@@ -1,0 +1,63 @@
+{
+  "host": "0.0.0.0",
+  "port": 8788,
+  "token": "在这里填一个长随机串；用图形界面启动时点「生成」按钮即可",
+  "token_ttl_days": 0,
+  "token_expires_at": "",
+  "readonly_token": "",
+  "roots": [
+    "D:\\share",
+    "E:\\data"
+  ],
+  "read_only": false,
+  "allow_delete": true,
+  "allow_move": true,
+  "auto_backup": true,
+  "preflight_check": true,
+  "enable_mcp": true,
+  "tools_disable": [],
+  "public_health": true,
+  "ip_allowlist": [],
+  "max_read_bytes": 4194304,
+  "max_write_bytes": 16777216,
+  "max_list_entries": 3000,
+  "max_grep_file_bytes": 2097152,
+  "audit_log": "logs/audit.jsonl",
+  "audit_max_bytes": 5242880,
+  "audit_backup_count": 3,
+  "run_log_max_bytes": 2097152,
+  "run_log_backup_count": 3,
+  "tls_cert": "",
+  "tls_key": "",
+  "tls_chain": "",
+  "databases": [
+    {
+      "name": "prod",
+      "type": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "root",
+      "password": "",
+      "database": "mydb",
+      "allow_write": false,
+      "max_rows": 200,
+      "timeout_sec": 30,
+      "connect_timeout_sec": 8
+    },
+    {
+      "name": "cache",
+      "type": "redis",
+      "host": "127.0.0.1",
+      "port": 6379,
+      "username": "",
+      "password": "",
+      "db": 0,
+      "allow_write": false,
+      "max_keys": 200,
+      "timeout_sec": 15,
+      "connect_timeout_sec": 8
+    }
+  ],
+  "auth_fail_limit": 20,
+  "auth_fail_window_sec": 300
+}

@@ -1,0 +1,44 @@
+# 含 Token 的运行时配置 —— 绝对不要进版本库
+server/wkfile.config.json
+wkfile.config.json
+**/wkfile.config.json
+server/agent.config.json
+**/agent.config.json
+
+# 运行时数据目录（配置/日志/备份/回收站都在这一个文件夹里）
+server/wkfile/
+wkfile/
+**/wkfile/wkfile.config.json
+
+# Trae 项目级 MCP 配置（里面写着真实 Token）
+.trae/
+deprecated/client/mcp.config.json
+
+# 内部开发记录 —— 不随开源仓库发布（历史记录里含内部信息）
+docs/竞品学习与改造清单.md
+
+# 与本项目无关的笔记本（误放进目录的，不发布）
+*.ipynb
+
+# 服务运行时产物（早期版本遗留的位置）
+.winfile-backups/
+.winfile-trash/
+winfile-agent-audit.jsonl
+winfile-agent-audit.jsonl.*
+*.audit.jsonl
+logs/
+gui-selftest.log
+*.pid
+
+# 构建产物（exe 走 GitHub Releases，不进 git）
+.build/
+dist/
+dist-new/
+*.old
+*.zip
+wkfile-v*/
+WinFile-Server-v*/
+
+# Python
+__pycache__/
+*.pyc
