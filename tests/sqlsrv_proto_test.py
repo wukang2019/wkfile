@@ -563,5 +563,75 @@ check("TLS 关闭通知" in str(conn._conn_closed("TLS 关闭通知")), "附加�
 conn2 = srv.SQLServerConn("h", 1, "u", "p")
 check(conn2._stage == "prelogin", "初始阶段为 prelogin")
 
+# ---------------------------------------------------------------------------
+# TLS MemoryBIO 泵送回环测试（真实 TLS，本地自签证书 + echo 服务端）
+# v1.7.4 修复的正是这条路径：SSLObject 没有 bio_read/bio_write（那是
+# pyOpenSSL 的 API），密文搬运必须操作 wrap_bio 传入的 MemoryBIO。
+# ---------------------------------------------------------------------------
+try:
+    import ssl
+    import socket
+    import tempfile
+    import threading
+    import shutil
+    import wkfile_selfcert as selfcert
+
+    tmpdir = tempfile.mkdtemp(prefix="sqlsrv_tls_")
+    cert_path = os.path.join(tmpdir, "c.pem")
+    key_path = os.path.join(tmpdir, "k.pem")
+    selfcert.write_pair(cert_path, key_path, cn="localhost",
+                        ips=("127.0.0.1",))
+
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert_path, key_path)
+    lsock = socket.socket()
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(1)
+    tls_port = lsock.getsockname()[1]
+
+    def _echo_server():
+        try:
+            c, _ = lsock.accept()
+            with c:
+                tls = server_ctx.wrap_socket(c, server_side=True)
+                with tls:
+                    while True:
+                        data = tls.recv(65536)
+                        if not data:
+                            break
+                        tls.sendall(data)
+        except Exception:
+            pass
+
+    threading.Thread(target=_echo_server, daemon=True).start()
+
+    tls_conn = srv.SQLServerConn("127.0.0.1", tls_port, "sa", "x")
+    tls_conn.sock = socket.create_connection(("127.0.0.1", tls_port), 5)
+    tls_conn.sock.settimeout(10)
+    # 旁路 TDS 帧层（帧包装另有 packetize 单测）：握手期密文裸发、裸收
+    tls_conn._flush_tls_wrapped = lambda: tls_conn._flush_outgoing()
+    tls_conn._plain_send = lambda raw: tls_conn.sock.sendall(raw)
+    tls_conn._plain_next_packet = lambda: (0x12, 0x01, 0,
+                                           tls_conn.sock.recv(65536))
+    try:
+        tls_conn._handshake()
+        check(True, "TLS MemoryBIO 真实握手")
+        msg = b"ping-" * 20000          # 100KB：覆盖 write 分块 + 多 TLS 记录
+        tls_conn._tls_send(msg)
+        got = tls_conn._tls_read_exact(len(msg))
+        check(got == msg, "TLS 回环 echo（100KB 分块）")
+        tls_conn._tls_send(b"tiny")
+        got2 = tls_conn._tls_read_exact(4)
+        check(got2 == b"tiny", "TLS 回环小包")
+    except Exception as exc:
+        check(False, "TLS MemoryBIO 回环", f"{type(exc).__name__}: {exc}")
+    finally:
+        tls_conn.close()
+        lsock.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+except ImportError:
+    print("[SKIP] wkfile_selfcert 不可用，跳过 TLS 回环测试")
+
 print(f"\nSQL Server 驱动协议测试：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

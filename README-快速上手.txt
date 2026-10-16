@@ -36,6 +36,12 @@ wkfile · 快速上手
   1.7.3 修正 PRELOGIN 的 offset 基准（真机实测第二弹）：offset 是相对整个
   PRELOGIN 数据起点的绝对偏移（FreeTDS 常量与真实抓包双重印证），此前误当
   相对数据区导致解析服务端响应时报「选项越界」。发送与解析两侧同步修正。
+  1.7.4 修正 TLS 内存管道的 API 误用（真机实测第三弹）：标准库 ssl 的
+  SSLObject 没有 bio_read/bio_write（那是 pyOpenSSL 的接口名），密文搬运
+  必须操作 wrap_bio 传入的 MemoryBIO。此前混用导致握手期报
+  'SSLObject' object has no attribute 'bio_read'。注意：这与服务器上装没装
+  pyOpenSSL、版本多少完全无关（驱动本身零第三方依赖）。新增本地真实 TLS
+  回路单测锁住这条路径。
 
 程序运行时【只创建 wkfile 这一个文件夹】，里面装着配置、日志、备份、回收站；
 不会往你允许 AI 操作的业务目录里撒任何东西。

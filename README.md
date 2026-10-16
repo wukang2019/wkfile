@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.3\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.4\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.3.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.4.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -117,7 +117,7 @@ trae-winfile\
 │   ├─ local_e2e.py                #   本机端到端（源码路线）
 │   ├─ tls_e2e.py                  #   真 HTTPS 链路（需本机有 openssl，无则跳过）
 │   ├─ mcp_exe_test.py             #   MCP 端点（打包后的 exe，需先 build）
-│   └─ sqlsrv_proto_test.py        #   SQL Server 驱动协议层单测（149 用例，无需真实服务器）
+│   └─ sqlsrv_proto_test.py        #   SQL Server 驱动协议层单测（152 用例，无需真实服务器）
 ├─ deprecated\                     # 已废弃方案归档，见里面的 README.txt
 ├─ .trae\mcp.json                  # Trae 项目级 MCP 配置（含真实 Token，勿提交 git）
 ├─ selftest.py                     # 老接口 + 安全机制 + MCP 协议自测（53 用例）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.3\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.4\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -165,7 +165,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.3\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.4\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -407,12 +407,12 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > MySQL 8 默认的 `caching_sha2_password`（含首次连接的 RSA 公钥交换）已完整支持，
 > MariaDB / MySQL 5.7 / Redis 3.x 以上都验证过。
 >
-> **SQL Server 驱动（v1.7.0 新增，v1.7.2/1.7.3 修正协议细节）**：自己实现的 TDS 7.4 协议（prelogin 加密协商 →
+> **SQL Server 驱动（v1.7.0 新增，v1.7.2-1.7.4 修正协议细节）**：自己实现的 TDS 7.4 协议（prelogin 加密协商 →
 > TLS 握手（握手报文按协议要求包在 TDS 包里搬运）→ LOGIN7 SQL 身份验证 →
 > token 流解析），支持 NBCROW 空值压缩行、varchar(max) 分块大对象、
 > DECIMAL 精确十进制、DATETIME2/DATETIMEOFFSET 等新版类型。边界：
 > 仅 SQL 身份验证（sa 等账号，不支持 Windows 集成认证）、仅全链路加密
-> （默认自签名证书即可）、需 SQL Server 2008+；协议层有 149 个单测
+> （默认自签名证书即可）、需 SQL Server 2008+；协议层有 152 个单测
 > （`tests\sqlsrv_proto_test.py`，无需真实服务器即可跑）。
 
 **两个超时是两个概念，别混**（界面④里是两个独立的框）：
@@ -638,7 +638,7 @@ python selftest.py                      # 老接口 + 安全机制 + MCP 协议�
 python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：227 用例
 python tests\mcp_e2e.py                 # MCP 端点（源码）：48 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
-python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：149 用例
+python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
 python tests\tls_e2e.py                 # 真起 HTTPS 服务端到端（需 openssl，无则跳过）：11 用例
 python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：22 用例
 ```
@@ -646,7 +646,7 @@ python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：22 
 
 ````
 
-当前状态（v1.7.3 实测）：**53/53、220/220、48/48、13/13、11/11、149/149 全通过**。
+当前状态（v1.7.4 实测）：**53/53、220/220、48/48、13/13、11/11、152/152 全通过**。
 
 重新打包 exe（改完源码后）：
 

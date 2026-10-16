@@ -1066,6 +1066,8 @@ class SQLServerConn:
         self.notes = notes if notes is not None else []
         self.sock = None
         self._ssl = None
+        self._incoming = None
+        self._outgoing = None
         self._feeder = None
         self._packet_size = 4096
         self._pkt_id = 1
@@ -1147,9 +1149,17 @@ class SQLServerConn:
         return ctx
 
     def _handshake(self):
-        """TLS 握手：握手报文包在 TDS 0x12 包里来回搬运，完成后切纯 TLS。"""
+        """TLS 握手：握手报文包在 TDS 0x12 包里来回搬运，完成后切纯 TLS。
+
+        标准库 ssl 的 MemoryBIO 泵送：SSLObject 只提供 read()/write()，
+        密文搬运靠 wrap_bio 时传入的 incoming/outgoing 两个 MemoryBIO
+        （注意 SSLObject 没有 bio_read/bio_write —— 那是 pyOpenSSL 的 API，
+        混用会报 AttributeError）。
+        """
         ctx = self._tls_context()
-        self._ssl = ctx.wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO())
+        self._incoming = ssl.MemoryBIO()   # 服务端 → TLS 引擎（密文入）
+        self._outgoing = ssl.MemoryBIO()   # TLS 引擎 → 服务端（密文出）
+        self._ssl = ctx.wrap_bio(self._incoming, self._outgoing)
         while True:
             want = None
             try:
@@ -1161,33 +1171,34 @@ class SQLServerConn:
             except (ssl.SSLError, OSError) as exc:
                 raise DBError("tls_failed", f"TLS 握手失败：{exc}")
             else:
-                self._flush_tls_wrapped()
+                self._flush_tls_wrapped()   # Finished 等尾部密文
                 return
             self._flush_tls_wrapped()
             if want == "read":
                 ptype, _status, _spid, payload = self._plain_next_packet()
-                self._ssl.bio_write(payload)
+                if ptype != PKT_PRELOGIN:
+                    raise DBError(
+                        "protocol",
+                        f"TLS 握手期收到非 0x12 包：0x{ptype:02X}")
+                self._incoming.write(payload)
 
     def _flush_tls_wrapped(self):
-        """把 TLS 引擎待发数据以 TDS 0x12 包形式发出去（握手期专用）。"""
-        while True:
-            try:
-                out = self._ssl.bio_read(65536)
-            except ssl.SSLWantReadError:
-                return
-            except ssl.SSLError as exc:
-                raise DBError("tls_failed", f"TLS 数据搬运失败：{exc}")
-            self._plain_send(packetize(PKT_PRELOGIN, out, 4096))
+        """握手期专用：把 TLS 引擎待发密文包成 TDS 0x12 包发出。"""
+        while self._outgoing.pending > 0:
+            self._plain_send(
+                packetize(PKT_PRELOGIN, self._outgoing.read(65536), 4096))
+
+    def _flush_outgoing(self):
+        """握手完成后专用：裸 TLS 记录直接发送（不再包 TDS 帧）。"""
+        while self._outgoing.pending > 0:
+            self._plain_send(self._outgoing.read(65536))
 
     def _tls_send(self, raw: bytes):
-        for i in range(0, len(raw), 65536):
-            self._ssl.write(raw[i:i + 65536])
-            while True:
-                try:
-                    out = self._ssl.bio_read(65536)
-                except ssl.SSLWantReadError:
-                    break
-                self._plain_send(out)
+        view = memoryview(raw)
+        while len(view) > 0:
+            n = self._ssl.write(view)
+            view = view[n:]
+            self._flush_outgoing()
 
     def _tls_read_exact(self, n: int) -> bytes:
         out = b""
@@ -1195,7 +1206,7 @@ class SQLServerConn:
             try:
                 chunk = self._ssl.read(n - len(out))
             except ssl.SSLWantReadError:
-                # TLS 引擎要密文：从 socket 收并喂进去
+                # TLS 引擎要密文：从 socket 收并喂进 incoming
                 try:
                     wire = self.sock.recv(65536)
                 except socket.timeout:
@@ -1204,14 +1215,15 @@ class SQLServerConn:
                     raise DBError("conn_failed", f"与数据库通信中断：{exc}")
                 if not wire:
                     raise self._conn_closed()
-                self._ssl.bio_write(wire)
+                self._incoming.write(wire)
                 continue
             except ssl.SSLZeroReturnError:
                 raise self._conn_closed("TLS 关闭通知")
             except ssl.SSLError as exc:
                 raise DBError("conn_failed", f"TLS 读取失败：{exc}")
-            if chunk:
-                out += chunk
+            if not chunk:
+                raise self._conn_closed()
+            out += chunk
         return out
 
     # ---------- TDS 发送 ----------
@@ -1313,6 +1325,8 @@ class SQLServerConn:
     def close(self):
         sock, self.sock = self.sock, None
         self._ssl = None
+        self._incoming = None
+        self._outgoing = None
         if sock is None:
             return
         try:
