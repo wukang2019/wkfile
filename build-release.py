@@ -98,8 +98,9 @@ FOLDER_README = """wkfile v{ver} · 部署包
   A: 一条都不用。Python 解释器已经打进 wkfile.exe 内部了，拷过去双击就跑。
      本项目还【零第三方依赖】，任何情况下都不需要 pip install；
      连自签证书都是程序自己算出来的，不需要 openssl；
-     连 MySQL / Redis 驱动也是自己手写的协议实现，不需要 PyMySQL / redis-py，
-     也不需要机器上装 mysql.exe / redis-cli。
+     连 MySQL / SQL Server / Redis 驱动也是自己手写的协议实现，
+     不需要 PyMySQL / redis-py / pyodbc，也不需要机器上装
+     mysql.exe / sqlcmd / redis-cli。
      （只有"源码版" python wkfile_agent.py 才要求机器上装 Python 3.8+，
        同样不需要 pip install。源码版一般用不到。）
      系统前提：Windows 10 / Server 2016 及以上。
@@ -143,7 +144,7 @@ FOLDER_README = """wkfile v{ver} · 部署包
                      选错证书文件是"浏览器能开、客户端连不上"的头号原因，
                      界面点【检查证书】会当场告诉你链全不全
        ④ 数据库       → 可选。想让 AI 除了文件还能看数据库，就在这页点
-                     【＋ MySQL】/【＋ Redis】加一条，填好地址账号，
+                     【＋ MySQL】/【＋ SQL Server】/【＋ Redis】加一条，填好地址账号，
                      点【测试连接】验一次，再保存配置重启服务。
                      默认只读（只能查询）；【允许写入】要放开写操作，
                      且还需服务端非只读 + 用主 Token，三个条件缺一不可。

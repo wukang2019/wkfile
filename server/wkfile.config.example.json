@@ -56,6 +56,19 @@
       "max_keys": 200,
       "timeout_sec": 15,
       "connect_timeout_sec": 8
+    },
+    {
+      "name": "erp",
+      "type": "sqlserver",
+      "host": "127.0.0.1",
+      "port": 1433,
+      "user": "sa",
+      "password": "",
+      "database": "erp",
+      "allow_write": false,
+      "max_rows": 200,
+      "timeout_sec": 30,
+      "connect_timeout_sec": 8
     }
   ],
   "auth_fail_limit": 20,

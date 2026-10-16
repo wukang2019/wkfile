@@ -957,13 +957,14 @@ class Wizard:
             f,
             justify="left", anchor="w", wraplength=780, padx=12, pady=8,
             background="#eef4ff", foreground="#1f2937",
-            text=("登记服务器上的 MySQL / Redis 后，AI 就能通过 MCP 一并查看数据，"
+            text=("登记服务器上的 MySQL / SQL Server / Redis 后，AI 就能通过 MCP 一并查看数据，"
                   "不必再单独开一个数据库客户端。\n"
                   "默认全部「只读」：只放行 SELECT / SHOW / DESC 这类查询。"
                   "要允许 AI 改数据，得逐个勾上「允许写入」，且服务端不能是只读模式、"
                   "用的还得是主 Token —— 三个条件缺一不可。\n"
-                  "无论怎么配，危险动作（INTO OUTFILE、LOAD_FILE、多语句、FLUSHALL、"
-                  "CONFIG、EVAL…）永远被拒绝。一个都不加 = 数据库能力完全关闭。"),
+                  "无论怎么配，危险动作（INTO OUTFILE、LOAD_FILE、xp_cmdshell、"
+                  "多语句、FLUSHALL、CONFIG、EVAL…）永远被拒绝。"
+                  "一个都不加 = 数据库能力完全关闭。"),
         )
         tip.grid(row=0, column=0, sticky="ew")
 
@@ -987,6 +988,8 @@ class Wizard:
         bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(bar, text="＋ MySQL", width=11,
                    command=lambda: self._db_add("mysql")).pack(side="left")
+        ttk.Button(bar, text="＋ SQL Server", width=12,
+                   command=lambda: self._db_add("sqlserver")).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="＋ Redis", width=11,
                    command=lambda: self._db_add("redis")).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="删除选中", width=10,
@@ -1064,12 +1067,17 @@ class Wizard:
     def _db_row_values(self, item: dict) -> tuple:
         kind = self._db_kind_of(item)
         host = item.get("host") or "127.0.0.1"
-        port = item.get("port") or (3306 if kind == "mysql" else 6379)
         if kind == "redis":
+            port = item.get("port") or 6379
             who = (item.get("username") or "").strip()
             target = f"{who + '@' if who else ''}{host}:{port}/{item.get('db') or 0}"
             type_label = "Redis"
+        elif kind in ("sqlserver", "sqlsrv", "mssql", "sqsrv"):
+            port = item.get("port") or 1433
+            target = f"{item.get('user') or 'sa'}@{host}:{port}/{item.get('database') or ''}"
+            type_label = "SQL Server"
         else:
+            port = item.get("port") or 3306
             target = f"{item.get('user') or 'root'}@{host}:{port}/{item.get('database') or ''}"
             type_label = "MySQL"
         return (item.get("name") or "(未命名)", type_label, target,
@@ -1082,17 +1090,26 @@ class Wizard:
 
     def _db_fill_form(self, item: dict) -> None:
         kind = self._db_kind_of(item)
+        is_redis = kind == "redis"
+        is_sqlsrv = kind in ("sqlserver", "sqlsrv", "mssql", "sqsrv")
+        default_port = 6379 if is_redis else (1433 if is_sqlsrv else 3306)
         self._db_syncing = True
         try:
             self.db_vars["name"].set(item.get("name") or "")
             self.db_vars["host"].set(item.get("host") or "")
-            self.db_vars["port"].set(str(item.get("port") or (3306 if kind == "mysql" else 6379)))
-            if kind == "redis":
+            self.db_vars["port"].set(str(item.get("port") or default_port))
+            if is_redis:
                 self.db_vars["user"].set(item.get("username") or "")
                 self.db_vars["database"].set(str(item.get("db") or 0))
                 self.db_vars["max_rows"].set(str(item.get("max_keys") or 200))
                 self.lbl_db_kind.configure(text="Redis")
                 default_timeout = 15
+            elif is_sqlsrv:
+                self.db_vars["user"].set(item.get("user") or "sa")
+                self.db_vars["database"].set(item.get("database") or "")
+                self.db_vars["max_rows"].set(str(item.get("max_rows") or 200))
+                self.lbl_db_kind.configure(text="SQL Server")
+                default_timeout = 30
             else:
                 self.db_vars["user"].set(item.get("user") or "")
                 self.db_vars["database"].set(item.get("database") or "")
@@ -1175,12 +1192,16 @@ class Wizard:
             note = ("Redis：用户名留空即只用 requirepass 密码；「库号」为 0-15 的整数。"
                     "列 key 一律走 SCAN，不会像 KEYS 那样阻塞实例。"
                     "「查询超时」管收发命令，「连接超时」管拨号（跨地域/走公网调大些）。")
+        elif kind in ("sqlserver", "sqlsrv", "mssql", "sqsrv"):
+            note = ("SQL Server：仅支持 SQL 身份验证（sa 等账号，不支持 Windows 集成认证），"
+                    "需 SQL Server 2008 及以上。连接全程 TLS 加密，服务器用默认自签名证书"
+                    "即可，无需额外配置。「数据库」是初始库，可留空。")
         elif kind == "mysql":
             note = ("MySQL：库名可留空，之后在 SQL 里用「库名.表名」限定即可。"
                     "「最大返回行/键数」限制单次回传的行数，防止一个大 SELECT 拖垮服务。"
                     "「连接超时」是拨号+解析的总预算，调大只影响连不上的等待上限。")
         else:
-            note = "点上面的「＋ MySQL」或「＋ Redis」添加一个数据源。"
+            note = "点上面的「＋ MySQL」「＋ SQL Server」或「＋ Redis」添加一个数据源。"
         self.lbl_db_note.configure(text=note)
 
     def _db_add(self, kind: str) -> None:
@@ -1193,6 +1214,11 @@ class Wizard:
                     "port": 6379, "username": "", "password": "", "db": 0,
                     "allow_write": False, "max_keys": 200, "timeout_sec": 15,
                     "connect_timeout_sec": 8}
+        elif kind == "sqlserver":
+            item = {"name": f"sqlserver{n}", "type": "sqlserver",
+                    "host": "127.0.0.1", "port": 1433, "user": "sa",
+                    "password": "", "database": "", "allow_write": False,
+                    "max_rows": 200, "timeout_sec": 30, "connect_timeout_sec": 8}
         else:
             item = {"name": f"mysql{n}", "type": "mysql", "host": "127.0.0.1",
                     "port": 3306, "user": "root", "password": "", "database": "",
@@ -1248,6 +1274,14 @@ class Wizard:
                 info = wa.redismod.RedisSource(item).test()
                 msg = (f"「{name}」连接正常：Redis {info.get('server_version')}"
                        f"，当前库 {info.get('dbsize')} 个 key，角色 {info.get('role')}")
+            elif kind in ("sqlserver", "sqlsrv", "mssql", "sqsrv"):
+                if getattr(wa, "sqlsrvmod", None) is None:
+                    raise RuntimeError(
+                        "SQL Server 模块未加载（server 目录缺少 wkfile_sqlsrv.py）")
+                info = wa.sqlsrvmod.SQLServerSource(item).test()
+                dbs = info.get("databases") or []
+                msg = (f"「{name}」连接正常：{info.get('server_version')}"
+                       f"，可见 {len(dbs)} 个库")
             else:
                 if wa.dbmod is None:
                     raise RuntimeError("MySQL 模块未加载（server 目录缺少 wkfile_mysql.py）")
@@ -1299,7 +1333,8 @@ class Wizard:
                 raise ValueError(f"数据源名称重复：{name}（每个数据源的名字必须唯一）")
             seen.add(name)
             kind = self._db_kind_of(item)
-            if kind not in ("mysql", "mariadb", "redis"):
+            if kind not in ("mysql", "mariadb", "sqlserver", "sqlsrv",
+                            "mssql", "sqsrv", "redis"):
                 raise ValueError(f"数据源「{name}」的类型不认识：{kind}")
             host = str(item.get("host") or "").strip()
             if not host:
@@ -2727,6 +2762,29 @@ def _check_gui() -> int:
             if (redis_entry["type"] != "redis" or redis_entry["db"] != 3
                     or "user" in redis_entry or "database" in redis_entry):
                 problems.append(f"数据库：Redis 结构不符 {redis_entry}")
+            # SQL Server：默认端口 1433 / 默认用户 sa，结构同 MySQL 分支
+            app._db_add("sqlserver")
+            if not any(i.get("type") == "sqlserver" for i in app.db_items):
+                problems.append("数据库：添加 SQL Server 未生效")
+            app.db_vars["name"].set("erptest")
+            app.db_vars["host"].set("127.0.0.1")
+            app.db_vars["port"].set("1433")
+            app.db_vars["user"].set("sa")
+            app.db_vars["database"].set("erp")
+            app.db_vars["password"].set("sp")
+            got3 = app._collect_databases()
+            sqlsrv_entry = [x for x in got3 if x["name"] == "erptest"][0]
+            if (sqlsrv_entry["type"] != "sqlserver" or sqlsrv_entry["port"] != 1433
+                    or sqlsrv_entry["user"] != "sa" or sqlsrv_entry["database"] != "erp"
+                    or sqlsrv_entry["password"] != "sp"):
+                problems.append(f"数据库：SQL Server 结构不符 {sqlsrv_entry}")
+            # 回填：默认值与类型标签必须对
+            app._db_fill_form([i for i in app.db_items
+                               if i.get("name") == "erptest"][0])
+            if (app.db_vars["port"].get() != "1433"
+                    or app.db_vars["user"].get() != "sa"
+                    or app.lbl_db_kind.cget("text") != "SQL Server"):
+                problems.append("数据库：SQL Server 表单回填/类型标签异常")
             # 重名必须被拦下
             app.db_vars["name"].set("selftest")
             try:
@@ -2760,7 +2818,8 @@ def _check_gui() -> int:
                 app._db_remove()
             if app.db_items:
                 problems.append("数据库：删除数据源未清空")
-            note("数据库页(④)     : OK（增删改/回填/重名、端口与连接超时校验/collect 全通过）")
+            note("数据库页(④)     : OK（增删改/回填/重名、端口与连接超时校验/"
+                 "collect 含 MySQL+Redis+SQL Server 全通过）")
         except Exception as exc:
             problems.append(f"数据库页异常: {exc}")
         try:

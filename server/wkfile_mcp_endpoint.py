@@ -358,12 +358,12 @@ TOOLS = [
     # ---------------- 数据库 / 缓存 ----------------
     {
         "name": "win_db_list",
-        "description": "列出远程服务器上已配置的数据库/缓存数据源（MySQL、Redis）及其可写状态。**操作数据库前先调用它**，确认有哪些数据源可用、名字叫什么、这次请求有没有写权限。",
+        "description": "列出远程服务器上已配置的数据库/缓存数据源（MySQL、SQL Server、Redis）及其可写状态。**操作数据库前先调用它**，确认有哪些数据源可用、名字叫什么、这次请求有没有写权限。",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "win_db_query",
-        "description": "在 MySQL/MariaDB 上执行一条**只读** SQL 查询（SELECT / SHOW / DESC / EXPLAIN / WITH...SELECT），返回表格数据。写语句（INSERT/UPDATE/DELETE/DDL）会被拒绝，请改用 win_db_exec。结果有行数上限，被截断时返回 truncated=true。",
+        "description": "在 MySQL/MariaDB/SQL Server 上执行一条**只读** SQL 查询（SELECT / SHOW / DESC / EXPLAIN / WITH...SELECT），返回表格数据。写语句（INSERT/UPDATE/DELETE/DDL/EXEC）会被拒绝，请改用 win_db_exec。结果有行数上限，被截断时返回 truncated=true。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -376,7 +376,7 @@ TOOLS = [
     },
     {
         "name": "win_db_exec",
-        "description": "在 MySQL/MariaDB 上执行**写** SQL（INSERT / UPDATE / DELETE / CREATE / ALTER 等）。需要数据源开启「允许写入」、服务端非只读、且使用完整权限 Token，否则会被拒绝。危险形态（INTO OUTFILE、LOAD_FILE、多语句）永远不允许。执行前建议先用 win_db_query 确认影响范围。",
+        "description": "在 MySQL/MariaDB/SQL Server 上执行**写** SQL（INSERT / UPDATE / DELETE / CREATE / ALTER / EXEC 等）。需要数据源开启「允许写入」、服务端非只读、且使用完整权限 Token，否则会被拒绝。危险形态（INTO OUTFILE、LOAD_FILE、xp_cmdshell、多语句）永远不允许。执行前建议先用 win_db_query 确认影响范围。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -389,7 +389,7 @@ TOOLS = [
     },
     {
         "name": "win_db_tables",
-        "description": "列出 MySQL/MariaDB 中的表。指定 database 时列出该库的表（含引擎、估算行数、占用空间、注释）；不指定时按库汇总表数量。用于在查数据前摸清结构。",
+        "description": "列出 MySQL/MariaDB/SQL Server 中的表。指定 database 时列出该库的表（MySQL 含引擎/注释，SQL Server 含架构/估算行数/占用空间）；不指定时 MySQL 按库汇总表数量、SQL Server 列出全部库。用于在查数据前摸清结构。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -401,7 +401,7 @@ TOOLS = [
     },
     {
         "name": "win_db_schema",
-        "description": "查看 MySQL/MariaDB 某张表的结构：所有列的字段名、类型、是否可空、键、默认值、注释，以及索引组成。写 SQL 前用它确认列名，避免猜错字段。",
+        "description": "查看 MySQL/MariaDB/SQL Server 某张表的结构：所有列的字段名、类型、是否可空、默认值，以及索引组成。写 SQL 前用它确认列名，避免猜错字段。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -816,7 +816,7 @@ def render(tool_name: str, data: dict) -> str:
     if tool_name in ("win_db_query", "win_db_exec", "win_db_tables"):
         head = f"数据源 {data.get('source')}"
         if data.get("server_version"):
-            head += f"（MySQL {data.get('server_version')}）"
+            head += f"（{data.get('server_version')}）"
         if data.get("rows") is not None:
             head += f"  返回 {data.get('row_count')} 行"
         if data.get("affected_rows") is not None:
@@ -841,7 +841,7 @@ def render(tool_name: str, data: dict) -> str:
         if not data.get("ok"):
             return f"连接失败：{data.get('error') or data}"
         out = [f"数据源 {data.get('source')} 连接正常（{data.get('dsn')}）",
-               f"  服务端版本：MySQL {data.get('server_version')}",
+               f"  服务端版本：{data.get('server_version')}",
                f"  认证方式：{data.get('auth_plugin')}",
                f"  当前身份：{data.get('identity')}"]
         if data.get("databases"):

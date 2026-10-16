@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.6.4\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.0\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.6.4.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.0.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -101,6 +101,7 @@ trae-winfile\
 │   ├─ wkfile_selfcert.py          #   自签证书生成器（纯标准库，手写 DER/RSA，不依赖 openssl）
 │   ├─ wkfile_mysql.py             #   MySQL/MariaDB 驱动（纯标准库手写协议，不依赖 PyMySQL）
 │   ├─ wkfile_redis.py             #   Redis 驱动（纯标准库 RESP，不依赖 redis-py）
+│   ├─ wkfile_sqlsrv.py            #   SQL Server 驱动（纯标准库手写 TDS 协议 + TLS，不依赖 pyodbc）
 │   ├─ wkfile_gui.py               #   图形界面源码（tkinter）
 │   ├─ connect-check.py            #   连接自检：配置/端口/IP/防火墙/MCP 一次查完
 │   ├─ 连接自检.bat                 #   上面那个的启动器，服务器上双击即可
@@ -115,7 +116,8 @@ trae-winfile\
 │   ├─ mcp_e2e.py                  #   MCP 端点（Streamable HTTP + SSE + 鉴权 + 越权拦截）
 │   ├─ local_e2e.py                #   本机端到端（源码路线）
 │   ├─ tls_e2e.py                  #   真 HTTPS 链路（需本机有 openssl，无则跳过）
-│   └─ mcp_exe_test.py             #   MCP 端点（打包后的 exe，需先 build）
+│   ├─ mcp_exe_test.py             #   MCP 端点（打包后的 exe，需先 build）
+│   └─ sqlsrv_proto_test.py        #   SQL Server 驱动协议层单测（135 用例，无需真实服务器）
 ├─ deprecated\                     # 已废弃方案归档，见里面的 README.txt
 ├─ .trae\mcp.json                  # Trae 项目级 MCP 配置（含真实 Token，勿提交 git）
 ├─ selftest.py                     # 老接口 + 安全机制 + MCP 协议自测（53 用例）
@@ -125,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.6.4\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.0\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -163,7 +165,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.6.4\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.0\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -306,9 +308,9 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 | --------------------- | ---------------------------------- |
 | `win_db_list`         | **先调这个**：看配了哪些数据源、这次有没有写权限         |
 | `win_db_test`         | 测连通性：服务端版本、认证方式、当前身份、可见的库          |
-| `win_db_query`        | MySQL/MariaDB **只读**查询（SELECT/SHOW/DESC/EXPLAIN） |
-| `win_db_exec`         | MySQL/MariaDB **写**语句（需要数据源开启允许写入）  |
-| `win_db_tables`       | 列库中的表（引擎、估算行数、占用空间、注释）             |
+| `win_db_query`        | MySQL/MariaDB/SQL Server **只读**查询（SELECT/SHOW/DESC/EXPLAIN/WITH） |
+| `win_db_exec`         | MySQL/MariaDB/SQL Server **写**语句（需要数据源开启允许写入）  |
+| `win_db_tables`       | 列库中的表（引擎/架构、估算行数、占用空间）            |
 | `win_db_schema`       | 看某张表的完整列定义与索引                      |
 | `win_redis_info`      | Redis 概况：版本、连接数、内存、各库 key 数        |
 | `win_redis_keys`      | 按模式列 key（走 `SCAN`，**不会**像 `KEYS` 那样阻塞实例） |
@@ -333,7 +335,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 ### 数据库工具怎么开
 
 默认**一个数据源都不配，数据库能力就是完全关闭的**。要开启：启动界面 → **④ 数据库** →
-「＋ MySQL」或「＋ Redis」→ 填地址账号 → **「测试连接」** → 「保存配置」→ 重启服务。
+「＋ MySQL」「＋ SQL Server」或「＋ Redis」→ 填地址账号 → **「测试连接」** → 「保存配置」→ 重启服务。
 
 **「到底在哪儿填数据库？」** —— 两个地方，改哪个都一样，随便挑：
 
@@ -354,7 +356,10 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 //      "max_rows":200,"timeout_sec":30,"connect_timeout_sec":8},
 //     {"name":"cache","type":"redis","host":"127.0.0.1","port":6379,
 //      "password":"","username":"","db":0,"allow_write":false,
-//      "max_keys":200,"timeout_sec":15,"connect_timeout_sec":8}
+//      "max_keys":200,"timeout_sec":15,"connect_timeout_sec":8},
+//     {"name":"erp","type":"sqlserver","host":"127.0.0.1","port":1433,
+//      "user":"sa","password":"","database":"erp","allow_write":false,
+//      "max_rows":200,"timeout_sec":30,"connect_timeout_sec":8}
 //   ],
 ```
 
@@ -377,35 +382,45 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 
 任何一条不满足，写语句都会被拒绝并说明是哪一条挡的。
 
-**语句分级**（MySQL 侧）：
+**语句分级**：
 
 | 级别 | 判定 | 处理 |
 | --- | --- | --- |
-| 只读 | `SELECT` / `SHOW` / `DESC` / `EXPLAIN` / `WITH...SELECT` | 直接放行 |
+| 只读 | `SELECT` / `SHOW` / `DESC` / `EXPLAIN` / `WITH...SELECT`（SQL Server：`SELECT` / `WITH...SELECT` / `USE`） | 直接放行 |
 | 写 | `INSERT` / `UPDATE` / `DELETE` / DDL / `SET` 等 | 需三重闸门全开 |
-| 拒绝 | 多语句、`INTO OUTFILE`、`LOAD_FILE`、`FOR UPDATE`、`SLEEP()` 等 | 任何情况都不放行 |
+| 拒绝 | 多语句、`INTO OUTFILE`、`LOAD_FILE`、`FOR UPDATE`、`SLEEP()`、`xp_cmdshell`、`OPENROWSET`、`SELECT...INTO` 等 | 任何情况都不放行 |
 
 只读判定的实现细节值得说明：判定前会先**剥离注释与字符串字面量**，所以
 `SELECT 'drop table x'` 不会被误判成删表，`/* x */ DELETE` 也不会被漏掉。
 另外只读查询还会在会话上执行 `SET SESSION TRANSACTION READ ONLY` —— 让**数据库自己**
 兜底，就算分类器被骗过，写入依然会被 MySQL 拒绝。
+（SQL Server 没有会话级只读开关，写拦截完全靠 T-SQL 分类器 + 三重闸门；
+这一点在界面的提示里也写明了。）
 
 **Redis 侧用白名单**：只有明确列在只读清单里的命令才放行，其余一律按写处理，
 `FLUSHALL` / `FLUSHDB` / `CONFIG` / `EVAL` / `MONITOR` / `SHUTDOWN` /
 `SUBSCRIBE`（会改变连接应答模型）等永远拒绝。列 key 强制走 `SCAN`，
 **`KEYS` 被禁用**——它会阻塞整个实例。
 
-> 驱动是**纯标准库手写**的（`wkfile_mysql.py` / `wkfile_redis.py`），
-> 依然不需要 `pip install`，也不依赖 `mysql.exe` / `redis-cli`。
+> 驱动是**纯标准库手写**的（`wkfile_mysql.py` / `wkfile_redis.py` / `wkfile_sqlsrv.py`），
+> 依然不需要 `pip install`，也不依赖 `mysql.exe` / `redis-cli` / `sqlcmd`。
 > MySQL 8 默认的 `caching_sha2_password`（含首次连接的 RSA 公钥交换）已完整支持，
 > MariaDB / MySQL 5.7 / Redis 3.x 以上都验证过。
+>
+> **SQL Server 驱动（v1.7.0 新增）**：自己实现的 TDS 7.4 协议（prelogin 加密协商 →
+> TLS 握手（握手报文按协议要求包在 TDS 包里搬运）→ LOGIN7 SQL 身份验证 →
+> token 流解析），支持 NBCROW 空值压缩行、varchar(max) 分块大对象、
+> DECIMAL 精确十进制、DATETIME2/DATETIMEOFFSET 等新版类型。边界：
+> 仅 SQL 身份验证（sa 等账号，不支持 Windows 集成认证）、仅全链路加密
+> （默认自签名证书即可）、需 SQL Server 2008+；协议层有 135 个单测
+> （`tests\sqlsrv_proto_test.py`，无需真实服务器即可跑）。
 
 **两个超时是两个概念，别混**（界面④里是两个独立的框）：
 
 | 字段 | 含义 | 默认 | 什么时候要调 |
 | --- | --- | --- | --- |
 | `connect_timeout_sec` | **拨号预算**：域名解析 + 逐个地址 TCP 连接，总共就这么多秒 | 8 | 库在跨地域/公网、建连慢，或想让它更快失败 |
-| `timeout_sec` | **查询超时**：连上之后等结果的时间 | MySQL 30 / Redis 15 | 有大表慢查询，或想限制单次调用时长 |
+| `timeout_sec` | **查询超时**：连上之后等结果的时间 | MySQL / SQL Server 30，Redis 15 | 有大表慢查询，或想限制单次调用时长 |
 
 为什么要自己写拨号逻辑而不用 `socket.create_connection`：后者对
 `getaddrinfo` 返回的**每个**地址都用一整份 timeout 各试一次。一台既有 A 又有 AAAA
@@ -550,10 +565,10 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
    | 并发保护           | 可选 `expected_sha256`，文件被别人改过就拒绝写入                                                                                               |
    | 鉴权锁定           | 同一 IP 5 分钟内失败 20 次即临时拒绝；Token 比对用 `hmac.compare_digest` 防时序攻击                                                                   |
    | **数据库三重闸门**（新） | 写库要同时满足：数据源开了「允许写入」+ 服务端非只读 + 用主 Token。缺哪条就明确告诉你是哪条挡的                                                            |
-   | **危险语句硬拒**（新）  | 多语句、`INTO OUTFILE`、`LOAD_FILE`、`FOR UPDATE`、`SLEEP()`、`FLUSHALL`、`CONFIG`、`EVAL`、`KEYS` 等，**任何配置下都不放行**（不依赖 allow_write）              |
-   | **只读会话兜底**（新）  | 只读查询会在 MySQL 会话上执行 `SET SESSION TRANSACTION READ ONLY`；就算 SQL 分类器被骗过，写入仍会被数据库自己拒绝                                    |
-   | **结果限额**（新）     | MySQL 单次查询有行数上限与累计字节上限、Redis 有 key 数上限，列 key 强制走 `SCAN` —— 防止一个大请求把服务或数据库拖死                                          |
-   | **凭据不回显**（新）   | 数据源列表、连接自检、审计日志里都只出现 `mysql://user@host:port/db` 这种摘要，**密码不会经任何接口回传**                                              |
+   | **危险语句硬拒**（新）  | 多语句、`INTO OUTFILE`、`LOAD_FILE`、`FOR UPDATE`、`SLEEP()`、`FLUSHALL`、`CONFIG`、`EVAL`、`KEYS`、`xp_cmdshell`、`OPENROWSET`、`SELECT...INTO` 等，**任何配置下都不放行**（不依赖 allow_write）  |
+   | **只读会话兜底**（新）  | 只读查询会在 MySQL 会话上执行 `SET SESSION TRANSACTION READ ONLY`；就算 SQL 分类器被骗过，写入仍会被数据库自己拒绝（SQL Server 无此开关，靠 T-SQL 分类器 + 三重闸门兜底）          |
+   | **结果限额**（新）     | MySQL / SQL Server 单次查询有行数上限与累计字节上限、Redis 有 key 数上限，列 key 强制走 `SCAN` —— 防止一个大请求把服务或数据库拖死                                 |
+   | **凭据不回显**（新）   | 数据源列表、连接自检、审计日志里都只出现 `mysql://`、`sqlserver://` 这种摘要，**密码不会经任何接口回传**                                              |
    | **MCP 不写库**（新）   | 数据库配置只能从本机界面/配置文件改，没有对应的 MCP 工具 —— AI 拿不到、也改不了自己的数据库权限                                                            |
    | 审计日志           | **每次操作都记**（含 MCP 工具调用与 SQL 语句本体，v1.6.0 补上），JSONL 格式，含 IP、操作、路径、耗时、结果                                                  |
    | 客户端风险提示        | 33 个工具全部带 MCP `annotations`，客户端才能正确区分只读/破坏性操作                                                                                |
@@ -623,6 +638,7 @@ python selftest.py                      # 老接口 + 安全机制 + MCP 协议�
 python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：227 用例
 python tests\mcp_e2e.py                 # MCP 端点（源码）：48 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
+python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：135 用例
 python tests\tls_e2e.py                 # 真起 HTTPS 服务端到端（需 openssl，无则跳过）：11 用例
 python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：22 用例
 ```
@@ -630,7 +646,7 @@ python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：22 
 
 ````
 
-当前状态（v1.6.4 实测）：**53/53、227/227、48/48、13/13、11/11 全通过**。
+当前状态（v1.7.0 实测）：**53/53、220/220、48/48、13/13、11/11、135/135 全通过**。
 
 重新打包 exe（改完源码后）：
 

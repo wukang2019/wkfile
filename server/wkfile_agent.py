@@ -85,7 +85,12 @@ try:
 except Exception:  # noqa: BLE001
     redismod = None
 
-VERSION = "1.6.4"
+try:
+    import wkfile_sqlsrv as sqlsrvmod
+except Exception:  # noqa: BLE001
+    sqlsrvmod = None
+
+VERSION = "1.7.0"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1054,11 +1059,16 @@ _CONFIG_NOTES = {
         '//      "max_rows":200,"timeout_sec":30,"connect_timeout_sec":8},',
         '//     {"name":"cache","type":"redis","host":"127.0.0.1","port":6379,',
         '//      "password":"","username":"","db":0,"allow_write":false,',
-        '//      "max_keys":200,"timeout_sec":15,"connect_timeout_sec":8}',
+        '//      "max_keys":200,"timeout_sec":15,"connect_timeout_sec":8},',
+        '//     {"name":"erp","type":"sqlserver","host":"127.0.0.1","port":1433,',
+        '//      "user":"sa","password":"","database":"erp","allow_write":false,',
+        '//      "max_rows":200,"timeout_sec":30,"connect_timeout_sec":8}',
         "//   ],",
         "// 也可以完全不手改 —— 打开图形界面的「④ 数据库」页点两下就行。",
         "// allow_write=false：只放行 SELECT/SHOW 这类查询，写语句一律拒绝。",
         "// 想给 AI 开写权限：① 这里改 true ② 服务端不能是只读 ③ 客户端用主 Token。",
+        "// type=sqlserver：仅 SQL 身份验证（sa 等账号），需 SQL Server 2008+，",
+        "//                连接全程 TLS 加密（服务器默认自签名证书即可）。",
         "// connect_timeout_sec = 拨号等待上限（连不上最多等多久，默认 8 秒）",
         "// timeout_sec         = 查询/读等待上限（等结果最多等多久）",
         "// 这两项填 0、负数或乱码都会自动退回默认值，不会把服务弄崩。",
@@ -2426,12 +2436,17 @@ class Agent:
             raise
 
     def db_source(self, req: dict, kind: str = None):
-        """按名字取数据源；只配了一个时可以省略 source。"""
-        if dbmod is None and redismod is None:
+        """按名字取数据源；只配了一个时可以省略 source。
+
+        kind 取值："mysql" / "sqlserver" / "redis" 精确匹配；
+        "sql" 表示任意 SQL 数据库（MySQL 或 SQL Server）。
+        """
+        if dbmod is None and redismod is None and sqlsrvmod is None:
             raise PathError(
                 "db_unavailable",
-                "数据库模块没加载起来（server 目录下缺少 wkfile_mysql.py 或 "
-                "wkfile_redis.py）。若是源码运行，请确认这两个文件与服务同级。",
+                "数据库模块没加载起来（server 目录下缺少 wkfile_mysql.py、"
+                "wkfile_redis.py 或 wkfile_sqlsrv.py）。若是源码运行，"
+                "请确认这些文件与服务同级。",
             )
         items = self.cfg.databases or []
         if not items:
@@ -2459,15 +2474,21 @@ class Agent:
                                 f"没有名为「{want}」的数据源。可用的有："
                                 f"{', '.join(str(i.get('name')) for i in items)}")
         src = self._make_source(chosen)
-        # redismod 可能为 None（模块缺失），不能直接 redismod.RedisSource
+        # 各模块都可能缺失，不能直接引用 XXXSource 类做 isinstance
         actual = "redis" if (redismod is not None
-                             and isinstance(src, redismod.RedisSource)) else "mysql"
-        if kind and actual != kind:
-            raise PathError(
-                "db_wrong_type",
-                f"数据源「{chosen.get('name')}」的类型是 {actual}，"
-                f"而当前工具只能用于 {kind}。请换一个数据源，或改用对应的工具。",
-            )
+                             and isinstance(src, redismod.RedisSource)) else (
+            "sqlserver" if (sqlsrvmod is not None
+                            and isinstance(src, sqlsrvmod.SQLServerSource))
+            else "mysql")
+        if kind:
+            matched = (kind == actual) or (kind == "sql"
+                                           and actual in ("mysql", "sqlserver"))
+            if not matched:
+                raise PathError(
+                    "db_wrong_type",
+                    f"数据源「{chosen.get('name')}」的类型是 {actual}，"
+                    f"而当前工具只能用于 {kind}。请换一个数据源，或改用对应的工具。",
+                )
         return src
 
     def _make_source(self, profile: dict):
@@ -2476,12 +2497,18 @@ class Agent:
             if dbmod is None:
                 raise PathError("db_unavailable", "MySQL 模块 wkfile_mysql.py 未加载")
             return dbmod.MySQLSource(profile)
+        if kind in ("sqlserver", "sqlsrv", "mssql", "sqsrv"):
+            if sqlsrvmod is None:
+                raise PathError("db_unavailable",
+                                "SQL Server 模块 wkfile_sqlsrv.py 未加载")
+            return sqlsrvmod.SQLServerSource(profile)
         if kind == "redis":
             if redismod is None:
                 raise PathError("db_unavailable", "Redis 模块 wkfile_redis.py 未加载")
             return redismod.RedisSource(profile)
         raise PathError("db_bad_type",
-                        f"不支持的数据源类型：{kind}（目前支持 mysql / mariadb / redis）")
+                        f"不支持的数据源类型：{kind}"
+                        f"（目前支持 mysql / mariadb / sqlserver / redis）")
 
     def op_db_list(self, req: dict) -> dict:
         ro = self.effective_readonly()
@@ -2490,6 +2517,8 @@ class Agent:
             kind = str(item.get("type") or "mysql").lower()
             if kind == "redis":
                 dsn = redismod.dsn_summary(item) if redismod else ""
+            elif kind in ("sqlserver", "sqlsrv", "mssql", "sqsrv"):
+                dsn = sqlsrvmod.dsn_summary(item) if sqlsrvmod else ""
             else:
                 dsn = dbmod.dsn_summary(item) if dbmod else ""
             out.append({
@@ -2513,10 +2542,15 @@ class Agent:
         sql = str(req.get("sql") or "").strip()
         if not sql:
             raise PathError("bad_request", "sql 不能为空")
-        # 先在通道这一层挡住写语句，好给出准确的指引。
-        # 如果放任它走到 MySQLSource 里，只会得到"只读 Token 拒绝写入"这种
+        # 先解析数据源，才能用对路的 SQL 分类器（T-SQL 与 MySQL 方言不同）
+        src = self.db_source(req, kind="sql")
+        cls_mod = (sqlsrvmod if (sqlsrvmod is not None
+                                 and isinstance(src, sqlsrvmod.SQLServerSource))
+                   else dbmod)
+        # 再在通道这一层挡住写语句，好给出准确的指引。
+        # 如果放任它走到 Source 里，只会得到"只读 Token 拒绝写入"这种
         # 误导性提示 —— 明明不是 Token 的问题，是走错了工具。
-        level, keyword, reason = dbmod.classify_sql(sql) if dbmod else ("read", "", "")
+        level, keyword, reason = cls_mod.classify_sql(sql) if cls_mod else ("read", "", "")
         if level == "deny":
             raise PathError("db_sql_rejected", reason)
         if level == "write":
@@ -2525,7 +2559,6 @@ class Agent:
                 f"{reason}。win_db_query 只能执行只读查询，"
                 f"写语句请改用 win_db_exec（需要数据源已开启允许写入）。",
             )
-        src = self.db_source(req, kind="mysql")
         # 只读查询：即使用完整 Token，也照样开会话只读
         return self._db_call(src.run, sql, max_rows=self._int_arg(req, "max_rows"),
                              force_readonly=True)
@@ -2535,18 +2568,18 @@ class Agent:
         sql = str(req.get("sql") or "").strip()
         if not sql:
             raise PathError("bad_request", "sql 不能为空")
-        src = self.db_source(req, kind="mysql")
+        src = self.db_source(req, kind="sql")
         return self._db_call(src.run, sql, max_rows=self._int_arg(req, "max_rows"))
 
     def op_db_tables(self, req: dict) -> dict:
-        src = self.db_source(req, kind="mysql")
+        src = self.db_source(req, kind="sql")
         return self._db_call(src.tables, req.get("database") or None)
 
     def op_db_schema(self, req: dict) -> dict:
         table = str(req.get("table") or "").strip()
         if not table:
             raise PathError("bad_request", "必须指定 table")
-        src = self.db_source(req, kind="mysql")
+        src = self.db_source(req, kind="sql")
         return self._db_call(src.schema, table, req.get("database") or None)
 
     def op_db_test(self, req: dict) -> dict:
