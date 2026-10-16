@@ -42,6 +42,11 @@ wkfile · 快速上手
   'SSLObject' object has no attribute 'bio_read'。注意：这与服务器上装没装
   pyOpenSSL、版本多少完全无关（驱动本身零第三方依赖）。新增本地真实 TLS
   回路单测锁住这条路径。
+  1.7.5 SQL Server 真机直连全通（对 SQL Server 2022 实测）：修正 5 处协议
+  细节——LOGIN7 的 TDSVersion 应为小端；ENVCHANGE 是 Length 在前 Type 在后
+  且数据库/语言的长度前缀按字符数算；列名/消息文本的长度前缀同样按字符数
+  （UTF-16 字节数要乘 2）；ORDER 项的 Count 是字节数。至此登录、查询、
+  类型解码在真实服务器上全部验证通过。
 
 程序运行时【只创建 wkfile 这一个文件夹】，里面装着配置、日志、备份、回收站；
 不会往你允许 AI 操作的业务目录里撒任何东西。

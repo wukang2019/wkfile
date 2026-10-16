@@ -445,10 +445,14 @@ def build_login7(*, host_name: str, server_name: str, user: str, password: str,
 
     header = bytearray(94)
     data_len = sum(len(s) for s in strings)
-    struct.pack_into("<I", header, 0, 94 + data_len)     # Length
-    # TDSVersion 是 LOGIN7 里唯一的大端字段（[MS-TDS] 2.2.6.4 / MS-SSTDS：
-    # "sent as big-endian"；FreeTDS 用字节交换常量 + 小端写入达成同样字节序）
-    struct.pack_into(">I", header, 4, TDS74_VERSION_VALUE)
+    struct.pack_into("<I", header, 0, 94 + data_len)  # Length
+    # TDSVersion 与全结构其余字段同为小端（0x74000004 -> 线上 04 00 00 74）。
+    # 交叉验证：pytds 生产实现 tds7_send_login 用 put_uint(TDS74=0x74000004)
+    # 小端写入且可连通 SQL Server 2012+；FreeTDS 的字节交换常量 0x04000074
+    # 经 swap 后小端写入，线上字节与 pytds 一致。此前 v1.7.2 误改为大端，
+    # 服务端解析 major=4（TDS 4.x）→ 按 [MS-TDS] 3.3.5.5 判定 LOGIN7 结构
+    # 无效 → 不回任何响应直接断连（真机实测第三弹根因）。
+    struct.pack_into("<I", header, 4, TDS74_VERSION_VALUE)
     struct.pack_into("<I", header, 8, packet_size)       # PacketSize
     struct.pack_into("<I", header, 12, 0x07000000)       # ClientProgVer
     struct.pack_into("<I", header, 16, os.getpid() & 0xFFFFFFFF)
@@ -483,6 +487,9 @@ def build_login7(*, host_name: str, server_name: str, user: str, password: str,
     struct.pack_into("<HH", header, 86, 0, 0)
     struct.pack_into("<I", header, 90, 0)    # cbSSPILong
 
+    # 标准登录（SQL 身份验证、无特性扩展）不带 FeatureExt 终止符 ——
+    # pytds 生产实现同样不发；FeatureExt 仅在实际启用特性（如 federated
+    # auth / UTF8 support）时才携带，空发 0xFF 反而破坏 Length 自洽性。
     return bytes(header) + bytes(blob)
 
 
@@ -521,8 +528,12 @@ class _Reader:
         self._buf = b""
 
     def bytes(self, n: int) -> bytes:
+        # fill 契约：恰好返回请求的字节数（_PacketFeeder.fill 保证）。
+        # 此前用 max(n, 4096) 预取，遇到「整个响应不足 4096B 且服务端
+        # 不再发数据」的登录响应时，会永远攒不够而触发 _next_packet
+        # 死等 —— 真机实测（v1.7.5）登录响应 285B 即此情形。
         while len(self._buf) < n:
-            self._buf += self._fill(max(n - len(self._buf), 4096))
+            self._buf += self._fill(n - len(self._buf))
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
 
@@ -560,9 +571,9 @@ class _Reader:
         return self.bytes(n).decode("latin-1", "replace")
 
     def ushort_varchar_utf16(self) -> str:
-        """USHORT 长度前缀 + UTF-16LE（ERROR/INFO 的 MsgText 用）。"""
+        """USHORT 字符数前缀 + UTF-16LE（字节数 = 字符数×2）。"""
         n = self.u16()
-        return self.bytes(n).decode("utf-16-le", "replace")
+        return self.bytes(n * 2).decode("utf-16-le", "replace")
 
 
 class _PacketFeeder:
@@ -875,18 +886,35 @@ class _ResponseParser:
                 number, state, level, msg = _read_error_token(r)
                 self.notes.append(f"SQL Server 提示 [{level}/{state}] {msg}")
             elif token == TOK_LOGINACK:
-                interface = r.u8()
-                ver = r.u16be()
-                prog = r.us_varchar()
-                prog_ver = r.u32()
+                # Length 整块读取兜底（真机实证：54B = iface(1)+version(4)
+                # +namelen(1)+name(44)+progver(4)；TDSVersion 为 4 字节大端）
+                length = r.u16()
+                blob = r.bytes(max(length, 0))
+                interface = blob[0] if blob else 0
+                ver = struct.unpack(">I", blob[1:5])[0] if len(blob) >= 5 else 0
+                prog = ""
+                if len(blob) >= 6:
+                    n = blob[5]
+                    prog = blob[6:6 + n * 2].decode("utf-16-le", "replace")
+                    prog = prog.rstrip("\x00")   # 服务端会以 NUL 填充名字区
+                prog_ver = 0
+                if len(blob) >= 4:
+                    tail = blob[-4:]
+                    prog_ver = (tail[0] << 24) | (tail[1] << 16) | \
+                        struct.unpack(">H", tail[2:4])[0]
                 info = {
                     "interface": interface,
-                    "tds_version": (ver >> 8, ver & 0xFF),
+                    # 0x74000004：高字节 0x74 = (7<<4)|4，即 TDS 7.4
+                    "tds_version": ((ver >> 28) & 0xF, (ver >> 24) & 0xF),
                     "program": prog,
-                    "program_version": (prog_ver >> 24, (prog_ver >> 16) & 0xFF,
+                    "program_version": ((prog_ver >> 24) & 0xFF,
+                                        (prog_ver >> 16) & 0xFF,
                                         prog_ver & 0xFFFF),
                 }
-                return info
+                # 不直接 return：继续消费 LOGINACK 之后的尾部 token
+                # （ENVCHANGE/INFO/DONE 等），直到缓冲清零（循环顶部判定），
+                # 否则残留字节会漏进下一条查询的 token 流 —— 真机实测
+                # （v1.7.5）登录响应的 DONE 残留被首条查询误读为其结果。
             elif token == TOK_ERROR:
                 number, state, level, msg = _read_error_token(r)
                 code = "access_denied" if number in (18456, 18452, 4064) else "auth_failed"
@@ -921,8 +949,11 @@ class _ResponseParser:
                 raise DBError("sql_error",
                               f"Msg {number}, Level {level}, State {state}：{msg}")
             elif token == TOK_ORDER:
+                # Count 是**字节数**（真机实证：1 列结果集的 ORDER 为
+                # a9 0200 0100 —— count=2、数据恰 2B=1 个列号 USHORT），
+                # 此前误当项数 skip(count*2) 多跳 2 字节导致行流错位。
                 count = r.u16()
-                r.skip(count * 2)
+                r.skip(count)
             elif token == TOK_RETURNSTATUS:
                 r.i32()
             elif token in (TOK_DONE, TOK_DONEPROC):
@@ -956,7 +987,10 @@ class _ResponseParser:
             r.u16()                  # Flags
             t, meta = _parse_type_info(r)
             nlen = r.u8()
-            name = r.bytes(nlen).decode("utf-16-le", "replace")
+            # ColName 的 B_VARCHAR 长度前缀是**字符数**，UTF-16 数据
+            # 字节数 = 字符数×2（真机实证：4 字符 "name" 占 8 字节，
+            # 此前按字节读只解出 "na" 导致后续 token 流全部错位）
+            name = r.bytes(nlen * 2).decode("utf-16-le", "replace")
             self.columns.append({"name": name, "type_id": t, "meta": meta,
                                  "type_name": _TYPE_NAMES.get(t, f"0x{t:02X}")})
 
@@ -1004,17 +1038,27 @@ class _ResponseParser:
         return status, cmd, rowcount
 
     def _envchange(self):
+        """ENVCHANGE：Length(USHORT 小端) 在前、Type(BYTE) 在后。
+
+        真机实证（v1.7.5 直连抓包）：e3 1b00 01 06 [master*12B] 06 [master*12B]
+        - Length=27 恰等于 type(1)+newlen(1)+new(12)+oldlen(1)+old(12)，含 Type 字节；
+        - type 1/2（database/language）的 newvalue/oldvalue 长度前缀是
+          BYTE **字符数**，数据为 UTF-16（字节数 = 字符数×2）；
+        - type 4（packet size）为 BYTE 字节数 + ASCII；
+        - type 7（collation）为 5 字节原始 BLOB。
+        Length 整块读取兜底：未知类型绝不错位。
+        """
         r = self.r
-        etype = r.u8()
         length = r.u16()
-        blob = r.bytes(length)
-        # 已知类型解码，未知类型整块跳过（Length 字段保证不越界）
-        if etype == 0x01:                     # Database：UTF-16LE
+        etype = r.u8()
+        blob = r.bytes(max(length - 1, 0))
+        if etype in (0x01, 0x02):           # Database / Language：字符数 + UTF-16
             if self._on_envchange:
-                self._on_envchange("database", _env_str(blob, "utf-16-le"))
-        elif etype == 0x04:                   # PacketSize：ASCII 数字
+                kind = "database" if etype == 0x01 else "language"
+                self._on_envchange(kind, _env_str_utf16(blob))
+        elif etype == 0x04:                 # PacketSize：字节数 + ASCII
             if self._on_envchange:
-                self._on_envchange("packet_size", _env_str(blob, "latin-1"))
+                self._on_envchange("packet_size", _env_str_ascii(blob))
 
     def _result(self):
         return {
@@ -1028,22 +1072,39 @@ class _ResponseParser:
         }
 
 
-def _env_str(blob: bytes, encoding: str):
-    """ENVCHANGE 的 NewValue：BYTE 长度前缀 + 指定编码的字符串。"""
+def _env_str_utf16(blob: bytes):
+    """ENVCHANGE Database/Language 的 NewValue：BYTE 字符数 + UTF-16 数据。"""
     if not blob:
         return None
     n = blob[0]
-    return blob[1:1 + n].decode(encoding, "replace")
+    return blob[1:1 + n * 2].decode("utf-16-le", "replace")
+
+
+def _env_str_ascii(blob: bytes):
+    """ENVCHANGE PacketSize 的 NewValue：BYTE 字节数 + ASCII。"""
+    if not blob:
+        return None
+    n = blob[0]
+    return blob[1:1 + n].decode("latin-1", "replace")
 
 
 def _read_error_token(r: _Reader):
-    number = r.i32()
-    state = r.u8()
-    level = r.u8()
-    msg = r.ushort_varchar_utf16()
-    server = r.us_varchar()
-    proc = r.us_varchar()
-    line = r.u16()
+    """ERROR/INFO token：Length 整块读取兜底，字段从块内解析。
+
+    真机实证（v1.7.5）：Length 含 number 之后的所有字段；MsgText 的
+    USHORT 前缀是**字符数**（UTF-16，字节数 = 字符数×2），此前按字节数
+    读导致 token 流错位死等。ServerName/ProcName/LineNo 不解析，
+    整块跳过 —— Length 保证与下一 token 边界对齐。
+    """
+    length = r.u16()
+    blob = r.bytes(max(length, 0))
+    if len(blob) < 8:
+        return 0, 0, 0, ""
+    number = struct.unpack_from("<i", blob, 0)[0]
+    state = blob[4]
+    level = blob[5]
+    n = struct.unpack_from("<H", blob, 6)[0]
+    msg = blob[8:8 + n * 2].decode("utf-16-le", "replace")
     return number, state, level, msg
 
 

@@ -123,9 +123,11 @@ data_len = sum(len(s) for s in [
     b"", "wkfile".encode("utf-16-le"), b"", "master".encode("utf-16-le")])
 check(len(rec) == 94 + data_len, "LOGIN7 总长", f"{len(rec)} vs {94 + data_len}")
 check(struct.unpack_from("<I", rec, 0)[0] == len(rec), "LOGIN7 Length 字段")
-# TDSVersion 是 LOGIN7 里唯一的大端字段（线上字节 74 00 00 04）
-check(struct.unpack_from(">I", rec, 4)[0] == 0x74000004, "LOGIN7 TDSVersion 大端")
-check(rec[4:8] == b"\x74\x00\x00\x04", "LOGIN7 TDSVersion 字节序")
+# TDSVersion 与全结构同为小端：0x74000004 -> 线上 04 00 00 74。
+# 真机实证（v1.7.5，SQL Server 2022）：小端打包被服务端接受并回登录响应；
+# 大端 74 00 00 04 被服务端判为无效版本静默断连。pytds 生产实现同此。
+check(struct.unpack_from("<I", rec, 4)[0] == 0x74000004, "LOGIN7 TDSVersion 小端")
+check(rec[4:8] == b"\x04\x00\x00\x74", "LOGIN7 TDSVersion 字节序")
 check(struct.unpack_from("<I", rec, 8)[0] == 4096, "LOGIN7 PacketSize")
 check(rec[24] == 0xF0, "LOGIN7 OptionFlags1", hex(rec[24]))
 check(rec[27] == 0x08, "LOGIN7 OptionFlags3", hex(rec[27]))
@@ -228,11 +230,11 @@ def utf16(s):
 
 
 def colmeta_intn_name():
-    """两列：INTN(4) id、NVARCHAR(100) name。"""
+    """两列：INTN(4) id、NVARCHAR(100) name。列名长度前缀 = 字符数。"""
     return (b"\x81" + u16(2)
-            + struct.pack("<IH", 0, 0) + b"\x26\x04" + b"\x04" + utf16("id")
+            + struct.pack("<IH", 0, 0) + b"\x26\x04" + b"\x02" + utf16("id")
             + struct.pack("<IH", 0, 0) + b"\xe7" + u16(100) + b"\x00" * 5
-            + b"\x08" + utf16("name"))
+            + b"\x04" + utf16("name"))
 
 
 def done(status=0x10, rowcount=0):
@@ -264,16 +266,30 @@ res = parse_stream(stream)
 check(res["rows"] == [[None, "Bob"]], "NBCROW 位图 NULL", str(res["rows"]))
 
 # 6.3 写语句：无结果集，只有 DONE
-res = parse_stream(b"\xe3\x01" + u16(10) + b"\x08" + utf16("mydb") + b"\x00"
-                   + done(0x10, 5))
+# ENVCHANGE 真机实证格式：Length(USHORT，含 Type 字节) 在前、Type 在后；
+# type 1/2 的 newvalue/oldvalue 长度前缀 = 字符数（UTF-16 字节数 ×2）
+env_db_tok = b"\xe3" + u16(11) + b"\x01" + b"\x04" + utf16("mydb") + b"\x00"
+res = parse_stream(env_db_tok + done(0x10, 5))
 check(res["rows"] == [] and res["columns"] == [], "写语句无结果集")
 check(res["affected_rows"] == 5, "写语句 affected=5")
 check(res["insert_id"] is None, "insert_id 恒 None")
 
-# 6.4 ERROR token → sql_error
+# 6.4 ERROR token → sql_error（真机实证：Length(USHORT) 整块在前，
+# MsgText 的 USHORT 前缀 = 字符数）
+def err_token(number, state, level, msg):
+    body = struct.pack("<i", number) + bytes([state, level]) \
+        + u16(len(msg)) + utf16(msg)
+    return b"\xaa" + u16(len(body)) + body
+
+
+def info_token(number, state, level, msg):
+    body = struct.pack("<i", number) + bytes([state, level]) \
+        + u16(len(msg)) + utf16(msg)
+    return b"\xab" + u16(len(body)) + body
+
+
 msg = "除以零错误"
-err = (b"\xaa" + struct.pack("<i", 8115) + b"\x02\x10"
-       + u16(len(utf16(msg))) + utf16(msg) + b"\x00" + b"\x00" + u16(1))
+err = err_token(8115, 2, 0x10, msg)
 try:
     parse_stream(err + done(0x02, 0))
     check(False, "ERROR token 应抛异常")
@@ -283,29 +299,29 @@ except srv.DBError as exc:
 
 # 6.5 INFO token → notes
 msg = "已更改数据库上下文"
-info = (b"\xab" + struct.pack("<i", 5701) + b"\x01\x10"
-        + u16(len(utf16(msg))) + utf16(msg) + b"\x00" + b"\x00" + u16(1))
+info = info_token(5701, 1, 0x10, msg)
 notes = []
 parser = srv._ResponseParser(MemFill(info + done(0x00, 0)), True, notes)
 res = parser.process_query(200, 4 * 1024 * 1024)
 check(len(notes) == 1 and "已更改数据库上下文" in notes[0], "INFO 进 notes",
       str(notes))
 
-# 6.6 ENVCHANGE：包大小回调
+# 6.6 ENVCHANGE：包大小回调（type 4：newvalue 长度=字节数 + ASCII）
 changes = []
-stream = (b"\xe3\x04" + u16(8) + b"\x04" + b"4096" + b"\x02" + b"40" + done(0x00, 0))
+stream = (b"\xe3" + u16(9) + b"\x04" + b"\x04" + b"4096" + b"\x02" + b"40"
+          + done(0x00, 0))
 parser = srv._ResponseParser(MemFill(stream), True, [],
                              on_envchange=lambda k, v: changes.append((k, v)))
 parser.process_query(200, 4 * 1024 * 1024)
 check(changes == [("packet_size", "4096")], "ENVCHANGE 包大小", str(changes))
 
-# 6.7 未知 ENVCHANGE 类型整块跳过
-stream = (b"\xe3\x09" + u16(10) + b"\x08" + b"\x01" * 8 + b"\x00" + done(0x00, 0))
+# 6.7 未知 ENVCHANGE 类型整块跳过（Length 含 Type 字节）
+stream = (b"\xe3" + u16(9) + b"\x09" + b"\x01" * 8 + done(0x00, 0))
 res = parse_stream(stream)
 check(res["row_count"] == 0, "未知 ENVCHANGE 跳过")
 
-# 6.8 ORDER token 跳过
-stream = (b"\xa9" + u16(2) + u16(1) + u16(2) + done(0x00, 0))
+# 6.8 ORDER token 跳过（真机实证：Count 是字节数，非项数）
+stream = (b"\xa9" + u16(4) + u16(1) + u16(2) + done(0x00, 0))
 res = parse_stream(stream)
 check(res["row_count"] == 0, "ORDER token 跳过")
 
@@ -316,10 +332,10 @@ parser = srv._ResponseParser(MemFill(stream), True, [])
 res = parser.process_query(2, 4 * 1024 * 1024)
 check(len(res["rows"]) == 2 and res["truncated"], "max_rows 截断", str(len(res["rows"])))
 
-# 6.10 各标量类型解码
+# 6.10 各标量类型解码（列名长度前缀 = 字符数）
 def colmeta(t, meta_bytes, name):
     return (b"\x81" + u16(1) + struct.pack("<IH", 0, 0) + bytes([t]) + meta_bytes
-            + bytes([len(utf16(name))]) + utf16(name))
+            + bytes([len(name)]) + utf16(name))
 
 cases = [
     # (类型, meta, 行数据, 期望值)
@@ -444,13 +460,17 @@ check(parse_stream(stream)["rows"][0][0] == "AB", "NVARCHAR(max) PLP")
 # 7. 登录响应解析
 # ---------------------------------------------------------------------------
 prog = "Microsoft SQL Server"
-loginack = (b"\xad" + b"\x01" + struct.pack(">H", 0x0704)
-            + bytes([len(prog)]) + prog.encode("latin-1")
-            + struct.pack("<I", 0x0C0055D3))
-env_db = b"\xe3\x01" + u16(14) + b"\x0c" + utf16("master") + b"\x00"
+# LOGINACK 真机实证格式：Length(USHORT) + Interface(1B) + TDSVersion(4B 大端
+# 0x74000004，高字节 0x74=(7<<4)|4 即 TDS 7.4) + 程序名(B_VARCHAR 字符数+UTF-16)
+# + ProgVersion(4B)。Length = 1+4+1+字节数+4
+_name = utf16(prog)
+_body = b"\x01" + struct.pack(">I", 0x74000004) + bytes([len(prog)]) + _name \
+    + struct.pack(">I", 0x100004A6)
+loginack = b"\xad" + u16(len(_body)) + _body
+env_db = b"\xe3" + u16(27) + b"\x01" + b"\x06" + utf16("master") + b"\x06" \
+    + utf16("master")
 msg = "已更改数据库上下文"
-info_tok = (b"\xab" + struct.pack("<i", 5701) + b"\x01\x10"
-            + u16(len(utf16(msg))) + utf16(msg) + b"\x00" + b"\x00" + u16(1))
+info_tok = info_token(5701, 1, 0x10, msg)
 login_stream = env_db + info_tok + loginack
 
 class PendingFill(MemFill):
@@ -473,8 +493,7 @@ check(len(notes) == 1, "登录期 INFO 记录", str(notes))
 
 # 登录失败：ERROR 18456
 msg = "用户 'sa' 登录失败"
-fail = (b"\xaa" + struct.pack("<i", 18456) + b"\x01\x14"
-        + u16(len(utf16(msg))) + utf16(msg) + b"\x00" + b"\x00" + u16(1))
+fail = err_token(18456, 1, 0x14, msg)
 pf = PendingFill(fail)
 parser = srv._ResponseParser(pf, True, [], pending=lambda: pf.left)
 expect_dberror("access_denied", parser.process_login, "登录失败 18456")
