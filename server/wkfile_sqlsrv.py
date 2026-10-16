@@ -370,10 +370,14 @@ def build_prelogin(version: int = TDS74_VERSION_VALUE, encrypt: int = 0x01) -> b
     """构造客户端 PRELOGIN 数据（不含 TDS 包头）。
 
     TLV：token(1B) + offset(2B 大端，相对数据区) + length(2B 大端)。
-    VERSION(0x00) 必须是第一项，我们只发 VERSION + ENCRYPTION + 终止符。
+    VERSION(0x00) 必须是第一项（否则服务端直接断连），其数据为
+    UL_VERSION(4B 大端) + US_SUBBUILD(2B 大端) 共 6 字节
+    —— [MS-TDS] 2.2.6.5：PL_OPTION_DATA = UL_VERSION US_SUBBUILD，
+    且 UL_VERSION 规定 network byte order（大端）。
+    我们只发 VERSION + ENCRYPTION + 终止符（FreeTDS 最小集合同此）。
     """
     entries = [
-        (0x00, struct.pack("<I", version)),
+        (0x00, struct.pack(">IH", version, 0)),
         (0x01, bytes([encrypt])),
     ]
     blob = b""
@@ -449,7 +453,9 @@ def build_login7(*, host_name: str, server_name: str, user: str, password: str,
     header = bytearray(94)
     data_len = sum(len(s) for s in strings)
     struct.pack_into("<I", header, 0, 94 + data_len)     # Length
-    struct.pack_into("<I", header, 4, TDS74_VERSION_VALUE)
+    # TDSVersion 是 LOGIN7 里唯一的大端字段（[MS-TDS] 2.2.6.4 / MS-SSTDS：
+    # "sent as big-endian"；FreeTDS 用字节交换常量 + 小端写入达成同样字节序）
+    struct.pack_into(">I", header, 4, TDS74_VERSION_VALUE)
     struct.pack_into("<I", header, 8, packet_size)       # PacketSize
     struct.pack_into("<I", header, 12, 0x07000000)       # ClientProgVer
     struct.pack_into("<I", header, 16, os.getpid() & 0xFFFFFFFF)

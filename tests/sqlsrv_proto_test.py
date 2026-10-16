@@ -67,17 +67,20 @@ check(unobfuscate(srv.obfuscate_password(pw16)) == pw16, "obfuscate utf16 可逆
 # 2. prelogin TLV 编解码
 # ---------------------------------------------------------------------------
 pl = srv.build_prelogin()
-# 目录：VERSION(0x00) off=0 len=4；ENCRYPTION(0x01) off=4 len=1；0xFF 终止
-check(pl == b"\x00\x00\x00\x00\x04" + b"\x01\x00\x04\x00\x01" + b"\xff"
-      + struct.pack("<I", 0x74000004) + b"\x01",
+# 目录：VERSION(0x00) off=0 len=6；ENCRYPTION(0x01) off=6 len=1；0xFF 终止
+# VERSION 数据 = UL_VERSION(4B 大端) + US_SUBBUILD(2B 大端)（[MS-TDS] 2.2.6.5）
+check(pl == b"\x00\x00\x00\x00\x06" + b"\x01\x00\x06\x00\x01" + b"\xff"
+      + struct.pack(">IH", 0x74000004, 0) + b"\x01",
       "prelogin 完整字节", pl.hex())
+check(pl[-7:] == b"\x74\x00\x00\x04\x00\x00\x01", "prelogin 版本大端+子构建号",
+      pl[-7:].hex())
 
-# 服务端风格响应：VERSION + ENCRYPTION + TERMINATOR
-resp = (b"\x00\x00\x00\x00\x04" + b"\x01\x00\x04\x00\x01" + b"\xff"
-        + b"\x74\x00\x00\x04" + b"\x01")
+# 服务端风格响应：VERSION(6B 大端) + ENCRYPTION + TERMINATOR
+resp = (b"\x00\x00\x00\x00\x06" + b"\x01\x00\x06\x00\x01" + b"\xff"
+        + b"\x74\x00\x00\x04\x00\x00" + b"\x01")
 opts = srv.parse_prelogin(resp)
 check(opts.get(0x01) == b"\x01", "parse_prelogin ENCRYPTION=ON")
-check(opts.get(0x00) == b"\x74\x00\x00\x04", "parse_prelogin VERSION")
+check(opts.get(0x00) == b"\x74\x00\x00\x04\x00\x00", "parse_prelogin VERSION 6 字节")
 # 目录项乱序 + 多选项
 resp2 = (b"\x00\x00\x00\x00\x04" + b"\x03\x00\x04\x00\x02" + b"\xff"
          + b"\x73\x0b\x00\x03" + b"\x00\x00")
@@ -100,7 +103,9 @@ data_len = sum(len(s) for s in [
     b"", "wkfile".encode("utf-16-le"), b"", "master".encode("utf-16-le")])
 check(len(rec) == 94 + data_len, "LOGIN7 总长", f"{len(rec)} vs {94 + data_len}")
 check(struct.unpack_from("<I", rec, 0)[0] == len(rec), "LOGIN7 Length 字段")
-check(struct.unpack_from("<I", rec, 4)[0] == 0x74000004, "LOGIN7 TDSVersion")
+# TDSVersion 是 LOGIN7 里唯一的大端字段（线上字节 74 00 00 04）
+check(struct.unpack_from(">I", rec, 4)[0] == 0x74000004, "LOGIN7 TDSVersion 大端")
+check(rec[4:8] == b"\x74\x00\x00\x04", "LOGIN7 TDSVersion 字节序")
 check(struct.unpack_from("<I", rec, 8)[0] == 4096, "LOGIN7 PacketSize")
 check(rec[24] == 0xF0, "LOGIN7 OptionFlags1", hex(rec[24]))
 check(rec[27] == 0x08, "LOGIN7 OptionFlags3", hex(rec[27]))
