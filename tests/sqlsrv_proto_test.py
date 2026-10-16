@@ -67,28 +67,48 @@ check(unobfuscate(srv.obfuscate_password(pw16)) == pw16, "obfuscate utf16 可逆
 # 2. prelogin TLV 编解码
 # ---------------------------------------------------------------------------
 pl = srv.build_prelogin()
-# 目录：VERSION(0x00) off=0 len=6；ENCRYPTION(0x01) off=6 len=1；0xFF 终止
+# 目录：VERSION(0x00) off=11 len=6；ENCRYPTION(0x01) off=17 len=1；0xFF 终止
+# offset 是相对 payload 起点的绝对偏移（目录 2 项 10B + 终止符 1B = 11）
 # VERSION 数据 = UL_VERSION(4B 大端) + US_SUBBUILD(2B 大端)（[MS-TDS] 2.2.6.5）
-check(pl == b"\x00\x00\x00\x00\x06" + b"\x01\x00\x06\x00\x01" + b"\xff"
+check(pl == b"\x00\x00\x0b\x00\x06" + b"\x01\x00\x11\x00\x01" + b"\xff"
       + struct.pack(">IH", 0x74000004, 0) + b"\x01",
-      "prelogin 完整字节", pl.hex())
+      "prelogin 完整字节（绝对偏移）", pl.hex())
 check(pl[-7:] == b"\x74\x00\x00\x04\x00\x00\x01", "prelogin 版本大端+子构建号",
       pl[-7:].hex())
 
 # 服务端风格响应：VERSION(6B 大端) + ENCRYPTION + TERMINATOR
-resp = (b"\x00\x00\x00\x00\x06" + b"\x01\x00\x06\x00\x01" + b"\xff"
+resp = (b"\x00\x00\x0b\x00\x06" + b"\x01\x00\x11\x00\x01" + b"\xff"
         + b"\x74\x00\x00\x04\x00\x00" + b"\x01")
 opts = srv.parse_prelogin(resp)
 check(opts.get(0x01) == b"\x01", "parse_prelogin ENCRYPTION=ON")
 check(opts.get(0x00) == b"\x74\x00\x00\x04\x00\x00", "parse_prelogin VERSION 6 字节")
-# 目录项乱序 + 多选项
-resp2 = (b"\x00\x00\x00\x00\x04" + b"\x03\x00\x04\x00\x02" + b"\xff"
+
+# 真实抓包风格：SQL Server 典型回复（VERSION/ENCRYPTION/INSTOPT/MARS 四项，
+# 目录 4×5+1=21B，offset 从 0x15=21 起步 —— 绝对偏移的铁证）
+resp3 = (b"\x00\x00\x15\x00\x06"       # VERSION  off=0x15 len=6
+         + b"\x01\x00\x1b\x00\x01"     # ENCRYPT  off=0x1b len=1
+         + b"\x02\x00\x1c\x00\x01"     # INSTOPT  off=0x1c len=1
+         + b"\x04\x00\x1d\x00\x01"     # MARS     off=0x1d len=1
+         + b"\xff"
+         + b"\x0f\x00\x05\x04\x00\x00" # SQL 2019 (15.0.1105) + subbuild
+         + b"\x01" + b"\x00" + b"\x00")
+opts3 = srv.parse_prelogin(resp3)
+check(opts3.get(0x00) == b"\x0f\x00\x05\x04\x00\x00", "真实抓包 VERSION")
+check(opts3.get(0x01) == b"\x01", "真实抓包 ENCRYPTION")
+check(opts3.get(0x02) == b"\x00", "真实抓包 INSTOPT=0（实例匹配）")
+check(opts3.get(0x04) == b"\x00", "真实抓包 MARS=off")
+# 目录项乱序 + 多选项（offset 仍指数据区绝对位置）
+resp2 = (b"\x00\x00\x0b\x00\x04" + b"\x03\x00\x0f\x00\x02" + b"\xff"
          + b"\x73\x0b\x00\x03" + b"\x00\x00")
 opts2 = srv.parse_prelogin(resp2)
 check(opts2.get(0x00) == b"\x73\x0b\x00\x03", "parse_prelogin 乱序 VERSION")
 check(opts2.get(0x03) == b"\x00\x00", "parse_prelogin 第三个选项")
 expect_dberror("protocol", lambda: srv.parse_prelogin(b"\x00\x00\x00"),
                "parse_prelogin 残缺")
+# offset 越界保护（真机曾触发的场景：offset 基准理解错导致读越界）
+expect_dberror("protocol",
+               lambda: srv.parse_prelogin(b"\x00\x00\xff\xff\x06\xff"),
+               "parse_prelogin 选项越界")
 
 # ---------------------------------------------------------------------------
 # 3. LOGIN7 布局（固定头 94 字节 + 字符串区）

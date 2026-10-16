@@ -369,21 +369,25 @@ def obfuscate_password(raw: bytes) -> bytes:
 def build_prelogin(version: int = TDS74_VERSION_VALUE, encrypt: int = 0x01) -> bytes:
     """构造客户端 PRELOGIN 数据（不含 TDS 包头）。
 
-    TLV：token(1B) + offset(2B 大端，相对数据区) + length(2B 大端)。
+    TLV：token(1B) + offset(2B 大端) + length(2B 大端)。
     VERSION(0x00) 必须是第一项（否则服务端直接断连），其数据为
     UL_VERSION(4B 大端) + US_SUBBUILD(2B 大端) 共 6 字节
     —— [MS-TDS] 2.2.6.5：PL_OPTION_DATA = UL_VERSION US_SUBBUILD，
     且 UL_VERSION 规定 network byte order（大端）。
+    **PL_OFFSET 是相对整个 PRELOGIN 数据（payload）起点的绝对偏移**
+    ——FreeTDS tds71_prelogin 常量自洽印证：4 项目录 20B + 0xFF 终止符
+    共 21B，VERSION 的 offset 恰为 0x15=21（数据区起点）。
     我们只发 VERSION + ENCRYPTION + 终止符（FreeTDS 最小集合同此）。
     """
     entries = [
         (0x00, struct.pack(">IH", version, 0)),
         (0x01, bytes([encrypt])),
     ]
+    base = 5 * len(entries) + 1      # 目录 + 终止符之后才是数据区
     blob = b""
     directory = b""
     for token, value in entries:
-        directory += bytes([token]) + struct.pack(">HH", len(blob), len(value))
+        directory += bytes([token]) + struct.pack(">HH", base + len(blob), len(value))
         blob += value
     return directory + b"\xff" + blob
 
@@ -391,8 +395,9 @@ def build_prelogin(version: int = TDS74_VERSION_VALUE, encrypt: int = 0x01) -> b
 def parse_prelogin(payload: bytes) -> dict:
     """解析服务端 PRELOGIN 响应，返回 {token: bytes}。
 
-    目录项：token(1B) + offset(2B 大端，相对数据区) + length(2B 大端)；
-    数据区从 0xFF 终止符之后开始。
+    目录项：token(1B) + offset(2B 大端) + length(2B 大端)；
+    **offset 相对整个 payload 起点的绝对偏移**（FreeTDS/真实抓包一致：
+    服务端目录 4 项 + 0xFF 共 21B，VERSION offset=0x15=21 即数据区起点）。
     """
     options = {}
     pos = 0
@@ -404,24 +409,12 @@ def parse_prelogin(payload: bytes) -> dict:
         if pos + 5 > end:
             raise DBError("protocol", "服务端 PRELOGIN 响应残缺")
         off, length = struct.unpack_from(">HH", payload, pos + 1)
-        base = _prelogin_data_base(payload)
-        value = payload[base + off: base + off + length]
+        value = payload[off: off + length]
         if len(value) != length:
             raise DBError("protocol", "服务端 PRELOGIN 选项越界")
         options[token] = value
         pos += 5
     return options
-
-
-def _prelogin_data_base(payload: bytes) -> int:
-    """算出 PRELOGIN 数据区起点（目录区结束、紧跟 0xFF 终止符之后）。"""
-    pos = 0
-    while pos < len(payload):
-        token = payload[pos]
-        if token == 0xFF:
-            return pos + 1
-        pos += 5
-    return len(payload)
 
 
 def build_login7(*, host_name: str, server_name: str, user: str, password: str,
