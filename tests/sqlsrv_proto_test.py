@@ -523,5 +523,20 @@ feeder = srv._PacketFeeder(ExactFill(wire))
 check(feeder.fill(100) == payload, "跨包重组")
 check(feeder.last_packet_info[0] == 0x04, "包类型记录")
 
+# _conn_closed：断连报错带协议阶段（区分 prelogin / TLS / 登录 / 查询）
+conn = srv.SQLServerConn("127.0.0.1", 1433, "sa", "x")
+conn._stage = "login7"
+e = conn._conn_closed()
+check(e.code == "conn_closed", "conn_closed 错误码")
+check("登录" in str(e), "报错带登录阶段")
+check("关闭" in str(e), "报错带关闭文案")
+conn._stage = "prelogin"
+check("PRELOGIN" in str(conn._conn_closed()), "报错带 prelogin 阶段")
+conn._stage = "query"
+check("查询" in str(conn._conn_closed()), "报错带查询阶段")
+check("TLS 关闭通知" in str(conn._conn_closed("TLS 关闭通知")), "附加说明拼接")
+conn2 = srv.SQLServerConn("h", 1, "u", "p")
+check(conn2._stage == "prelogin", "初始阶段为 prelogin")
+
 print(f"\nSQL Server 驱动协议测试：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

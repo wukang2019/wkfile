@@ -1074,6 +1074,29 @@ class SQLServerConn:
         self.spid = 0
         self.current_database = ""
         self._tds_ge_72 = True
+        # 断连诊断：记录当前协议阶段，conn_closed 报错会带上它
+        self._stage = "prelogin"
+
+    _STAGE_LABELS = {
+        "prelogin": "PRELOGIN 协商",
+        "tls-handshake": "TLS 握手",
+        "login7": "登录（LOGIN7）",
+        "query": "查询",
+    }
+
+    def _conn_closed(self, extra: str = "") -> "DBError":
+        """服务端主动断开连接：带上协议阶段，方便定位死在哪一步。"""
+        label = self._STAGE_LABELS.get(self._stage, self._stage)
+        tail = f"（{extra}）" if extra else ""
+        hint = ""
+        if self._stage == "prelogin":
+            hint = "；常见原因：连的端口不是 SQL Server、版本过老（需 2008+）或协议不兼容"
+        elif self._stage == "tls-handshake":
+            hint = "；常见原因：服务器只支持过老的 SSL 版本或证书握手失败"
+        elif self._stage == "login7":
+            hint = "；常见原因：登录包被服务端拒绝（版本/排序规则不兼容或账号策略）"
+        return DBError("conn_closed",
+                       f"连接被数据库关闭（{label}阶段{tail}）{hint}")
 
     # ---------- 明文阶段（prelogin / TLS 握手期） ----------
 
@@ -1095,7 +1118,7 @@ class SQLServerConn:
             except OSError as exc:
                 raise DBError("conn_failed", f"与数据库通信中断：{exc}")
             if not chunk:
-                raise DBError("conn_closed", "连接被数据库关闭")
+                raise self._conn_closed()
             buf += chunk
         return buf
 
@@ -1181,11 +1204,11 @@ class SQLServerConn:
                 except OSError as exc:
                     raise DBError("conn_failed", f"与数据库通信中断：{exc}")
                 if not wire:
-                    raise DBError("conn_closed", "连接被数据库关闭")
+                    raise self._conn_closed()
                 self._ssl.bio_write(wire)
                 continue
             except ssl.SSLZeroReturnError:
-                raise DBError("conn_closed", "连接被数据库关闭（TLS 关闭通知）")
+                raise self._conn_closed("TLS 关闭通知")
             except ssl.SSLError as exc:
                 raise DBError("conn_failed", f"TLS 读取失败：{exc}")
             if chunk:
@@ -1207,8 +1230,11 @@ class SQLServerConn:
         try:
             self.sock.settimeout(self.connect_timeout)
             self._negotiate_prelogin()
+            self._stage = "tls-handshake"
             self._handshake()
+            self._stage = "login7"
             self._login()
+            self._stage = "query"
             self.sock.settimeout(self.query_timeout)
         except Exception:
             self.close()
