@@ -1085,6 +1085,10 @@ section("P 证书链完整性（只有叶子证书 = Electron 客户端连不上
 
 _p_tmp = os.path.join(tmp, "p-chain")
 os.makedirs(_p_tmp, exist_ok=True)
+# P 节在 try 里，openssl 不可用/造链失败时这些变量不会定义 ——
+# Q 节的 skip 判断会直接 NameError 把整个测试带崩。先给默认空值。
+_p_leaf = ""
+_p_int = ""
 
 
 def _w(path, text):

@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.5\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.6\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.5.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.6.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.5\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.6\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -137,9 +137,12 @@ wkfile\                          ← 程序启动时唯一会创建的地方（�
 ├─ wkfile.config.json            配置（含 Token，别外传）
 ├─ wkfile.pid                    服务进程号
 ├─ logs\wkfile.log               运行日志
-├─ logs\audit.jsonl              审计日志（超 5 MB 轮转，留 3 份）
-├─ backups\<时间戳>\<根目录>\…    改写文件前的自动备份
-└─ trash\<trash_id>\…            删除的东西（可用 trash_id 恢复，不是真删）
+├─ logs\audit.jsonl              审计日志（超 5 MB 轮转，留 3 份；文件操作记
+│                                  path，数据库操作记 source/sql/database/table）
+├─ backups\<时间戳-毫秒>\<根目录>\…  改写/覆盖文件前的自动备份
+│                                  （总量超 backup_max_bytes 从最旧开始清，默认 2 GB）
+└─ trash\<trash_id>\…            删除的东西（可用 trash_id 恢复，不是真删；
+                                   超过 trash_retain_days 天自动清，默认 30 天）
 ```
 
 - **选址规则**：exe 所在目录若已叫 `wkfile` 就直接用（不套娃）；否则在 exe 同级
@@ -165,7 +168,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.5\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.6\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -407,7 +410,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > MySQL 8 默认的 `caching_sha2_password`（含首次连接的 RSA 公钥交换）已完整支持，
 > MariaDB / MySQL 5.7 / Redis 3.x 以上都验证过。
 >
-> **SQL Server 驱动（v1.7.0 新增，v1.7.2-1.7.5 修正协议细节）**：自己实现的 TDS 7.4 协议（prelogin 加密协商 →
+> **SQL Server 驱动（v1.7.0 新增，v1.7.2-1.7.5 修正协议细节，v1.7.6 增强数据保险链）**：自己实现的 TDS 7.4 协议（prelogin 加密协商 →
 > TLS 握手（握手报文按协议要求包在 TDS 包里搬运）→ LOGIN7 SQL 身份验证 →
 > token 流解析），支持 NBCROW 空值压缩行、varchar(max) 分块大对象、
 > DECIMAL 精确十进制、DATETIME2/DATETIMEOFFSET 等新版类型。边界：
@@ -646,7 +649,7 @@ python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：22 
 
 ````
 
-当前状态（v1.7.5 实测）：**53/53、220/220、48/48、13/13、11/11、152/152 全通过**。
+当前状态（v1.7.6 实测）：**53/53、220/220、48/48、13/13、11/11、152/152 全通过**。
 
 重新打包 exe（改完源码后）：
 

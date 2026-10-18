@@ -90,7 +90,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.5"
+VERSION = "1.7.6"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -145,6 +145,11 @@ DEFAULT_CONFIG = {
     # 0 = 不轮转
     "run_log_max_bytes": 2 * 1024 * 1024,
     "run_log_backup_count": 3,
+    # 备份目录总量上限：超过就从最旧的时间戳文件夹开始整目录清掉，
+    # 直到低于上限（0 = 不清理，保持旧行为）。防止长期运行吃满磁盘。
+    "backup_max_bytes": 2 * 1024 * 1024 * 1024,
+    # 回收站保留天数：超过天数的条目整个清掉（0 = 永久保留，保持旧行为）。
+    "trash_retain_days": 30,
     "tls_cert": "",
     "tls_key": "",
     # 中间证书链（可选）。证书商把「公钥证书」和「中间链」分成两个文件给的时候
@@ -249,6 +254,18 @@ def trash_root(base: str | None = None) -> str:
     path = os.path.join(base or data_dir(), TRASH_DIRNAME)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _dir_size(path: str) -> int:
+    """目录总字节数（读不了的文件按 0 计）。"""
+    total = 0
+    for cur, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(cur, name))
+            except OSError:
+                pass
+    return total
 
 
 def root_key(root: str) -> str:
@@ -1331,6 +1348,15 @@ class Agent:
         self.audit = Audit(cfg)
         self.fail_lock = threading.Lock()
         self.failures: dict[str, list[float]] = {}
+        # 启动时先把超限/超龄的备份与回收站清一遍（此后靠节流触发）
+        try:
+            self.cleanup_backups()
+        except Exception:
+            pass
+        try:
+            self.cleanup_trash()
+        except Exception:
+            pass
         # 每个请求线程各自的权限模式（见 set_request_mode）
         self._req_local = threading.local()
         # 被配置禁用的工具/操作名（MCP 与裸 HTTP 接口共用同一份名单）
@@ -1446,7 +1472,11 @@ class Agent:
         if not self.cfg.auto_backup or not os.path.exists(full):
             return None
         root = self.guard.root_of(full)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        now = datetime.now()
+        # 时间戳带毫秒：同一秒内连续改写同一文件时（AI 批量编辑很常见），
+        # 秒级 stamp 会让第二份备份直接盖掉第一份 —— 丢一段历史。
+        # 字符串排序仍按时间序（backup_list / _find_backup_for 依赖这一点）。
+        stamp = now.strftime("%Y%m%d-%H%M%S") + f"-{now.microsecond // 1000:03d}"
         rel = self.guard.rel_to_root(full)
         # 备份统一落在 wkfile\backups\<时间戳>\<根目录标识>\<相对路径>，
         # 不往被操作的业务目录里塞东西
@@ -1456,7 +1486,67 @@ class Agent:
             shutil.copy2(full, dest)
         except OSError:
             return None
+        self._maybe_cleanup_backups()
         return dest
+
+    # ---- 备份/回收站的容量与龄期清理 ----
+    # 备份和回收站此前没有任何上限：长期运行会无限累积（尤其删大目录时
+    # 整个搬进回收站），迟早吃满磁盘。审计日志一直有轮转，这里补齐对齐。
+
+    def _maybe_cleanup_backups(self):
+        """节流触发备份清理：每 32 次备份才真正扫一遍目录体积。"""
+        self._backup_cleanup_count = getattr(self, "_backup_cleanup_count", 0) + 1
+        if self._backup_cleanup_count % 32 != 1:
+            return
+        self.cleanup_backups()
+
+    def cleanup_backups(self):
+        """备份总量超 backup_max_bytes → 从最旧的时间戳文件夹整目录清掉。
+
+        时间戳文件夹之间互相独立（一个文件夹 = 一次改写动作），整目录删除
+        不会破坏其他备份的完整性。0 = 不清理。
+        """
+        limit = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
+        if limit <= 0:
+            return
+        base = backup_root(self.cfg.base_dir)
+        try:
+            stamps = sorted(d for d in os.listdir(base)
+                            if os.path.isdir(os.path.join(base, d)))
+        except OSError:
+            return
+        total = 0
+        sizes = {}
+        for st in stamps:
+            sz = _dir_size(os.path.join(base, st))
+            sizes[st] = sz
+            total += sz
+        for st in stamps:                     # 从最旧开始清，直到达标
+            if total <= limit:
+                break
+            shutil.rmtree(os.path.join(base, st), ignore_errors=True)
+            total -= sizes.get(st, 0)
+
+    def cleanup_trash(self):
+        """回收站超过 trash_retain_days 的条目整个清掉。0 = 永久保留。"""
+        days = int(getattr(self.cfg, "trash_retain_days", 0) or 0)
+        if days <= 0:
+            return
+        base = trash_root(self.cfg.base_dir)
+        cutoff = time.time() - days * 86400
+        try:
+            tids = os.listdir(base)
+        except OSError:
+            return
+        for tid in tids:
+            entry = os.path.join(base, tid)
+            probe = os.path.join(entry, "manifest.json")
+            try:
+                mtime = os.path.getmtime(probe if os.path.isfile(probe) else entry)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
 
     def _preflight(self, full: str, data: bytes) -> None:
         """写前语法预校验；不通过则抛错，调用方不得落盘。"""
@@ -1855,6 +1945,10 @@ class Agent:
         if os.path.exists(dst) and not req.get("overwrite", False):
             raise PathError("exists", f"目标已存在：{dst}（如需覆盖请传 overwrite=true）")
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        # 覆盖前把目标旧文件备份一份 —— 否则 move 盖掉的内容无法回档
+        # （目录覆盖场景 shutil.move 语义是「移进去」而非整目录替换，不涉及丢内容）
+        if os.path.exists(dst) and os.path.isfile(dst):
+            self._backup(dst)
         shutil.move(src, dst)
         return {"src": src, "dst": dst, "moved": True}
 
@@ -1867,6 +1961,9 @@ class Agent:
         if os.path.exists(dst) and not req.get("overwrite", False):
             raise PathError("exists", f"目标已存在：{dst}（如需覆盖请传 overwrite=true）")
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        # 覆盖前备份目标旧文件（文件级；目录覆盖走 copytree 逐文件合并，不整目录丢）
+        if os.path.exists(dst) and os.path.isfile(dst):
+            self._backup(dst)
         if os.path.isdir(src):
             shutil.copytree(src, dst, dirs_exist_ok=bool(req.get("overwrite", False)))
         else:
@@ -1902,6 +1999,10 @@ class Agent:
         with open(os.path.join(entry, "manifest.json"), "w",
                   encoding="utf-8") as fh:
             json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        try:
+            self.cleanup_trash()      # 顺手清超龄条目（条目数少，开销可忽略）
+        except Exception:
+            pass
         return manifest
 
     def op_trash_list(self, req: dict) -> dict:
@@ -2725,7 +2826,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _audit_record(self, action: str, req: dict, ip: str, started: float,
                       exc: Exception = None) -> dict:
-        """组装一条审计记录。用只读 Token 的请求会带上 scope=readonly 标记。"""
+        """组装一条审计记录。用只读 Token 的请求会带上 scope=readonly 标记。
+
+        数据库类操作（db_query/db_exec/db_tables/db_schema）的请求体里是
+        source/sql/database/table 而不是 path —— 必须单独捞出来落账，
+        否则审计日志只知道「有人调过 db_query」，查不了
+        「AI 到底对哪个库执行了什么语句」。
+        """
         req = req or {}
         rec = {
             "ip": ip,
@@ -2734,6 +2841,14 @@ class Handler(BaseHTTPRequestHandler):
             "path": str(req.get("path") or req.get("src") or req.get("root") or ""),
             "ms": int((time.time() - started) * 1000),
         }
+        if req.get("source"):
+            rec["source"] = str(req["source"])
+        if req.get("sql"):
+            rec["sql"] = str(req["sql"])[:200]     # 截断防日志膨胀
+        if req.get("database"):
+            rec["database"] = str(req["database"])
+        if req.get("table"):
+            rec["table"] = str(req["table"])
         if exc is not None:
             rec["error"] = getattr(exc, "code", None) or exc.__class__.__name__
         if self.agent.request_readonly():
