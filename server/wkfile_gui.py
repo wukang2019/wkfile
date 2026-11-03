@@ -258,6 +258,9 @@ class Wizard:
         self.var_preflight = tk.BooleanVar(value=True)
         self.var_mcp = tk.BooleanVar(value=True)
         self.var_tools: dict[str, tk.BooleanVar] = {}
+        # 远程命令执行（win_exec）的程序白名单，逗号分隔。
+        # 总开关复用工具级开关里的「执行远程命令」勾选框（= exec_enabled）
+        self.var_exec_allow = tk.StringVar(value="")
         self.var_audit_mb = tk.StringVar(value="5")
         self.var_runlog_mb = tk.StringVar(value="2")
         self.var_status = tk.StringVar(value="● 状态未知")
@@ -627,6 +630,23 @@ class Wizard:
             text="开放 MCP 端点 —— 允许客户端直连 …/mcp（关掉后所有 MCP 客户端都将无法接入）",
             variable=self.var_mcp,
         ).pack(anchor="w", pady=2)
+
+        g3b = ttk.LabelFrame(f, text=" 远程命令执行（win_exec）—— 权限最高的能力，默认关闭 ", padding=(12, 10))
+        g3b.pack(fill="x", pady=(12, 0))
+        ttk.Label(
+            g3b,
+            text="总开关就是上面「工具级开关」里的「执行远程命令」勾选框。\n"
+                 "开启前必须配置程序白名单（逗号分隔，命令链里每段的首程序都必须在名单里）：",
+        ).pack(anchor="w")
+        ttk.Entry(g3b, textvariable=self.var_exec_allow, width=72).pack(
+            anchor="w", fill="x", pady=(4, 0)
+        )
+        ttk.Label(
+            g3b,
+            text="PHP 运维示例：php, composer, dir, type。超时默认 60 秒，输出截 64KB，\n"
+                 "工作目录限定在授权根目录内，审计日志记录完整命令。",
+            foreground="#666",
+        ).pack(anchor="w", pady=(4, 0))
 
         g4 = ttk.LabelFrame(f, text=" 工具级开关（取消勾选 = 该工具不出现、直接调用也被拒） ", padding=(12, 10))
         g4.pack(fill="x", pady=(12, 0))
@@ -1531,6 +1551,12 @@ class Wizard:
         disabled = wa.disabled_tools(cfg)
         for name, var in self.var_tools.items():
             var.set(name not in disabled)
+        # win_exec 的勾选 = exec_enabled 总开关（而不是 tools_disable）
+        if "win_exec" in self.var_tools:
+            self.var_tools["win_exec"].set(bool(getattr(cfg, "exec_enabled", False)))
+        self.var_exec_allow.set(
+            ", ".join(str(x) for x in (getattr(cfg, "exec_allowed_commands", None) or []))
+        )
         self.lst_roots.delete(0, "end")
         for r in cfg.roots or []:
             self.lst_roots.insert("end", r)
@@ -1623,7 +1649,16 @@ class Wizard:
             "auto_backup": bool(self.var_backup.get()),
             "preflight_check": bool(self.var_preflight.get()),
             "enable_mcp": bool(self.var_mcp.get()),
-            "tools_disable": sorted(n for n, v in self.var_tools.items() if not v.get()),
+            # win_exec 的启停完全由 exec_enabled 决定（勾选框在工具级开关里，
+            # 但语义是总开关）——绝不写进 tools_disable，避免两套开关打架
+            "tools_disable": sorted(n for n, v in self.var_tools.items()
+                                    if not v.get() and n != "win_exec"),
+            "exec_enabled": bool(self.var_tools.get("win_exec")
+                                 and self.var_tools["win_exec"].get()),
+            "exec_allowed_commands": [
+                x.strip() for x in self.var_exec_allow.get().replace("，", ",").split(",")
+                if x.strip()
+            ],
             "audit_max_bytes": int(audit_mb * 1024 * 1024),
             "run_log_max_bytes": int(runlog_mb * 1024 * 1024),
             "databases": self._collect_databases(),

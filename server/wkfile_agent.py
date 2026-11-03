@@ -60,6 +60,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -90,7 +91,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.6"
+VERSION = "1.7.7"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -179,6 +180,14 @@ DEFAULT_CONFIG = {
     "enable_mcp": True,
     # 工具级禁用：写在这里的工具名不会出现在 tools/list 里，直接调用也会被拒
     "tools_disable": [],
+    # 远程命令执行（win_exec）。权限最高的能力，默认整体关闭：
+    #   exec_enabled = true 才会开放；且只能跑 exec_allowed_commands 白名单里的
+    #   程序（命令链每段的首程序都要过名单）；工作目录限定在 roots 内。
+    # 白名单示例（PHP 运维场景）：["php", "composer", "dir", "type"]
+    "exec_enabled": False,
+    "exec_allowed_commands": [],
+    "exec_timeout_sec": 60,
+    "exec_max_output_bytes": 65536,
     # 落盘前对 .py/.json/.jsonl/.xml/.toml 做一次语法校验，不通过则原文件不动
     "preflight_check": True,
     # 是否允许免鉴权访问 /health、/api/health（只返回服务名与版本，不含主机名）
@@ -710,7 +719,12 @@ def preflight_check(path: str, data: bytes) -> None:
 
 
 def disabled_tools(cfg) -> frozenset:
-    """从配置里取出被禁用的工具名（容忍写成字符串或空值）。"""
+    """从配置里取出被禁用的工具名（容忍写成字符串或空值）。
+
+    另外把「远程命令执行未开启」也表达成禁用：exec_enabled=false 时
+    win_exec 不出现在 tools/list 里，直接调用也会被拒——未开启的能力
+    对客户端应该是"不存在"，而不是"看得见调不动"。
+    """
     raw = getattr(cfg, "tools_disable", None) or []
     if isinstance(raw, str):
         raw = [x for x in re.split(r"[,;\s]+", raw) if x]
@@ -719,6 +733,8 @@ def disabled_tools(cfg) -> frozenset:
         name = str(item).strip()
         if name:
             out.add(name if name.startswith("win_") else "win_" + name)
+    if not getattr(cfg, "exec_enabled", False):
+        out.add("win_exec")
     return frozenset(out)
 
 
@@ -1886,8 +1902,17 @@ class Agent:
                 replaced_text = text.replace(old, new)
                 n = occurrences
         if n == 0:
-            return {"path": full, "replaced": 0, "occurrences": occurrences,
-                    "message": "没有找到匹配内容，文件未改动"}
+            # 未命中也给出上下文，省得调用方再 read 一趟排查（常见原因：
+            # old 与文件内容有细微出入、或编码转换后字符不一致）
+            head = text[:200].replace("\n", "\\n")
+            return {
+                "path": full, "replaced": 0, "occurrences": occurrences,
+                "message": "没有找到匹配内容，文件未改动",
+                "file_head": head,
+                "hint": "文件开头 200 字符见 file_head；若与预期不符，"
+                        "建议先用 win_read 看该区域的真实内容，"
+                        "或用 regex=true + dry_run=true 验证模式。",
+            }
 
         if req.get("dry_run"):
             # 只看不改：把将要发生的改动以 unified diff 返回，磁盘上什么都不动
@@ -2415,9 +2440,10 @@ class Agent:
         root = self.guard.resolve(req.get("root") or req.get("path"), allow_empty=True)
         if not root:
             root = self.cfg.roots[0]
-        pattern = req.get("regex")
+        pattern = req.get("regex") or req.get("pattern") or req.get("query")
         if not pattern:
-            raise PathError("bad_request", "regex 不能为空")
+            raise PathError("bad_request",
+                            "regex 不能为空（参数名 regex，也接受 pattern 别名）")
         flags = re.MULTILINE
         if req.get("ignore_case", True):
             flags |= re.IGNORECASE
@@ -2497,6 +2523,106 @@ class Agent:
             "count": len(matches),
             "truncated": truncated,
             "matches": matches,
+        }
+
+    # ------------------------------------------------------------------
+    # 远程命令执行（win_exec）
+    #
+    # 这是全服务权限最高的操作，围栏也是最多的，一重都不能少：
+    #   ① exec_enabled 总开关（默认 false —— 不显式开启就是没有这个能力）
+    #   ② exec_allowed_commands 程序白名单：命令链里每一段的首程序都必须
+    #      在名单里（防 "php a.php && del /s ." 这种借道），不区分大小写
+    #   ③ 工作目录必须落在 roots 白名单内（默认第一个根目录）
+    #   ④ 超时硬顶（默认 60s，上限 300s），超时连子进程树一起杀
+    #   ⑤ 只读 Token / 只读模式直接拒绝（同写文件）
+    #   ⑥ 输出截断（默认 64KB），审计日志记完整命令
+    # ------------------------------------------------------------------
+
+    def _exec_first_token(self, segment: str) -> str:
+        """取一段命令的首程序名（剥掉引号），用于白名单比对。"""
+        token = segment.strip().split(None, 1)[0] if segment.strip() else ""
+        return token.strip("\"'").lower()
+
+    def op_exec(self, req: dict) -> dict:
+        self._require_write()
+        if not self.cfg.exec_enabled:
+            raise PathError(
+                "exec_disabled",
+                "远程命令执行未开启。出于安全考虑默认关闭：在 wkfile.config.json 里"
+                "把 exec_enabled 改为 true，并在 exec_allowed_commands 配置允许执行的"
+                "程序白名单（如 [\"php\", \"composer\"]），重启服务后生效。",
+            )
+        command = str(req.get("command") or "").strip()
+        if not command:
+            raise PathError("bad_request", "command 不能为空")
+        allowed = [str(c).strip().lower() for c in (self.cfg.exec_allowed_commands or [])
+                   if str(c).strip()]
+        if not allowed:
+            raise PathError(
+                "exec_no_whitelist",
+                "exec_allowed_commands 白名单为空，拒绝执行任何命令。"
+                "请在配置里列出允许的程序，如 [\"php\", \"composer\", \"dir\"]。",
+            )
+        # 命令链每段（&& || & | ; 分隔）的首程序都要过白名单
+        for seg in re.split(r"\s*(?:&&|\|\||[&|;])\s*", command):
+            first = self._exec_first_token(seg)
+            if not first:
+                continue
+            if first not in allowed:
+                raise PathError(
+                    "exec_not_allowed",
+                    f"命令 {first} 不在白名单里（允许：{'、'.join(allowed)}）。"
+                    "需要放开的话，把程序名加进 exec_allowed_commands。",
+                )
+        # 工作目录：默认第一个根目录，必须落在白名单内
+        cwd_raw = req.get("cwd") or (self.cfg.roots[0] if self.cfg.roots else None)
+        if not cwd_raw:
+            raise PathError("bad_request", "没有可用的根目录作为工作目录，请传 cwd")
+        cwd = self.guard.resolve(str(cwd_raw))
+        if not os.path.isdir(cwd):
+            raise PathError("not_found", f"工作目录不存在：{cwd}")
+
+        timeout = min(max(self._int_arg(req, "timeout",
+                                        int(self.cfg.exec_timeout_sec or 60)) or 60, 1), 300)
+        max_out = int(self.cfg.exec_max_output_bytes or 65536)
+        started = time.time()
+        timed_out = False
+        try:
+            proc = subprocess.Popen(
+                ["cmd", "/c", command],
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as exc:
+            raise PathError("exec_failed", f"命令启动失败：{exc}")
+        try:
+            raw, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            # cmd /c 的子进程树必须连根杀，不然超时后命令可能还在后台跑
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
+            try:
+                raw, _ = proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001 —— 拿不到残留输出就算了
+                raw = b""
+        duration_ms = int((time.time() - started) * 1000)
+        output, out_enc = decode_text(raw or b"")
+        truncated = len(output.encode("utf-8", "ignore")) > max_out
+        if truncated:
+            cut = output.encode("utf-8", "ignore")[:max_out].decode("utf-8", "ignore")
+            output = cut + f"\n...（输出超过 {max_out} 字节，已截断）"
+        return {
+            "command": command,
+            "cwd": cwd,
+            "exit_code": None if timed_out else proc.returncode,
+            "timed_out": timed_out,
+            "duration_ms": duration_ms,
+            "output_encoding": out_enc,
+            "output_truncated": truncated,
+            "output": output,
         }
 
     # ---- 分发 ----
@@ -2757,6 +2883,7 @@ class Agent:
         "redis_keys": op_redis_keys,
         "redis_get": op_redis_get,
         "redis_write": op_redis_write,
+        "exec": op_exec,
     }
 
     def dispatch(self, action: str, req: dict) -> dict:
@@ -2849,6 +2976,8 @@ class Handler(BaseHTTPRequestHandler):
             rec["database"] = str(req["database"])
         if req.get("table"):
             rec["table"] = str(req["table"])
+        if req.get("command"):
+            rec["command"] = str(req["command"])[:300]   # win_exec：完整命令必须落账
         if exc is not None:
             rec["error"] = getattr(exc, "code", None) or exc.__class__.__name__
         if self.agent.request_readonly():

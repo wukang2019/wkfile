@@ -74,12 +74,13 @@ def _raises(fn, exc=Exception):
 # ---------------------------------------------------------------------------
 section("A 工具 annotations / title")
 
-check("工具数量为 33", len(mcp.TOOLS) == 33, str(len(mcp.TOOLS)))
+check("工具数量为 34（含默认关闭的 win_exec）", len(mcp.TOOLS) == 34, str(len(mcp.TOOLS)))
 check("每个工具都有 title + 4 项 annotations",
       all(t.get("title") and set(t.get("annotations", {})) ==
           {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"}
           for t in mcp.TOOLS))
-check("只读 21 / 写入 12", len(mcp.READ_ONLY_TOOLS) == 21 and len(mcp.WRITE_TOOLS) == 12,
+check("只读 21 / 写入 13（win_exec 属写）",
+      len(mcp.READ_ONLY_TOOLS) == 21 and len(mcp.WRITE_TOOLS) == 13,
       "%d/%d" % (len(mcp.READ_ONLY_TOOLS), len(mcp.WRITE_TOOLS)))
 ro = {t["name"]: t["annotations"] for t in mcp.TOOLS}
 
@@ -250,10 +251,12 @@ except wa.PathError as exc:
 check("被禁用的删除操作确实没执行", os.path.isfile(os.path.join(root, "good.py")))
 
 check("工具名支持不带 win_ 前缀的写法", wa.disabled_tools(
-    wa.Config({"tools_disable": ["trash", " win_move "]}, "x.json")) ==
+    wa.Config({"exec_enabled": True, "tools_disable": ["trash", " win_move "]}, "x.json")) ==
     frozenset({"win_trash", "win_move"}))
-check("tools_disable 为空时不禁用任何工具",
-      wa.disabled_tools(wa.Config({}, "x.json")) == frozenset())
+check("tools_disable 为空且 exec 开启时不禁用任何工具",
+      wa.disabled_tools(wa.Config({"exec_enabled": True}, "x.json")) == frozenset())
+check("exec 未开启时 win_exec 自动进入禁用集（其余不受影响）",
+      wa.disabled_tools(wa.Config({}, "x.json")) == frozenset({"win_exec"}))
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +365,8 @@ try:
     s4, b4 = http("/", TOKEN)
     d4 = (json.loads(b4).get("data") or {}) if s4 == 200 else {}
     check("GET / 带 Token → 200 且给出详细信息", s4 == 200 and "host" in d4, str(s4))
-    check("详细状态里能看到禁用工具", d4.get("mcp", {}).get("tools_disabled") == ["win_trash"],
+    check("详细状态里能看到禁用工具（含未开启的 win_exec）",
+          d4.get("mcp", {}).get("tools_disabled") == ["win_exec", "win_trash"],
           str(d4.get("mcp")))
 
     # MCP：禁用名单生效

@@ -128,7 +128,7 @@ def main():
     d = json.loads(body).get("data") or {}
     check("GET / 带 Token 返回详细状态", st == 200, f"status={st}")
     check("详细状态报告 mcp.enabled", d.get("mcp", {}).get("enabled") is True)
-    check("详细状态报告 33 个工具", d.get("mcp", {}).get("tools") == 33, str(d.get("mcp")))
+    check("详细状态报告 34 个工具", d.get("mcp", {}).get("tools") == 34, str(d.get("mcp")))
     check("详细状态版本与源码常量一致", d.get("version") == wa.VERSION, str(d.get("version")))
 
     print("\n========== 2. Streamable HTTP：initialize ==========")
@@ -154,7 +154,9 @@ def main():
     st, _, body = post("/mcp", jrpc("tools/list", {}, 2), headers={"Mcp-Session-Id": sid})
     tools = json.loads(body)["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("返回 33 个工具", len(tools) == 33, str(len(tools)))
+    # exec_enabled 默认 false：win_exec 对客户端应该"不存在"而不是"看得见调不动"
+    check("exec 未开启时 tools/list 返回 33 个且不含 win_exec",
+          len(tools) == 33 and "win_exec" not in names, str(len(tools)))
     check("含 win_read / win_write / win_grep",
           all(n in names for n in ("win_read", "win_write", "win_grep")))
     check("每个工具都有 inputSchema", all("inputSchema" in t for t in tools))

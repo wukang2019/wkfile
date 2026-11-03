@@ -24,7 +24,7 @@ def _read_version() -> str:
 
 
 EXPECT_VER = _read_version()
-EXPECT_TOOLS = 33
+EXPECT_TOOLS = 34
 
 
 def _find_exe():
@@ -104,6 +104,9 @@ def main():
         "ip_allowlist": ["127.0.0.1"],
         "enable_mcp": True,
         "audit_log": os.path.join(WORK, "audit.jsonl"),
+        # exe 端到端验证 win_exec（PyInstaller 冻结环境里 subprocess 行为必须实测）
+        "exec_enabled": True,
+        "exec_allowed_commands": ["echo"],
     }
     cfg_path = os.path.join(WORK, "wkfile.config.json")
     with open(cfg_path, "w", encoding="utf-8") as fh:
@@ -152,7 +155,7 @@ def main():
         check(f"版本与源码一致（{EXPECT_VER}）", h.get("version") == EXPECT_VER, str(h.get("version")))
         check("MCP 已启用", h.get("mcp", {}).get("enabled") is True)
         check(f"MCP 注册了 {EXPECT_TOOLS} 个工具", h.get("mcp", {}).get("tools") == EXPECT_TOOLS, str(h.get("mcp")))
-        check("exe 的写入无痕：tools_disable 为空",
+        check("exe 的写入无痕：tools_disable 为空（exec 已开启）",
               h.get("mcp", {}).get("tools_disabled") == [], str(h.get("mcp")))
 
         print("\n========== 2. exe 的 /mcp initialize ==========")
@@ -209,6 +212,44 @@ def main():
                            headers={"Mcp-Session-Id": sid})
         txt = " ".join(i.get("text", "") for i in json.loads(body)["result"]["content"])
         check("越权路径仍被拦截", "out_of_scope" in txt, txt[:200])
+
+        # win_exec 端到端：exe（PyInstaller 冻结环境）里的 subprocess 必须实测
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "echo exec-from-exe"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec 在 exe 里真实执行（echo 输出回传）",
+              r["isError"] is False and "exec-from-exe" in txt, txt[:200])
+
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "whoami"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec 白名单外命令（whoami）被拒",
+              r["isError"] is True and "exec_not_allowed" in txt, txt[:200])
+
+        # BOM 防误用：utf-8-sig 写入必须在 MCP 层被拦
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                                    "params": {"name": "win_write",
+                                               "arguments": {"path": os.path.join(share, "bom.php"),
+                                                             "content": "<?php",
+                                                             "encoding": "utf-8-sig"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("utf-8-sig 写入被拦（防 BOM 破坏 PHP）",
+              r["isError"] is True and "BOM" in txt, txt[:200])
+
+        # win_grep pattern 别名（真会话路径）
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                                    "params": {"name": "win_grep", "arguments": {"pattern": "ERROR", "root": share}}},
+                           headers={"Mcp-Session-Id": sid})
+        txt = " ".join(i.get("text", "") for i in json.loads(body)["result"]["content"])
+        check("win_grep 用 pattern 参数名也能命中", "disk full" in txt, txt[:200])
 
         print("\n========== 5. exe 的鉴权 ==========")
         st, _, _ = post("/mcp", {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}}, token=None)

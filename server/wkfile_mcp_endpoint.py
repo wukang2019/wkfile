@@ -246,7 +246,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "regex": {"type": "string", "description": "正则表达式，如 \"ERROR|Exception\""},
+                "regex": {"type": "string", "description": "正则表达式，如 \"ERROR|Exception\"（也接受参数名 pattern 作为别名）"},
                 "root": {"type": "string", "description": "搜索根目录，默认第一个根目录"},
                 "glob": {"type": "string", "description": "只搜匹配的文件名，默认 *"},
                 "ignore_case": {"type": "boolean", "description": "是否忽略大小写，默认 true"},
@@ -478,6 +478,21 @@ TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "win_exec",
+        "description": "在远程服务器上执行命令（运维利器，但**默认关闭**：需要服务端把 exec_enabled 改为 true 并配置程序白名单）。"
+                       "适合 composer 安装依赖、php 执行脚本、清缓存这类操作，省去「写临时脚本→web 触发→删脚本」的三步弯路。"
+                       "安全围栏：命令链中每一段的首程序都必须在白名单 exec_allowed_commands 里；工作目录必须在授权根目录内；超时默认 60 秒。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的命令，如 \"php -v\" 或 \"composer require phpspreadsheet\""},
+                "cwd": {"type": "string", "description": "工作目录（必须在授权根目录内），默认第一个根目录"},
+                "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 300"},
+            },
+            "required": ["command"],
+        },
+    },
 ]
 
 # 工具名 -> (中文短标题, 风险标注)
@@ -519,6 +534,9 @@ _TOOL_META = {
     # 客户端据此弹确认框是应该的。
     "win_db_exec":       ("执行写SQL",      _WRITE),
     "win_redis_write":   ("执行Redis写命令", _WRITE),
+    # win_exec 权限最高（远程命令执行），保持 destructiveHint=True：
+    # 默认服务端不开 exec_enabled，客户端弹确认是完全应该的
+    "win_exec":          ("执行远程命令",   _WRITE),
 }
 
 _unknown = sorted(set(_TOOL_META) - {t["name"] for t in TOOLS})
@@ -575,6 +593,7 @@ ROUTE_MAP = {
     "win_redis_keys": "redis_keys",
     "win_redis_get": "redis_get",
     "win_redis_write": "redis_write",
+    "win_exec": "exec",
 }
 
 
@@ -757,6 +776,15 @@ def render(tool_name: str, data: dict) -> str:
                 f"{data.get('path')}  预览（文件未改动）：将替换 {data.get('replaced')} 处\n"
                 + "-" * 60 + "\n" + str(data.get("diff") or "（无差异）")
             )
+
+    if tool_name == "win_exec":
+        state = "超时被杀" if data.get("timed_out") else f"退出码 {data.get('exit_code')}"
+        head = (
+            f"命令：{data.get('command')}\n"
+            f"目录：{data.get('cwd')}   {state}   耗时 {data.get('duration_ms')}ms"
+        )
+        flag = "（输出已截断）" if data.get("output_truncated") else ""
+        return head + "\n" + ("-" * 60) + flag + "\n" + str(data.get("output") or "（无输出）")
 
     if tool_name == "win_backup_list":
         if not data.get("items"):
@@ -971,13 +999,29 @@ def call_tool(dispatch, params: dict, *, disabled=()) -> dict:
         return {
             "content": [{
                 "type": "text",
-                "text": f"工具 {name} 已被服务端配置禁用（wkfile.config.json 的 tools_disable）。"
-                        f"如确需使用，请在服务器界面的「安全」页取消勾选后重启服务。",
+                "text": f"工具 {name} 当前不可用（被 tools_disable 禁用，或该能力未开启）。"
+                        f"win_exec 需要在服务端配置 exec_enabled=true 并设置命令白名单；"
+                        f"其它工具请在服务器界面的「安全」页检查后重启服务。",
             }],
             "isError": True,
         }
     action = ROUTE_MAP[name]
     payload = {k: v for k, v in args.items() if v is not None}
+    # BOM 防误用：AI 给写文件工具传 utf-8-sig 十有八九是想"兼容 BOM"，
+    # 实际效果是往 <?php / import 前塞 3 个 BOM 字节，直接把脚本写崩
+    # （PHP Fatal: Namespace declaration statement has to be the very first...）。
+    # 需要真正写 BOM 的场景让用户走服务端 API，MCP 面向 AI 一律拦下。
+    if name in ("win_write", "win_append") and "encoding" in payload:
+        if str(payload["encoding"]).strip().lower().replace("-", "").replace("_", "") == "utf8sig":
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "已拒绝：encoding=utf-8-sig 会把 BOM 写进文件开头，"
+                            "PHP 等脚本会直接 Fatal。MCP 接口只允许无 BOM 编码"
+                            "（推荐 utf-8；旧文件是 GBK 就传 gbk）。",
+                }],
+                "isError": True,
+            }
     try:
         data = dispatch(action, payload)
         return {"content": [{"type": "text", "text": render(name, data)}], "isError": False}
