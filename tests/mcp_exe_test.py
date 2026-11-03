@@ -350,6 +350,45 @@ def main():
         check("win_write backup=false 正常写入",
               json.loads(body)["result"]["isError"] is False, body[:200])
 
+        # v1.7.10：win_write_b64 内容级 sha256 校验（防 AI 客户端静默截断）
+        import base64 as _b64
+        b64_payload = "b64-verify-payload-line\n" * 30            # ~0.75KB
+        b64_raw = b64_payload.encode()
+        b64_sha = _hl.sha256(b64_raw).hexdigest()
+        b64_path = os.path.join(share, "b64-verify.txt")
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 17, "method": "tools/call",
+                                    "params": {"name": "win_write_b64",
+                                               "arguments": {"path": b64_path,
+                                                             "base64": _b64.b64encode(b64_raw).decode(),
+                                                             "expected_sha256": b64_sha}}},
+                           headers={"Mcp-Session-Id": sid})
+        check("win_write_b64 expected_sha256 一致时正常写入",
+              json.loads(body)["result"]["isError"] is False, body[:200])
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 18, "method": "tools/call",
+                                    "params": {"name": "win_write_b64",
+                                               "arguments": {"path": b64_path,
+                                                             "base64": _b64.b64encode(b64_raw).decode(),
+                                                             "expected_sha256": "0" * 64}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_write_b64 sha256 不匹配 409 拒写 + 报错引导 /api/upload",
+              r["isError"] is True and "conflict" in txt and "/api/upload" in txt,
+              txt[:200])
+        # 模拟「客户端截断」：base64 被截掉一半，hash 按完整内容算 → 必须拒
+        half_b64 = _b64.b64encode(b64_raw).decode()[:len(_b64.b64encode(b64_raw).decode()) // 2]
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 19, "method": "tools/call",
+                                    "params": {"name": "win_write_b64",
+                                               "arguments": {"path": b64_path,
+                                                             "base64": half_b64,
+                                                             "expected_sha256": b64_sha}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_write_b64 模拟客户端截断被 hash 兜底拒写",
+              r["isError"] is True and "conflict" in txt and "截断" in txt,
+              txt[:200])
+
         # BOM 防误用：utf-8-sig 写入必须在 MCP 层被拦
         st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
                                     "params": {"name": "win_write",

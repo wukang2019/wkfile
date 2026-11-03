@@ -272,12 +272,17 @@ TOOLS = [
     },
     {
         "name": "win_write_b64",
-        "description": "用 base64 内容写入二进制文件（自动建父目录，写前备份）。",
+        "description": "用 base64 内容写入二进制文件（自动建父目录，写前备份）。"
+                       "⚠️ 大文件（>8KB）慎用：base64 会让参数膨胀 33%，超长会被 AI 客户端静默截断"
+                       "而服务端无法察觉——请务必同时传 expected_sha256（按解码后原始内容计算），"
+                       "不匹配会 409 拒写；更大的文件（如整个 PHP 类文件）建议改走 HTTP 直传通道"
+                       " POST /api/upload（原始字节，用法见 tools/upload.py 或 README）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "文件绝对路径"},
                 "base64": {"type": "string", "description": "base64 编码的内容"},
+                "expected_sha256": {"type": "string", "description": "强烈建议提供：解码后原始内容的 sha256 十六进制值，防客户端截断写坏文件"},
                 "backup": {"type": "boolean", "description": "写前备份原文件，默认 true"},
             },
             "required": ["path", "base64"],

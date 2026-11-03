@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.9\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.10\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.9.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.10.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.9\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.10\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -168,7 +168,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.9\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.10\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -387,6 +387,14 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > python tools\upload.py --url http://服务器:8788 --token <主Token> ^
 >                         --from d:\deving\kh\app\xxx.php --to E:\kanghui\app\xxx.php
 > ```
+
+> **为什么大文件别走 `win_write_b64`（v1.7.10 起工具描述会明确提示）**——
+> base64 让内容膨胀 33%，超长参数会被 AI 客户端**静默截断**：截断发生在
+> 客户端，服务端收到的仍是合法 base64，自己发现不了，残缺文件直接上盘
+> （典型症状：写完 PHP 报 Fatal）。两个兜底：
+> ① 传 `expected_sha256`（按**解码后原始内容**计算）——不匹配 409 拒写，
+>   错误信息会引导改走 `/api/upload`；
+> ② 文件超过 ~8KB 一律走上面的 `/api/upload` 直传，根本不进 base64。
 
 ### 数据库工具怎么开
 
@@ -696,13 +704,13 @@ python tests\mcp_e2e.py                 # MCP 端点（源码）：48 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
 python tests\tls_e2e.py                 # 真起 HTTPS 服务端到端（需 openssl，无则跳过）：11 用例
-python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：43 用例
+python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：46 用例
 ```
 
 
 ````
 
-当前状态（v1.7.9 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、48/48、13/13、11/11、152/152、43/43 全通过**。
+当前状态（v1.7.10 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、48/48、13/13、11/11、152/152、46/46 全通过**。
 
 重新打包 exe（改完源码后）：
 

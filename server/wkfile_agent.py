@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.9"
+VERSION = "1.7.10"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1870,6 +1870,20 @@ class Agent:
             raise PathError("bad_request", "base64 内容无法解码")
         if len(data) > int(self.cfg.max_write_bytes):
             raise PathError("too_large", "内容超过上限")
+        # 内容级校验（v1.7.10）：截断发生在 AI 客户端，服务端收到的仍是合法
+        # base64，靠它自己根本发现不了——expected_sha256 是唯一兜底，
+        # 不匹配直接拒写，别让残缺文件上盘。
+        expected = req.get("expected_sha256")
+        if expected:
+            actual = hashlib.sha256(data).hexdigest()
+            if actual.lower() != str(expected).lower():
+                raise PathError(
+                    "conflict",
+                    f"内容 sha256 校验失败（期望 {expected}，实际 {actual}）。"
+                    "最常见原因是大文件的 base64 参数被 AI 客户端截断——"
+                    "请改走 POST /api/upload 原始字节直传（用法见 tools/upload.py），"
+                    "或分块小段写入。",
+                )
         if req.get("create_dirs", True):
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         self._preflight(full, data)
