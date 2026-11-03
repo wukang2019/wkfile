@@ -91,7 +91,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.7"
+VERSION = "1.7.8"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -181,11 +181,17 @@ DEFAULT_CONFIG = {
     # 工具级禁用：写在这里的工具名不会出现在 tools/list 里，直接调用也会被拒
     "tools_disable": [],
     # 远程命令执行（win_exec）。权限最高的能力，默认整体关闭：
-    #   exec_enabled = true 才会开放；且只能跑 exec_allowed_commands 白名单里的
-    #   程序（命令链每段的首程序都要过名单）；工作目录限定在 roots 内。
-    # 白名单示例（PHP 运维场景）：["php", "composer", "dir", "type"]
+    #   exec_enabled = true 才会开放；且首程序必须在 exec_allowed_commands
+    #   白名单里（v1.7.8 起只查整条命令的首程序——剥掉 cmd /c 前缀后第一个
+    #   token；&&、||、|、重定向 2>&1 等全部原样交给 cmd 自己处理，
+    #   不再逐段拆链。这是实测反馈：逐段检查会让复合命令寸步难行，
+    #   set a=b&&php -v / echo x 2>&1 / 带引号参数 全部误伤）。
+    #   想要回到 v1.7.7 的逐段严格模式，把 exec_strict_chain 设为 true。
+    #   短名/带 .exe/全路径调用都认（按 basename 比对，php == php.exe）。
+    # 白名单示例（PHP 运维场景）：["php", "composer", "cmd", "dir", "type"]
     "exec_enabled": False,
     "exec_allowed_commands": [],
+    "exec_strict_chain": False,
     "exec_timeout_sec": 60,
     "exec_max_output_bytes": 65536,
     # 落盘前对 .py/.json/.jsonl/.xml/.toml 做一次语法校验，不通过则原文件不动
@@ -1108,6 +1114,15 @@ _CONFIG_NOTES = {
     ],
     '"roots"': [
         "// ★ 允许 AI 操作的目录白名单，越窄越安全。例： \"roots\": [\"D:\\\\share\"]",
+    ],
+    '"exec_allowed_commands"': [
+        "// 远程命令执行（win_exec）的程序白名单：只查整条命令的首程序",
+        "//（去掉 cmd /c 前缀后第一个程序），&&、|、2>&1 都交给 cmd 处理。",
+        "// 短名/带 .exe/全路径都认。例：[\"php\", \"composer\", \"cmd\"]",
+    ],
+    '"exec_strict_chain"': [
+        "// 严格模式：命令链每一段（&& / | 分隔）的首程序都要过白名单。",
+        "// 默认 false（只查首程序）。追求极致安全再开 true。",
     ],
     '"token"': [
         "// ★ 访问 Token。留空时程序会自动生成一个；也可以自己填任意长随机串。",
@@ -2530,18 +2545,83 @@ class Agent:
     #
     # 这是全服务权限最高的操作，围栏也是最多的，一重都不能少：
     #   ① exec_enabled 总开关（默认 false —— 不显式开启就是没有这个能力）
-    #   ② exec_allowed_commands 程序白名单：命令链里每一段的首程序都必须
-    #      在名单里（防 "php a.php && del /s ." 这种借道），不区分大小写
+    #   ② exec_allowed_commands 程序白名单：v1.7.8 起只查**整条命令的首程序**
+    #      （剥掉 cmd /c 前缀后的第一个 token，按 basename 比对，php == php.exe）。
+    #      &&、||、|、; 与重定向 2>&1 全部原样交给 cmd 自己处理——
+    #      旧版逐段拆链在实战里寸步难行（set a=b&&php -v、echo x 2>&1 全误伤）。
+    #      需要回到逐段严格模式（命令链每一段首程序都过名单），配
+    #      exec_strict_chain = true。
     #   ③ 工作目录必须落在 roots 白名单内（默认第一个根目录）
     #   ④ 超时硬顶（默认 60s，上限 300s），超时连子进程树一起杀
     #   ⑤ 只读 Token / 只读模式直接拒绝（同写文件）
     #   ⑥ 输出截断（默认 64KB），审计日志记完整命令
     # ------------------------------------------------------------------
 
-    def _exec_first_token(self, segment: str) -> str:
-        """取一段命令的首程序名（剥掉引号），用于白名单比对。"""
-        token = segment.strip().split(None, 1)[0] if segment.strip() else ""
-        return token.strip("\"'").lower()
+    _CMD_SAFE_SWITCHES = ("/c", "/d", "/s", "/q")
+
+    def _exec_norm_program(self, token: str) -> str:
+        """把首程序 token 归一化成可比对的名字：剥引号、取 basename、小写。
+
+        白名单里写 "php"，命令里写 php / php.exe / "C:\\php\\php.exe" 都认。
+        """
+        t = token.strip().strip("\"'")
+        return os.path.basename(t).lower()
+
+    def _exec_head_program(self, command: str) -> str:
+        """解析整条命令的首程序（v1.7.8 白名单只看它）。
+
+        规则：
+        - 按空白取第一个 token，引号内的空白不算数（cmd 的引号语义跟
+          shlex 不同，手写扫描最稳）；
+        - 若首 token 是 cmd/cmd.exe，吃掉它和后续安全开关（/c /d /s /q），
+          再取下一个 token 当首程序 —— "cmd /c php -v" 查的是 php；
+          /k 是常驻交互模式，直接拒绝；
+        - 返回归一化后的程序名。
+        """
+        tokens, cur, in_quote = [], [], False
+        for ch in command:
+            if ch == '"':
+                in_quote = not in_quote
+                cur.append(ch)
+            elif ch in " \t" and not in_quote:
+                if cur:
+                    tokens.append("".join(cur))
+                    cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            tokens.append("".join(cur))
+        if not tokens:
+            raise PathError("bad_request", "command 不能为空")
+        head = self._exec_norm_program(tokens[0])
+        if head not in ("cmd", "cmd.exe"):
+            return head
+        idx = 1
+        while idx < len(tokens) and tokens[idx].startswith("/"):
+            sw = tokens[idx].lower()
+            if sw == "/k":
+                raise PathError(
+                    "exec_not_allowed",
+                    "不支持 cmd /k（交互常驻模式）。请用 cmd /c 一次性执行。",
+                )
+            if sw not in self._CMD_SAFE_SWITCHES:
+                raise PathError(
+                    "exec_not_allowed",
+                    f"不支持的 cmd 开关 {tokens[idx]}（仅支持 "
+                    + " ".join(self._CMD_SAFE_SWITCHES) + "）。",
+                )
+            idx += 1
+        if idx >= len(tokens):
+            raise PathError("bad_request", "cmd /c 后面没有要执行的命令")
+        return self._exec_norm_program(tokens[idx])
+
+    def _exec_whitelisted(self, program: str, allowed) -> bool:
+        """短名/带 .exe/全路径调用都认：php == php.exe == C:\\x\\php.exe。"""
+        if program in allowed:
+            return True
+        if program.endswith(".exe") and program[:-4] in allowed:
+            return True
+        return program + ".exe" in allowed
 
     def op_exec(self, req: dict) -> dict:
         self._require_write()
@@ -2555,25 +2635,42 @@ class Agent:
         command = str(req.get("command") or "").strip()
         if not command:
             raise PathError("bad_request", "command 不能为空")
-        allowed = [str(c).strip().lower() for c in (self.cfg.exec_allowed_commands or [])
-                   if str(c).strip()]
+        allowed = sorted({self._exec_norm_program(str(c))
+                          for c in (self.cfg.exec_allowed_commands or [])
+                          if str(c).strip()})
         if not allowed:
             raise PathError(
                 "exec_no_whitelist",
                 "exec_allowed_commands 白名单为空，拒绝执行任何命令。"
                 "请在配置里列出允许的程序，如 [\"php\", \"composer\", \"dir\"]。",
             )
-        # 命令链每段（&& || & | ; 分隔）的首程序都要过白名单
-        for seg in re.split(r"\s*(?:&&|\|\||[&|;])\s*", command):
-            first = self._exec_first_token(seg)
-            if not first:
-                continue
-            if first not in allowed:
-                raise PathError(
-                    "exec_not_allowed",
-                    f"命令 {first} 不在白名单里（允许：{'、'.join(allowed)}）。"
-                    "需要放开的话，把程序名加进 exec_allowed_commands。",
-                )
+        # 围栏②：首程序过白名单（剥掉 cmd /c 前缀后检查）
+        program = self._exec_head_program(command)
+        if not self._exec_whitelisted(program, allowed):
+            raise PathError(
+                "exec_not_allowed",
+                f"命令 {program} 不在白名单里（允许：{'、'.join(allowed)}）。"
+                "v1.7.8 起白名单只查整条命令的首程序（去掉 cmd /c 前缀后第一个"
+                "程序），后面的参数、&&、|、重定向都原样交给 cmd 处理；"
+                "需要放开的话，把程序名加进 exec_allowed_commands。",
+            )
+        # 可选严格模式：命令链每一段（&& || & | ; 分隔）的首程序都要过白名单。
+        # 重定向 2>&1 里的 & 不算分隔符（旧版会拆出 "1" 来误报，这里先打码）。
+        if getattr(self.cfg, "exec_strict_chain", False):
+            masked = re.sub(r"(\d*)&(\d+)",
+                            lambda m: m.group(1) + "\x01" + m.group(2), command)
+            for seg in re.split(r"\s*(?:&&|\|\||[&|;])\s*", masked):
+                seg = seg.replace("\x01", "&").strip()
+                if not seg:
+                    continue
+                seg_program = self._exec_head_program(seg)
+                if not self._exec_whitelisted(seg_program, allowed):
+                    raise PathError(
+                        "exec_not_allowed",
+                        f"严格模式：命令链中 {seg_program} 不在白名单里"
+                        f"（允许：{'、'.join(allowed)}）。可关掉 exec_strict_chain"
+                        "回到只查首程序的默认模式。",
+                    )
         # 工作目录：默认第一个根目录，必须落在白名单内
         cwd_raw = req.get("cwd") or (self.cfg.roots[0] if self.cfg.roots else None)
         if not cwd_raw:
@@ -2587,9 +2684,20 @@ class Agent:
         max_out = int(self.cfg.exec_max_output_bytes or 65536)
         started = time.time()
         timed_out = False
+        # 整串原样交给 cmd：引号、&&、|、2>&1 全由 cmd 自己解析。
+        # 关键点（v1.7.8 修复"引号被吞"）：
+        #   * 用单字符串命令行而不是参数列表 —— 列表形式会被 list2cmdline
+        #     二次转义，内层引号变成 ""，cmd 解析后原引号就丢了；
+        #   * /d 跳过 AutoRun 注册表劫持；/s 让 cmd 只剥我们加的最外层一对
+        #     引号，command 里的引号原样保留；
+        #   * cmd.exe 用 ComSpec 全路径启动，不吃当前目录搜索序的亏
+        #     （工作目录在授权 roots 内、AI 有写权限，不能给它塞假 cmd.exe 的机会）。
+        comspec = os.environ.get("ComSpec") or "cmd.exe"
+        if " " in comspec and not comspec.startswith('"'):
+            comspec = f'"{comspec}"'
         try:
             proc = subprocess.Popen(
-                ["cmd", "/c", command],
+                f'{comspec} /d /s /c "{command}"',
                 cwd=cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

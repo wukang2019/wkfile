@@ -482,7 +482,9 @@ TOOLS = [
         "name": "win_exec",
         "description": "在远程服务器上执行命令（运维利器，但**默认关闭**：需要服务端把 exec_enabled 改为 true 并配置程序白名单）。"
                        "适合 composer 安装依赖、php 执行脚本、清缓存这类操作，省去「写临时脚本→web 触发→删脚本」的三步弯路。"
-                       "安全围栏：命令链中每一段的首程序都必须在白名单 exec_allowed_commands 里；工作目录必须在授权根目录内；超时默认 60 秒。",
+                       "白名单只查整条命令的首程序（去掉 cmd /c 前缀后第一个程序，php 等价 php.exe），"
+                       "后面的参数、&&、||、| 管道、2>&1 重定向、带引号的字符串都原样交给 cmd 处理。"
+                       "安全围栏：首程序必须在白名单 exec_allowed_commands 里；工作目录必须在授权根目录内；超时默认 60 秒。",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -232,6 +232,32 @@ def main():
         check("win_exec 白名单外命令（whoami）被拒",
               r["isError"] is True and "exec_not_allowed" in txt, txt[:200])
 
+        # v1.7.8：白名单只查首程序，复合命令交给 cmd（PyInstaller 冻结环境实测）
+        for cmd, needle, name in (
+            ("echo exe-chain-a && echo exe-chain-b", "exe-chain-b", "win_exec 复合命令 && 不再拆链误拒"),
+            ("echo exe-redir 2>&1",                  "exe-redir",   "win_exec 重定向 2>&1 不再拆出 1 误拒"),
+            ('echo "exe quoted"',                    '"exe quoted"', "win_exec 带引号参数原样保留"),
+            ("echo exe-pipe-src | findstr exe",      "exe-pipe-src", "win_exec 管道 | 正常工作"),
+            ("cmd /c echo exe-nested",               "exe-nested",  "win_exec cmd /c 前缀照常可用"),
+        ):
+            st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                                        "params": {"name": "win_exec",
+                                                   "arguments": {"command": cmd}}},
+                               headers={"Mcp-Session-Id": sid})
+            r = json.loads(body)["result"]
+            txt = " ".join(i.get("text", "") for i in r["content"])
+            check(name, r["isError"] is False and needle in txt, txt[:200])
+
+        # cmd /c 前缀剥掉后仍查首程序 —— whoami 借 cmd /c 走私必须被拒
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "cmd /c whoami"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec cmd /c whoami 走私被拒",
+              r["isError"] is True and "exec_not_allowed" in txt, txt[:200])
+
         # BOM 防误用：utf-8-sig 写入必须在 MCP 层被拦
         st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
                                     "params": {"name": "win_write",
