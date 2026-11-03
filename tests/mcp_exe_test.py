@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,6 +72,20 @@ def post(path, body, token=TOKEN, headers=None):
         return e.code, dict(e.headers), e.read().decode("utf-8", "replace")
 
 
+def post_raw(path, data: bytes, token=TOKEN):
+    """原始字节直传（/api/upload 用）：请求体不是 JSON。"""
+    url = f"http://127.0.0.1:{PORT}{path}"
+    hdrs = {"Content-Type": "application/octet-stream"}
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    try:
+        with OPENER.open(req, timeout=60) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
 def get(path, token=TOKEN):
     url = f"http://127.0.0.1:{PORT}{path}"
     hdrs = {"Accept": "application/json"}
@@ -106,7 +121,7 @@ def main():
         "audit_log": os.path.join(WORK, "audit.jsonl"),
         # exe 端到端验证 win_exec（PyInstaller 冻结环境里 subprocess 行为必须实测）
         "exec_enabled": True,
-        "exec_allowed_commands": ["echo"],
+        "exec_allowed_commands": ["echo", "findstr", "type"],
     }
     cfg_path = os.path.join(WORK, "wkfile.config.json")
     with open(cfg_path, "w", encoding="utf-8") as fh:
@@ -257,6 +272,83 @@ def main():
         txt = " ".join(i.get("text", "") for i in r["content"])
         check("win_exec cmd /c whoami 走私被拒",
               r["isError"] is True and "exec_not_allowed" in txt, txt[:200])
+
+        # v1.7.9：stdin 直喂（免引号转义地狱）
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "findstr mcp-stdin",
+                                                             "stdin": "mcp-stdin hit line\nplain line\n"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec stdin 直喂脚本（findstr 读标准输入）",
+              r["isError"] is False and "mcp-stdin hit line" in txt
+              and "plain line" not in txt, txt[:200])
+
+        # v1.7.9：structuredContent 机器可读字段（exit_code 不用再从文本解析）
+        check("win_exec 返回 structuredContent（exit_code/duration_ms）",
+              isinstance(r.get("structuredContent"), dict)
+              and r["structuredContent"].get("exit_code") == 0,
+              body[:200])
+
+        # v1.7.9：超限输出落盘 output_file + win_read 可直读全量
+        big_content = ("BIGLINE-" + "x" * 99 + "\n") * 2200          # ~ 230KB > 64KB
+        st, _, body = post("/api/write", {"path": os.path.join(share, "big.txt"),
+                                          "content": big_content})
+        check("准备大文件用于输出截断测试", st == 200, body[:120])
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "type big.txt"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        sc = r.get("structuredContent") or {}
+        out_file = sc.get("output_file")
+        check("超限输出已落盘（output_truncated + output_file）",
+              r["isError"] is False and sc.get("output_truncated") is True
+              and out_file and out_file.endswith(".txt"), body[:200])
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 15, "method": "tools/call",
+                                    "params": {"name": "win_read",
+                                               "arguments": {"path": out_file,
+                                                             "max_lines": 3}}},
+                           headers={"Mcp-Session-Id": sid})
+        txt = " ".join(i.get("text", "") for i in json.loads(body)["result"]["content"])
+        check("win_read 能直读 exec 落盘的完整输出",
+              json.loads(body)["result"]["isError"] is False and "BIGLINE-" in txt,
+              txt[:200])
+
+        # v1.7.9：/api/upload 原始字节直传（本地→远程大文件通道）
+        import hashlib as _hl
+        payload = "uploaded-raw-payload-line\n" * 40                 # ~1.2KB 文本载荷
+        up_path = os.path.join(share, "up-raw.txt")
+        q = urllib.parse.quote(str(up_path), safe="")
+        sha = _hl.sha256(payload.encode()).hexdigest()
+        st, body = post_raw(f"/api/upload?path={q}&sha256={sha}", payload.encode())
+        resp = json.loads(body)
+        check("POST /api/upload 直传成功 + sha256 校验一致",
+              st == 200 and resp.get("ok") and resp["data"]["sha256"] == sha
+              and resp["data"]["bytes"] == len(payload), body[:200])
+        st, _, body = post("/api/read", {"path": up_path})
+        check("上传内容可读回（原始字节无损）",
+              st == 200 and "uploaded-raw-payload-line" in body, body[:160])
+        st, body = post_raw(f"/api/upload?path={q}&sha256={'0' * 64}", payload.encode())
+        check("upload sha256 不匹配被拒（409 conflict）",
+              st == 409 and "conflict" in body, body[:200])
+        st, body = post_raw(f"/api/upload?path={q}", payload.encode(), token=None)
+        check("upload 无 Token 被拒（401）", st == 401, str(st))
+        st, body = post_raw(f"/api/upload?path={q}", payload.encode())
+        resp = json.loads(body)
+        check("upload 覆盖已有文件自动备份",
+              st == 200 and resp.get("ok") and resp["data"].get("backup"), body[:200])
+
+        # v1.7.9：win_write backup=false（按次关闭写前备份）
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                                    "params": {"name": "win_write",
+                                               "arguments": {"path": os.path.join(share, "nb.txt"),
+                                                             "content": "no-backup\n",
+                                                             "backup": False}}},
+                           headers={"Mcp-Session-Id": sid})
+        check("win_write backup=false 正常写入",
+              json.loads(body)["result"]["isError"] is False, body[:200])
 
         # BOM 防误用：utf-8-sig 写入必须在 MCP 层被拦
         st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 11, "method": "tools/call",

@@ -68,6 +68,17 @@ wkfile · 快速上手
   「不在白名单」。引号被吞的根因（参数列表二次转义）也一并修掉。想回到
   逐段严格模式，配置 exec_strict_chain=true；cmd /k（交互常驻）始终拒绝；
   cmd /c 前缀剥掉后照查首程序，whoami 借道走私进不来。
+  1.7.9 继续按实战痛点补齐：① win_exec 新增 stdin 参数——要跑一段
+  PHP/Python 脚本直接把整段脚本放 stdin，不用再写 php -r "引号嵌套地狱"；
+  ② 白名单热加载——改 wkfile.config.json 里的 exec_allowed_commands
+  保存即可，不用重启服务（exec_enabled 总开关仍需重启）；③ 超长输出
+  自动落盘（数据目录 logs\exec-*.txt），返回 output_file 路径可用
+  win_read 分段读全量，不再只有截断预览；④ 新增 POST /api/upload
+  原始字节直传端点——本地开发机到服务器的大文件（几百 KB~几 MB）不再
+  需要 base64 塞 JSON（会超限/截断），curl --data-binary 或包里的
+  tools\upload.py 一条命令直推，带 sha256 校验与写前备份；⑤ win_write
+  支持 backup=false 按次关闭写前备份（频繁覆盖 .env 这类小文件时回收站
+  不再堆历史版本）。
 
 程序运行时【只创建 wkfile 这一个文件夹】，里面装着配置、日志、备份、回收站；
 不会往你允许 AI 操作的业务目录里撒任何东西。

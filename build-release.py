@@ -52,6 +52,7 @@ LAYOUT = [
     ("tools/probe-public.py",            "tools/probe-public.py"),
     ("tools/mcp-public-test.py",         "tools/mcp-public-test.py"),
     ("tools/mcp-call-test.py",           "tools/mcp-call-test.py"),
+    ("tools/upload.py",                  "tools/upload.py"),
 ]
 
 # 这些后缀在包里统一成 CRLF：.bat 是为了 cmd.exe，.txt 是为了记事本双击可读

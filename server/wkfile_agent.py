@@ -41,6 +41,7 @@ wkfile —— 跑在 Windows 服务器上的「文件查看/修改」HTTP 服务
     POST /api/copy           POST /api/trash
     POST /api/search         POST /api/grep
     POST /api/trash_list     POST /api/trash_restore
+    POST /api/upload         （原始字节直传：?path=<目标>&sha256=<可选>，v1.7.9+）
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.8"
+VERSION = "1.7.9"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1118,7 +1119,18 @@ _CONFIG_NOTES = {
     '"exec_allowed_commands"': [
         "// 远程命令执行（win_exec）的程序白名单：只查整条命令的首程序",
         "//（去掉 cmd /c 前缀后第一个程序），&&、|、2>&1 都交给 cmd 处理。",
-        "// 短名/带 .exe/全路径都认。例：[\"php\", \"composer\", \"cmd\"]",
+        "// 短名/带 .exe/全路径都认。改这里不用重启：保存本文件后下次调用即生效。",
+        "// 推荐起步（PHP 运维场景，覆盖查/搜/下载，均无破坏力）：",
+        '//   "exec_allowed_commands": ["php", "php.exe", "composer", "composer.phar",',
+        '//       "cmd", "dir", "type", "where", "findstr",',
+        '//       "tasklist", "netstat", "curl"]',
+        "// 谨慎追加（有破坏力，确认真的需要再开）：",
+        '//   del / rd        —— 删除文件/目录（不可逆，回收站都进不了）',
+        '//   move / copy     —— 搬运覆盖（有写前备份兜底，风险小一些）',
+        '//   net / sc / wmic —— 服务与系统管理',
+        '//   certutil        —— 下载 + 证书操作（常被滥用为下载器）',
+        '//   powershell      —— ★ 几乎等于全开：-Command 能绕过一切白名单，',
+        '//                       非加不可时务必配合 exec_strict_chain=true',
     ],
     '"exec_strict_chain"': [
         "// 严格模式：命令链每一段（&& / | 分隔）的首程序都要过白名单。",
@@ -1745,7 +1757,10 @@ class Agent:
         return info
 
     def op_read(self, req: dict) -> dict:
-        full = self.guard.resolve(req.get("path"))
+        # win_exec 落盘的完整输出（logs\exec-*.txt）允许直读：它在数据目录、
+        # 不在 roots 里，但本来就是给 AI 读全量输出准备的（见 _persist_exec_output）
+        full = (self._resolve_exec_output(req.get("path"))
+                or self.guard.resolve(req.get("path")))
         if not os.path.isfile(full):
             raise PathError("not_found", f"文件不存在：{full}")
         size = os.path.getsize(full)
@@ -1828,7 +1843,9 @@ class Agent:
 
         # 语法校验通过才继续 —— 不通过则连备份都不做，磁盘上不留任何痕迹
         self._preflight(full, data)
-        backup = self._backup(full)
+        # backup=false（v1.7.9）：频繁覆盖同一小文件（.env 改一行密码这种）
+        # 时可以按次关掉备份，不让回收站堆一堆同文件的历史版本
+        backup = self._backup(full) if req.get("backup", True) else None
         existed = os.path.isfile(full)
         tmp = full + ".wkfile-tmp"
         with open(tmp, "wb") as fh:
@@ -1856,10 +1873,56 @@ class Agent:
         if req.get("create_dirs", True):
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         self._preflight(full, data)
-        backup = self._backup(full)
+        backup = self._backup(full) if req.get("backup", True) else None
         with open(full, "wb") as fh:
             fh.write(data)
         return {"path": full, "bytes": len(data), "backup": backup}
+
+    def op_upload(self, req: dict) -> dict:
+        """POST /api/upload?path=<目标>&sha256=<可选校验>（v1.7.9）。
+
+        请求体是文件**原始字节**（application/octet-stream），不走 JSON ——
+        这是"本地开发机 → 远程服务器"的跨机直传通道：几 MB 的大文件不再
+        需要展开成 base64 塞进 JSON 参数（会被截断/超限）。
+
+        围栏与 win_write 完全一致：roots 内路径、写前备份、语法预校验、
+        原子落盘（tmp + replace）；sha256 给了就强校验，不匹配直接拒收。
+        """
+        raw = req.pop("_raw", b"") or b""
+        self._require_write()
+        full = self.guard.resolve(req.get("path"))
+        if len(raw) > int(self.cfg.max_write_bytes):
+            raise PathError(
+                "too_large",
+                f"上传体积 {human_size(len(raw))} 超过上限 "
+                f"{human_size(int(self.cfg.max_write_bytes))}",
+            )
+        expected = req.get("expected_sha256")
+        if expected:
+            actual = hashlib.sha256(raw).hexdigest()
+            if actual.lower() != str(expected).lower():
+                raise PathError(
+                    "conflict",
+                    f"上传内容 sha256 校验失败（期望 {expected}，实际 {actual}），"
+                    "请重传。多半是传输中断或文件在中途被改动。",
+                )
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        self._preflight(full, raw)
+        backup = self._backup(full) if req.get("backup", True) else None
+        existed = os.path.isfile(full)
+        tmp = full + ".wkfile-tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, full)
+        st = os.stat(full)
+        return {
+            "path": full,
+            "bytes": len(raw),
+            "created": not existed,
+            "backup": backup,
+            "sha256": sha256_of(full),
+            "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+        }
 
     def op_append(self, req: dict) -> dict:
         self._require_write()
@@ -2101,6 +2164,21 @@ class Agent:
         if not os.path.isfile(full):
             raise PathError("not_found", f"备份文件不存在：{full}")
         return full
+
+    def _resolve_exec_output(self, raw) -> str | None:
+        """win_exec 落盘的完整输出文件（数据目录 logs\\exec-*.txt）。
+
+        不在 roots 里，但就是给 AI 读全量输出准备的 —— 只放行 logs 目录下
+        的直接子文件、且文件名形如 exec-*.txt，不开放整个数据目录。
+        """
+        full = os.path.abspath(str(raw or "").strip())
+        logs_dir = os.path.join(self.cfg.base_dir, "logs")
+        name = os.path.basename(full)
+        if (os.path.dirname(full).lower() == logs_dir.lower()
+                and name.startswith("exec-") and name.endswith(".txt")
+                and os.path.isfile(full)):
+            return full
+        return None
 
     def _root_by_key(self, key: str) -> str:
         """把备份目录名里的根标识还原回真实根目录。"""
@@ -2623,6 +2701,63 @@ class Agent:
             return True
         return program + ".exe" in allowed
 
+    # 热加载只覆盖"参数级"字段；exec_enabled 仍然必须重启 —— 它决定
+    # win_exec 是否出现在 tools/list（Agent 构造时的快照），"能力开关必须
+    # 显式重启"的安全语义保持不变。
+    _EXEC_HOT_KEYS = ("exec_allowed_commands", "exec_timeout_sec",
+                      "exec_max_output_bytes", "exec_strict_chain")
+
+    def _hotload_exec_cfg(self):
+        """exec 参数热加载（v1.7.9）：改配置文件后不用重启服务，下次调用即生效。
+
+        检测配置文件 mtime，变了就重读上面四个字段。文件坏了/被截断时
+        静默保持当前配置继续跑 —— 热加载失败绝不应该把正在工作的服务搞挂。
+        """
+        try:
+            mtime = os.path.getmtime(self.cfg.config_path)
+        except OSError:
+            return
+        if mtime == getattr(self, "_exec_cfg_mtime", None):
+            return
+        self._exec_cfg_mtime = mtime
+        try:
+            with open(self.cfg.config_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        for key in self._EXEC_HOT_KEYS:
+            if key in data:
+                setattr(self.cfg, key, data[key])
+
+    def _persist_exec_output(self, text: str) -> str | None:
+        """超限输出落盘：数据目录 logs\\exec-<时间戳>.txt，只保留最近 30 份。
+
+        返回文件路径（win_read 可直接读，见 _resolve_exec_output 的白名单口），
+        落盘失败返回 None —— 输出通道绝不能因为落盘失败而整体失败。
+        """
+        try:
+            out_dir = os.path.join(self.cfg.base_dir, "logs")
+            os.makedirs(out_dir, exist_ok=True)
+            now = datetime.now()
+            fname = ("exec-" + now.strftime("%Y%m%d-%H%M%S")
+                     + f"-{now.microsecond // 1000:03d}.txt")
+            path = os.path.join(out_dir, fname)
+            # 单份上限 10MB：误 dump 二进制/超长输出不至于把数据目录吃满
+            cap = 10 * 1024 * 1024
+            with open(path, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write(text if len(text) <= cap
+                         else text[:cap] + "\n...（超过 10MB，落盘时已截断）")
+            olds = sorted(f for f in os.listdir(out_dir)
+                          if f.startswith("exec-") and f.endswith(".txt"))
+            for f in olds[:-30]:
+                try:
+                    os.remove(os.path.join(out_dir, f))
+                except OSError:
+                    pass
+            return path
+        except OSError:
+            return None
+
     def op_exec(self, req: dict) -> dict:
         self._require_write()
         if not self.cfg.exec_enabled:
@@ -2635,6 +2770,8 @@ class Agent:
         command = str(req.get("command") or "").strip()
         if not command:
             raise PathError("bad_request", "command 不能为空")
+        # 白名单热加载：运维改完配置文件保存即可，不用重启服务
+        self._hotload_exec_cfg()
         allowed = sorted({self._exec_norm_program(str(c))
                           for c in (self.cfg.exec_allowed_commands or [])
                           if str(c).strip()})
@@ -2682,6 +2819,13 @@ class Agent:
         timeout = min(max(self._int_arg(req, "timeout",
                                         int(self.cfg.exec_timeout_sec or 60)) or 60, 1), 300)
         max_out = int(self.cfg.exec_max_output_bytes or 65536)
+        # stdin 直喂（v1.7.9）：php/python 这类读标准输入的程序不用再写
+        # `php -r "引号嵌套地狱"`，把脚本放 stdin 参数里就行。
+        # cmd /c 会把标准输入透传给被调程序，管道是通的。
+        stdin_text = req.get("stdin")
+        if stdin_text is not None and not isinstance(stdin_text, str):
+            raise PathError("bad_request", "stdin 必须是字符串")
+        stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
         started = time.time()
         timed_out = False
         # 整串原样交给 cmd：引号、&&、|、2>&1 全由 cmd 自己解析。
@@ -2699,14 +2843,15 @@ class Agent:
             proc = subprocess.Popen(
                 f'{comspec} /d /s /c "{command}"',
                 cwd=cwd,
-                stdin=subprocess.DEVNULL,
+                stdin=(subprocess.PIPE if stdin_bytes is not None
+                       else subprocess.DEVNULL),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
         except OSError as exc:
             raise PathError("exec_failed", f"命令启动失败：{exc}")
         try:
-            raw, _ = proc.communicate(timeout=timeout)
+            raw, _ = proc.communicate(input=stdin_bytes, timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             # cmd /c 的子进程树必须连根杀，不然超时后命令可能还在后台跑
@@ -2719,9 +2864,17 @@ class Agent:
         duration_ms = int((time.time() - started) * 1000)
         output, out_enc = decode_text(raw or b"")
         truncated = len(output.encode("utf-8", "ignore")) > max_out
+        output_file = None
         if truncated:
+            # 完整输出落盘（v1.7.9）：预览留在响应里，全量存 logs\exec-*.txt，
+            # AI 拿 output_file 路径用 win_read 分段读 —— 不用再靠对话窗口猜
+            output_file = self._persist_exec_output(output)
             cut = output.encode("utf-8", "ignore")[:max_out].decode("utf-8", "ignore")
-            output = cut + f"\n...（输出超过 {max_out} 字节，已截断）"
+            note = (f"\n...（输出超过 {max_out} 字节，已截断；"
+                    f"完整输出已存 {output_file}，可用 win_read 读取）"
+                    if output_file else
+                    f"\n...（输出超过 {max_out} 字节，已截断）")
+            output = cut + note
         return {
             "command": command,
             "cwd": cwd,
@@ -2730,6 +2883,7 @@ class Agent:
             "duration_ms": duration_ms,
             "output_encoding": out_enc,
             "output_truncated": truncated,
+            "output_file": output_file,
             "output": output,
         }
 
@@ -2965,6 +3119,7 @@ class Agent:
         "read_b64": op_read_b64,
         "write": op_write,
         "write_b64": op_write_b64,
+        "upload": op_upload,
         "append": op_append,
         "replace": op_replace,
         "mkdir": op_mkdir,
@@ -3129,6 +3284,22 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PathError("bad_json", f"请求体不是合法 JSON：{exc}")
+
+    def _read_raw_body(self) -> bytes:
+        """读原始字节请求体（/api/upload 用）：超写入上限直接 413。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return b""
+        if length > int(self.agent.cfg.max_write_bytes):
+            raise PathError(
+                "too_large",
+                f"上传体积 {human_size(length)} 超过写入上限 "
+                f"{human_size(int(self.agent.cfg.max_write_bytes))}",
+            )
+        return self.rfile.read(length) or b""
 
     def _auth(self) -> bool:
         agent = self.agent
@@ -3460,7 +3631,16 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         req = {}
         try:
-            req = self._read_body()
+            if action == "upload":
+                # /api/upload 的请求体是原始字节（不走 JSON）：跨机直传大文件。
+                # 目标路径与校验值放查询串：?path=<urlencoded>&sha256=<可选>&backup=0
+                query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
+                req = {"path": query.get("path"),
+                       "expected_sha256": query.get("sha256"),
+                       "backup": query.get("backup", "1") not in ("0", "false")}
+                req["_raw"] = self._read_raw_body()
+            else:
+                req = self._read_body()
             data = self.agent.dispatch(action, req)
             self.agent.audit.write(self._audit_record(action, req, ip, started))
             self._ok(data)

@@ -127,6 +127,7 @@ TOOLS = [
                 "encoding": {"type": "string", "description": "编码，默认 utf-8"},
                 "create_dirs": {"type": "boolean", "description": "自动创建父目录，默认 true"},
                 "expected_sha256": {"type": "string", "description": "可选：文件当前 sha256，不匹配则拒绝写入"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true。频繁覆盖同一小文件（如 .env 改一行）时可传 false 少留历史版本"},
             },
             "required": ["path", "content"],
         },
@@ -277,6 +278,7 @@ TOOLS = [
             "properties": {
                 "path": {"type": "string", "description": "文件绝对路径"},
                 "base64": {"type": "string", "description": "base64 编码的内容"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true"},
             },
             "required": ["path", "base64"],
         },
@@ -484,13 +486,16 @@ TOOLS = [
                        "适合 composer 安装依赖、php 执行脚本、清缓存这类操作，省去「写临时脚本→web 触发→删脚本」的三步弯路。"
                        "白名单只查整条命令的首程序（去掉 cmd /c 前缀后第一个程序，php 等价 php.exe），"
                        "后面的参数、&&、||、| 管道、2>&1 重定向、带引号的字符串都原样交给 cmd 处理。"
-                       "安全围栏：首程序必须在白名单 exec_allowed_commands 里；工作目录必须在授权根目录内；超时默认 60 秒。",
+                       "要跑一段脚本（引号嵌套难写）优先用 stdin 参数直喂，别硬拼 php -r \"...\"。"
+                       "安全围栏：首程序必须在白名单 exec_allowed_commands 里（改白名单不用重启，"
+                       "保存配置文件后下次调用即生效）；工作目录必须在授权根目录内；超时默认 60 秒。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要执行的命令，如 \"php -v\" 或 \"composer require phpspreadsheet\""},
                 "cwd": {"type": "string", "description": "工作目录（必须在授权根目录内），默认第一个根目录"},
                 "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 300"},
+                "stdin": {"type": "string", "description": "喂给命令标准输入的文本（如整段 PHP/Python 脚本），免引号转义地狱"},
             },
             "required": ["command"],
         },
@@ -785,6 +790,8 @@ def render(tool_name: str, data: dict) -> str:
             f"命令：{data.get('command')}\n"
             f"目录：{data.get('cwd')}   {state}   耗时 {data.get('duration_ms')}ms"
         )
+        if data.get("output_file"):
+            head += f"\n完整输出：{data.get('output_file')}（超限已落盘，可用 win_read 读取）"
         flag = "（输出已截断）" if data.get("output_truncated") else ""
         return head + "\n" + ("-" * 60) + flag + "\n" + str(data.get("output") or "（无输出）")
 
@@ -1026,7 +1033,14 @@ def call_tool(dispatch, params: dict, *, disabled=()) -> dict:
             }
     try:
         data = dispatch(action, payload)
-        return {"content": [{"type": "text", "text": render(name, data)}], "isError": False}
+        result = {"content": [{"type": "text", "text": render(name, data)}],
+                  "isError": False}
+        if name == "win_exec":
+            # MCP structuredContent（2025-06-18 规范字段，旧客户端自动忽略）：
+            # exit_code / duration_ms / output_file 等机器可读字段直接给结构化
+            # 结果，AI 不用再从文本头部解析「退出码 2」这种行
+            result["structuredContent"] = data
+        return result
     except Exception as exc:  # noqa: BLE001 —— 任何异常都要变成工具错误，不能让连接断
         msg = getattr(exc, "message", None) or str(exc)
         code = getattr(exc, "code", "") or exc.__class__.__name__

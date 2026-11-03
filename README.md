@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.8\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.9\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.8.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.9.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.8\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.9\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -168,7 +168,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.8\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.9\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -354,8 +354,39 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > ④ 超时硬顶（默认 60s，上限 300s），超时连子进程树一起杀；
 > ⑤ 只读 Token / 只读模式拒绝；
 > ⑥ 审计日志记录完整命令，输出截 64KB。
+>
+> v1.7.9 补强：
+> * **stdin 参数**——要跑一段 PHP/Python 脚本，把整段脚本放 `stdin` 直喂，
+>   不用再拼 `php -r "引号嵌套地狱"`；
+> * **白名单热加载**——改配置文件里的 `exec_allowed_commands` 保存即可，
+>   不用重启服务（`exec_enabled` 总开关仍需重启）；
+> * **超长输出落盘**——超过上限的完整输出存到数据目录 `logs\exec-*.txt`
+>   （保留最近 30 份），返回 `output_file` 路径，`win_read` 可直读全量；
+> * **structuredContent**——`exit_code` / `duration_ms` 等机器可读字段
+>   按新版 MCP 规范随结果返回，AI 不用再从文本头部解析。
+>
+> **推荐白名单起步**（无破坏力：`php`、`php.exe`、`composer`、`composer.phar`、
+> `cmd`、`dir`、`type`、`where`、`findstr`、`tasklist`、`netstat`、`curl`）。
+> 谨慎追加：`del`/`rd`（不可逆删除）、`move`/`copy`（搬运覆盖）、`net`/`sc`/`wmic`
+> （服务管理）、`certutil`（常被滥用为下载器）；**`powershell` 几乎等于全开**
+> （`-Command` 能绕过一切白名单），非加不可时务必同时开 `exec_strict_chain`。
+>
 > 开启入口：界面②「安全与权限」→「远程命令执行」区，或直接改
 > `wkfile.config.json` 的 `exec_enabled` + `exec_allowed_commands` 后重启。
+
+> **本地 → 远程传大文件：`POST /api/upload`（v1.7.9+）**——几 MB 的文件
+> 不再需要 base64 塞进 JSON（会超限/被截断）。请求体就是文件原始字节，
+> 目标路径放查询串，带 sha256 强校验与写前备份：
+>
+> ```bat
+> :: Win10+ 自带 curl
+> curl -X POST --data-binary @xxx.php -H "Authorization: Bearer <主Token>" ^
+>      "http://服务器:8788/api/upload?path=E%%3A%%5Ckanghui%%5Capp%%5Cxxx.php"
+>
+> :: 或用部署包里的脚本（自动算 sha256）
+> python tools\upload.py --url http://服务器:8788 --token <主Token> ^
+>                         --from d:\deving\kh\app\xxx.php --to E:\kanghui\app\xxx.php
+> ```
 
 ### 数据库工具怎么开
 
@@ -665,13 +696,13 @@ python tests\mcp_e2e.py                 # MCP 端点（源码）：48 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
 python tests\tls_e2e.py                 # 真起 HTTPS 服务端到端（需 openssl，无则跳过）：11 用例
-python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：32 用例
+python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：43 用例
 ```
 
 
 ````
 
-当前状态（v1.7.8 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、48/48、13/13、11/11、152/152、32/32 全通过**。
+当前状态（v1.7.9 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、48/48、13/13、11/11、152/152、43/43 全通过**。
 
 重新打包 exe（改完源码后）：
 
