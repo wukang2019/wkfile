@@ -103,13 +103,14 @@ TOOLS = [
     },
     {
         "name": "win_read",
-        "description": "读取文本文件内容（带行号）。大文件用 start_line/max_lines 分段读。二进制文件请用 win_read_b64。",
+        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，直到 eof=true；二进制文件请用 win_read_b64。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "文件绝对路径"},
-                "start_line": {"type": "integer", "description": "从第几行开始（从 1 计），默认 1"},
-                "max_lines": {"type": "integer", "description": "最多读多少行，默认 400"},
+                "offset": {"type": "integer", "description": "字节游标：填上一次返回的 next_offset，从该字节续读（优先于 start_line，默认 0）"},
+                "start_line": {"type": "integer", "description": "行号游标（从 1 计，默认 1）；与 offset 同时传时只作为行号编号基，不切片"},
+                "max_lines": {"type": "integer", "description": "最多返回多少行；0 或省略 = 本段全部（总量仍受 max_bytes 限制）"},
                 "encoding": {"type": "string", "description": "编码，默认 auto（自动识别 UTF-8 / GBK）"},
                 "line_numbers": {"type": "boolean", "description": "是否带行号，默认 true"},
             },
@@ -668,12 +669,18 @@ def render(tool_name: str, data: dict) -> str:
     if tool_name == "win_read":
         head = (
             f"{data.get('path')}  [{data.get('encoding')}, {data.get('size_human')}, "
-            f"共 {data.get('total_lines')} 行, 本次第 {data.get('start_line')} 行起 "
+            f"{'本段 ' if data.get('total_lines_partial') else ''}共 {data.get('total_lines')} 行, "
+            f"本次第 {data.get('start_line')} 行起 "
             f"{data.get('returned_lines')} 行"
             f"{', 已截断' if data.get('truncated') else ''}]"
         )
-        # v1.7.11：续读游标直接给下一步参数，AI 不用自己算行号（算错会静默漏行）
-        if data.get("next_start_line"):
+        # v1.7.12：游标分两种——字节层截断必须用 offset 续读（行号游标
+        # 在超限文件上够不着尾部，旧版这里会误导 AI 以为读完了）
+        if data.get("next_offset"):
+            head += (f"\n⚠️ 文件还有未读内容（字节层截断）：下次调用传 "
+                     f"offset={data['next_offset']}"
+                     f" + start_line={data.get('next_start_line')} 续读，直至 truncated=false")
+        elif data.get("next_start_line"):
             head += f"\n⚠️ 还有未读内容：下次调用传 start_line={data['next_start_line']} 续读"
         return head + "\n" + ("-" * 60) + "\n" + str(data.get("content", ""))
 

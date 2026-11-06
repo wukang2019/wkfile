@@ -12,6 +12,13 @@ import sys
 import urllib.error
 import urllib.request
 
+if len(sys.argv) < 4:
+    print("用法：python mcp-call-test.py <base_url> <token> <tool_name> [args_json]")
+    print('示例：python mcp-call-test.py http://1.2.3.4:10087 TOKEN win_roots')
+    print('      python mcp-call-test.py http://1.2.3.4:10087 TOKEN win_list '
+          '"{\\"path\\":\\"D:\\\\share\\"}"')
+    sys.exit(2)
+
 BASE = sys.argv[1]
 TOKEN = sys.argv[2]
 TOOL = sys.argv[3]

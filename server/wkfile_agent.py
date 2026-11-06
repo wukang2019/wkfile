@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.11"
+VERSION = "1.7.12"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -964,6 +964,9 @@ WEAK_TOKENS = frozenset({
     "", "test", "token", "changeme", "change-me", "password", "secret",
     "testtoken", "testtoken123456", "123456", "admin",
     "在这里填一个长随机串，或运行 python wkfile_agent.py --init 自动生成",
+    # v1.7.12：示例配置实际用的占位串（此前黑名单文案改了、集合没跟上，
+    # 拿示例配置原样启动不会被拦）
+    "在这里填一个长随机串；用图形界面启动时点「生成」按钮即可",
 })
 
 # 低于这个长度算"偏弱"（只警告，不拦截）
@@ -1254,6 +1257,19 @@ class Guard:
         self._assert_inside(full)
         return full
 
+    def contains(self, full: str) -> bool:
+        """路径 realpath 之后是否仍在 roots 内且不踩数据目录（v1.7.12）。
+
+        给遍历类操作（search/grep/tree 的 os.walk）做逐目录剪枝用：
+        roots 里被放进一个指向外部的 junction 时，walk 会跟着遍历出去
+        （junction 对 Python 的 os.walk 不是 symlink，followlinks=False 拦不住）。
+        """
+        try:
+            self._assert_inside(os.path.realpath(full))
+            return True
+        except PathError:
+            return False
+
     def _assert_inside(self, full: str) -> None:
         if not self.cfg.roots:
             raise PathError("no_roots", "服务端未配置任何可操作目录（roots）")
@@ -1293,7 +1309,8 @@ class Guard:
         base = getattr(self.cfg, "base_dir", None) or data_dir()
         protected = [self.cfg.config_path] + [
             os.path.join(base, x)
-            for x in (PID_FILENAME, LOG_DIRNAME, BACKUP_DIRNAME, TRASH_DIRNAME, APP_DIRNAME)
+            for x in (PID_FILENAME, LOG_DIRNAME, BACKUP_DIRNAME, TRASH_DIRNAME,
+                      APP_DIRNAME, "tls")
         ]
         # 默认布局下 base 就是 exe 旁边那个 wkfile\ 数据目录，整棵子树都挡掉；
         # 用 --config 把配置放到别处时不整体挡，免得误伤业务目录
@@ -1366,10 +1383,17 @@ class Audit:
                 try:
                     with open(self.path, "a", encoding="utf-8") as fh:
                         fh.write(line + "\n")
-                except OSError:
-                    pass
-            except OSError:
-                pass
+                except OSError as exc:
+                    self._complain(exc)
+            except OSError as exc:
+                self._complain(exc)
+
+    @staticmethod
+    def _complain(exc: OSError) -> None:
+        # v1.7.12：审计写不进去不能无声无息——安全网关的账本停了，
+        # 运维必须能察觉。打到 stderr（运行日志），不打断请求本身。
+        print(f"[audit] 写入失败，审计日志可能不完整：{exc}",
+              file=sys.stderr, flush=True)
 
     def size(self) -> int:
         try:
@@ -1544,8 +1568,14 @@ class Agent:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         try:
             shutil.copy2(full, dest)
-        except OSError:
-            return None
+        except OSError as exc:
+            # v1.7.12：备份失败必须报错拒绝写，而不是静默跳过——否则「写坏
+            # 了也没有退路」的操作会照常发生，用户却以为有备份兜底。
+            raise PathError(
+                "backup_failed",
+                f"写前备份失败，已拒绝本次写入：{exc}。"
+                "排查磁盘空间/权限后重试，或对本次调用显式传 backup=false。",
+            )
         self._maybe_cleanup_backups()
         return dest
 
@@ -1768,9 +1798,16 @@ class Agent:
         info["exists"] = True
         info["is_dir"] = os.path.isdir(full)
         if not info["is_dir"]:
-            info["sha256"] = req.get("hash") and sha256_of(full) or None
-            if info["sha256"] is None:
-                info.pop("sha256")
+            # v1.7.12（WK-009）：sha256 只对小文件算——几百 MB 的文件会把
+            # 请求线程占住几十秒，等于一个变相 DoS。超限明确报错而不是硬算。
+            if req.get("hash"):
+                if os.path.getsize(full) > int(self.cfg.max_read_bytes):
+                    raise PathError(
+                        "too_large",
+                        f"文件 {human_size(os.path.getsize(full))} 超过哈希上限 "
+                        f"{human_size(int(self.cfg.max_read_bytes))}，拒绝计算 sha256。",
+                    )
+                info["sha256"] = sha256_of(full)
         return info
 
     def op_read(self, req: dict) -> dict:
@@ -1782,40 +1819,102 @@ class Agent:
             raise PathError("not_found", f"文件不存在：{full}")
         size = os.path.getsize(full)
         limit = min(int(req.get("max_bytes", self.cfg.max_read_bytes)), int(self.cfg.max_read_bytes))
-        with open(full, "rb") as fh:
-            probe = fh.read(8192)
+        # v1.7.12：offset 字节游标。旧实现的致命伤是「先读前 4MB 再按行切片」，
+        # total_lines 只是截断文本的行数——按 next_start_line 续读永远够不着
+        # 文件尾部（实测 4.4MB 文件尾部 99 行永久丢失）。现在：
+        #   * offset 起读 limit+1 字节，截断时回退到最后一个换行（行对齐——
+        #     多字节 UTF-8 不会被劈开，段内永远是完整行）；
+        #   * 字节层还有剩余 → 返回 next_offset，用 offset 续读直至文件尾；
+        #   * start_line 变成"本段第 1 行的编号基"（默认 1），续读时传上一次
+        #     的 next_start_line 即可保持行号全局连贯。
+        try:
+            offset = max(int(req.get("offset", 0) or 0), 0)
+        except (TypeError, ValueError):
+            offset = 0
+        if offset > size:
+            raise PathError(
+                "bad_request",
+                f"offset {offset} 超出文件大小 {size}，没有更多内容可读。",
+            )
+        if offset == size:
+            # offset == size 是合法 EOF（续读恰好走到文件尾），返回空页而不是报错
+            probe, raw = b"", b""
+        else:
+            with open(full, "rb") as fh:
+                fh.seek(offset)
+                probe = fh.read(8192)
+                fh.seek(offset)
+                raw = fh.read(limit + 1)
         if looks_binary(probe):
             raise PathError(
                 "binary_file",
                 f"看起来是二进制文件（{human_size(size)}），请用 read_b64，或用 download 下载",
             )
-        text, enc, truncated = read_text_file(full, limit)
+        byte_truncated = len(raw) > limit
+        if byte_truncated:
+            raw = raw[:limit]
+            cut = raw.rfind(b"\n")
+            if cut > 0:                      # 行对齐：回退到最后一个完整换行
+                raw = raw[:cut + 1]
+        consumed = len(raw)
+        text, enc = decode_text(raw)
         lines = text.splitlines()
-        total_lines = len(lines)
         start = max(int(req.get("start_line", 1) or 1), 1)
-        max_lines = int(req.get("max_lines", 0) or 0)
-        selected = lines[start - 1:]
-        if max_lines > 0:
-            selected = selected[:max_lines]
+        max_lines = max(int(req.get("max_lines", 0) or 0), 0)
+        # v1.7.12（WK-001 双游标定义，唯一权威）：
+        #   * offset > 0：字节游标优先，start_line 只是**行号编号基**，不切片；
+        #   * offset == 0：start_line 是行号游标（跳过前 start-1 行）；
+        #   * 两者同时传：以 offset 为准，start_line 只影响输出编号，绝不切空。
+        seg_skip = 0 if offset > 0 else max(start - 1, 0)
+        if seg_skip >= len(lines):
+            selected: list = []
+        else:
+            selected = lines[seg_skip:]
+            if max_lines > 0:
+                selected = selected[:max_lines]
+        lines_left = max(len(lines) - seg_skip - len(selected), 0)
+        # max_lines 在本段内提前收口时，字节游标必须停在最后一个已返回行的
+        # 行尾——否则 next_offset 会跳过没返回的行（静默丢行）。
+        if lines_left > 0:
+            taken = seg_skip + len(selected)
+            cut = 0
+            for _ in range(taken):
+                nl = raw.find(b"\n", cut)
+                if nl < 0:
+                    cut = len(raw)
+                    break
+                cut = nl + 1
+            if cut > 0:
+                consumed = min(consumed, cut)
         numbered = bool(req.get("line_numbers", True))
         body = (
             "\n".join(f"{start + i:>6}\t{ln}" for i, ln in enumerate(selected))
             if numbered
             else "\n".join(selected)
         )
-        truncated = truncated or (start - 1 + len(selected)) < total_lines
+        byte_more = (offset + consumed) < size           # 文件里还有没读到的字节
+        truncated = byte_more or lines_left > 0
         return {
             "path": full,
             "encoding": enc,
             "size": size,
             "size_human": human_size(size),
-            "total_lines": total_lines,
+            "offset": offset,
+            "consumed_bytes": consumed,
+            "total_lines": len(lines),
+            # offset>0 或字节层截断时，total_lines 只是本段行数、不是全文件的
+            "total_lines_partial": bool(offset > 0 or byte_truncated),
             "returned_lines": len(selected),
             "start_line": start,
+            "line_number_base": start,
+            "cursor_mode": "offset" if offset > 0 else "start_line",
             "truncated": truncated,
-            # v1.7.11：续读游标——还有没读完的行时直接给出下一次 start_line，
-            # AI 不用自己算（算错会静默漏行）
-            "next_start_line": (start - 1 + len(selected) + 1) if truncated else None,
+            "eof": not truncated,
+            "byte_truncated": byte_truncated,
+            # 续读游标：字节层还有剩余 → offset 续读（唯一可靠的通道）；
+            # 行号续读只在本段内有效
+            "next_offset": (offset + consumed) if byte_more else None,
+            "next_start_line": (start + len(selected)) if truncated else None,
             "content": body,
         }
 
@@ -1868,10 +1967,7 @@ class Agent:
         # 时可以按次关掉备份，不让回收站堆一堆同文件的历史版本
         backup = self._backup(full) if req.get("backup", True) else None
         existed = os.path.isfile(full)
-        tmp = full + ".wkfile-tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, full)
+        self._atomic_write(full, data)      # v1.7.12：补上原子化（此前仍是固定名 tmp）
         st = os.stat(full)
         return {
             "path": full,
@@ -1978,6 +2074,14 @@ class Agent:
         self._require_write()
         full = self.guard.resolve(req.get("path"))
         data = (req.get("content") or "").encode(req.get("encoding") or "utf-8")
+        # v1.7.12：上限检查——append 原先不设限，反复追加能把文件无限吹大
+        cur = os.path.getsize(full) if os.path.isfile(full) else 0
+        if cur + len(data) > int(self.cfg.max_write_bytes):
+            raise PathError(
+                "too_large",
+                f"追加后文件将达 {human_size(cur + len(data))}，"
+                f"超过上限 {human_size(int(self.cfg.max_write_bytes))}。",
+            )
         if req.get("create_dirs", True):
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         backup = self._backup(full)
@@ -2075,8 +2179,9 @@ class Agent:
         out_bytes = replaced_text.encode(enc if enc != "utf-8-sig" else "utf-8")
         self._preflight(full, out_bytes)
         backup = self._backup(full)
-        with open(full, "wb") as fh:
-            fh.write(out_bytes)
+        # v1.7.12（WK-006）：与 op_write 一致走原子写——固定 open("wb") 在
+        # 写到一半崩溃时会把原文件截成半截，备份虽有但等于赌运气
+        self._atomic_write(full, out_bytes)
         return {
             "path": full,
             "replaced": n,
@@ -2441,6 +2546,9 @@ class Agent:
         def walk(cur: str, level: int) -> None:
             if state["truncated"]:
                 return
+            # v1.7.12 junction 剪枝：递归进入前校验 realpath 仍在 roots 内
+            if not self.guard.contains(cur):
+                return
             try:
                 names = sorted(os.listdir(cur))
             except OSError:
@@ -2460,6 +2568,9 @@ class Agent:
                 if len(entries) >= max_nodes:
                     state["truncated"] = True
                     return
+                # v1.7.12（WK-004）：指向 roots 外的 junction/symlink 连列都不列
+                if not self.guard.contains(p):
+                    continue
                 state["dirs"] += 1
                 entries.append({"depth": level, "type": "dir", "name": name, "path": p,
                                 "rel": os.path.relpath(p, base)})
@@ -2469,6 +2580,8 @@ class Agent:
                 if len(entries) >= max_nodes:
                     state["truncated"] = True
                     return
+                if not self.guard.contains(p):
+                    continue
                 state["files"] += 1
                 item = {"depth": level, "type": "file", "name": name, "path": p,
                         "rel": os.path.relpath(p, base)}
@@ -2561,6 +2674,11 @@ class Agent:
                 raise PathError("bad_regex", f"正则无效：{exc}")
 
         for cur, dirs, files in os.walk(root):
+            # v1.7.12 junction 剪枝：walk 跟着指向外部的 junction 遍历出去，
+            # 逐目录校验 realpath 仍在 roots 内
+            if not self.guard.contains(cur):
+                dirs[:] = []
+                continue
             dirs[:] = [d for d in dirs if include_hidden or not self.guard.blocked_name(d)]
             if len(results) >= limit:
                 truncated = True
@@ -2570,6 +2688,9 @@ class Agent:
                     truncated = True
                     break
                 full = os.path.join(cur, name)
+                # v1.7.12（WK-004）：文件级 symlink 也要逐条解析，不能只信父目录
+                if not self.guard.contains(full):
+                    continue
                 is_dir = os.path.isdir(full)
                 if kind == "file" and is_dir:
                     continue
@@ -2618,6 +2739,10 @@ class Agent:
         truncated = False
 
         for cur, dirs, files in os.walk(root):
+            # v1.7.12 junction 剪枝（同 op_search）
+            if not self.guard.contains(cur):
+                dirs[:] = []
+                continue
             dirs[:] = [d for d in dirs if include_hidden or not self.guard.blocked_name(d)]
             for name in files:
                 if len(matches) >= limit:
@@ -2629,6 +2754,10 @@ class Agent:
                     if os.path.splitext(name)[1].lower() not in allowed_ext:
                         continue
                 full = os.path.join(cur, name)
+                # v1.7.12（WK-004）：grep 要真正读字节，文件级 symlink 必须
+                # 逐条 realpath 校验——父目录在 roots 内不代表这个文件也在
+                if not self.guard.contains(full):
+                    continue
                 try:
                     if os.path.getsize(full) > max_file:
                         continue
@@ -2761,41 +2890,71 @@ class Agent:
             return True
         return program + ".exe" in allowed
 
-    def _exec_guard_hijack(self, program: str, cwd: str) -> None:
-        """围栏⑦（v1.7.11）：堵 cwd 劫持。
+    # cmd 真内建命令（v1.7.12）：cmd 解析时内建优先于任何文件搜索——
+    # 往 cwd 投放同名 echo.bat/dir.bat 劫持不了它们，所以对这些名字跳过
+    # cwd 投放检测（v1.7.11 把这种情况当威胁拒绝是误报）。注意 find /
+    # findstr / sort / fc / where / whoami 这类**不在**名单里：它们是
+    # 外部命令（System32 里的 .exe），cwd 搜索序对它们生效，必须查。
+    _CMD_BUILTINS = frozenset({
+        "dir", "type", "echo", "ver", "vol", "set", "cls", "cd", "chdir",
+        "md", "mkdir", "rd", "rmdir", "ren", "rename", "del", "erase",
+        "copy", "move", "path", "title", "prompt", "rem", "assoc", "ftype",
+        "date", "time", "call", "exit", "pause", "shift", "goto",
+        "setlocal", "endlocal",
+    })
+
+    def _exec_guard_hijack(self, command: str, cwd: str) -> None:
+        """围栏⑦（v1.7.11 引入，v1.7.12 扩为全链）：堵 cwd 劫持。
 
         Windows 下 cmd 执行不带路径的程序时搜索序是 **cwd 优先于 PATH**，
         而 roots 恰恰是 AI 可写目录——往里面放一个与白名单程序同名的
-        php.bat / php.exe，"php xxx" 实际执行的就是投放文件，白名单
-        形同虚设。两道检查：
-          a) cwd 里存在首程序的任何可执行变体（.bat/.cmd/.exe/.com）
-             → 拒绝：有文件在抢这个名字，绝大多数就是投放；
-          b) shutil.which 按 PATH 解析到的真实路径落在 roots 内 → 拒绝：
-             PATH 里混进了 AI 可写目录，同样是投放面。
-        cmd 内建命令（dir/type/set 这类 which 找不到、cwd 里也不该有
-        同名文件）不受影响。
+        php.bat / php.exe，"php xxx" 实际执行的就是投放文件。
+
+        v1.7.12 两处升级（外部审计实测绕过）：
+        ① **全链检测**：旧版只查整条命令的首程序，`dir && payload.bat`
+           直接绕过（dir 在白名单，链上第二段投放文件照跑）。现在拆链后
+           每一段的首程序都过投放检测——白名单仍是首程序制（复合命令的
+           可用性），但「往可写 cwd 投放可执行文件」这个攻击面对全链封死；
+        ② **内建名单**：cmd 内建（echo/dir/type…）优先于文件搜索，投放
+           同名 .bat 劫持不了它们——对这些名字跳过 cwd 检测，消除误报。
         """
-        stem = program[:-4] if program.endswith(".exe") else program
-        for ext in (".bat", ".cmd", ".exe", ".com"):
-            candidate = os.path.join(cwd, stem + ext)
-            if os.path.isfile(candidate):
+        # 拆链（2>&1 的 & 不是分隔符，先打码——v1.7.8 的老坑不能复发）
+        masked = re.sub(r"(\d*)&(\d+)",
+                        lambda m: m.group(1) + "\x01" + m.group(2), command)
+        for seg in re.split(r"\s*(?:&&|\|\||[&|;])\s*", masked):
+            seg = seg.replace("\x01", "&").strip()
+            if not seg:
+                continue
+            try:
+                program = self._exec_head_program(seg)
+            except PathError:
+                continue
+            if program in self._CMD_BUILTINS:
+                continue
+            stem = program[:-4] if program.endswith(".exe") else program
+            names = {stem + ext for ext in (".bat", ".cmd", ".exe", ".com")}
+            if program.endswith((".bat", ".cmd", ".com")):
+                names.add(program)      # 命令直接引用了 cwd 里的脚本文件
+            planted = next(
+                (n for n in sorted(names) if os.path.isfile(os.path.join(cwd, n))), None)
+            if planted:
                 raise PathError(
                     "exec_hijack_suspected",
-                    f"工作目录里存在与白名单程序同名的 {os.path.basename(candidate)}，"
+                    f"命令链中 {program} 对应的工作目录里存在 {planted}，"
                     "拒绝执行——cwd 优先于 PATH 的程序搜索序会被它劫持。"
                     "如确属正常使用，请换一个工作目录，或把该程序装到授权目录之外。",
                 )
-        resolved = shutil.which(program) or shutil.which(stem)
-        if resolved:
-            resolved_dir = os.path.normcase(os.path.dirname(os.path.abspath(resolved)))
-            for root in (self.cfg.roots or []):
-                r = os.path.normcase(os.path.abspath(root))
-                if resolved_dir == r or resolved_dir.startswith(r + os.sep):
-                    raise PathError(
-                        "exec_hijack_suspected",
-                        f"程序 {program} 经 PATH 解析到 {resolved}，落在授权可写目录内，"
-                        "拒绝执行。请从 PATH 移除该目录，或把程序安装到可信位置。",
-                    )
+            resolved = shutil.which(program) or shutil.which(stem)
+            if resolved:
+                resolved_dir = os.path.normcase(os.path.dirname(os.path.abspath(resolved)))
+                for root in (self.cfg.roots or []):
+                    r = os.path.normcase(os.path.abspath(root))
+                    if resolved_dir == r or resolved_dir.startswith(r + os.sep):
+                        raise PathError(
+                            "exec_hijack_suspected",
+                            f"程序 {program} 经 PATH 解析到 {resolved}，落在授权可写目录内，"
+                            "拒绝执行。请从 PATH 移除该目录，或把程序安装到可信位置。",
+                        )
 
     # 热加载只覆盖"参数级"字段；exec_enabled 仍然必须重启 —— 它决定
     # win_exec 是否出现在 tools/list（Agent 构造时的快照），"能力开关必须
@@ -2818,7 +2977,13 @@ class Agent:
         self._exec_cfg_mtime = mtime
         try:
             with open(self.cfg.config_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+                text = fh.read()
+            # v1.7.12：配置文件可能带我们自己模板写的 "// " 注释——
+            # 裸 json.load 直接炸然后静默放弃热加载（GUI 保存的带注释配置
+            # 永远热加载不了）。和 load_config 一样先剥注释再解析。
+            if "//" in text:
+                text = _strip_json_comments(text)
+            data = json.loads(text)
         except (OSError, ValueError):
             return
         for key in self._EXEC_HOT_KEYS:
@@ -2915,9 +3080,10 @@ class Agent:
         timeout = min(max(self._int_arg(req, "timeout",
                                         int(self.cfg.exec_timeout_sec or 60)) or 60, 1), 300)
         max_out = int(self.cfg.exec_max_output_bytes or 65536)
-        # 围栏⑦（v1.7.11）：cwd 劫持防护——cwd 默认就是 roots[0]（AI 可写），
-        # Windows 程序搜索序 cwd 优先于 PATH，不查的话白名单可被同名投放文件绕过
-        self._exec_guard_hijack(program, cwd)
+        # 围栏⑦（v1.7.11 引入，v1.7.12 全链）：cwd 劫持防护——cwd 默认就是
+        # roots[0]（AI 可写），Windows 程序搜索序 cwd 优先于 PATH；链上每一段
+        # 的首程序都要过投放检测（`dir && payload.bat` 这种借道也被拒）
+        self._exec_guard_hijack(command, cwd)
         # stdin 直喂（v1.7.9）：php/python 这类读标准输入的程序不用再写
         # `php -r "引号嵌套地狱"`，把脚本放 stdin 参数里就行。
         # cmd /c 会把标准输入透传给被调程序，管道是通的。
@@ -3279,6 +3445,43 @@ SSE_SESSIONS_LOCK = threading.Lock()
 SSE_IDLE_TIMEOUT = 3600
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """线程数有上限的 HTTP 服务（v1.7.12）。
+
+    ThreadingHTTPServer 每连接一线程、无上限——配合慢连接/慢攻击能
+    无限吃线程。这里用 BoundedSemaphore 封顶（默认 64）：拿不到线程位
+    的连接直接回 503 短响应并关闭，而不是把服务拖死。
+    """
+
+    def __init__(self, addr, handler, max_workers: int = 64):
+        super().__init__(addr, handler)
+        self._slots = threading.BoundedSemaphore(max_workers)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(timeout=15):
+            # 线程位拿不到：裸发 503 关连接（此刻还没解析到 Handler 层）
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"{SERVICE}/{VERSION}"
     protocol_version = "HTTP/1.1"
@@ -3372,6 +3575,24 @@ class Handler(BaseHTTPRequestHandler):
 
         return dispatch
 
+    def _drain_body(self, cap: int = 64 * 1024 * 1024) -> None:
+        """把超限的请求体读掉丢弃（v1.7.12）。
+
+        不 drain 就回 413 并关闭连接的话，客户端可能还在往 socket 里写
+        剩余数据——服务端直接 RST，客户端看到的是「连接被重置（10053）」
+        而不是干净的 413。读一块丢一块，最多读 cap 字节防内存炸。
+        """
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            remaining = 0
+        remaining = min(max(remaining, 0), cap)
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _read_body(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -3379,8 +3600,16 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         if length <= 0:
             return {}
-        if length > 64 * 1024 * 1024:
-            raise PathError("too_large", "请求体过大")
+        # v1.7.12：上限与 _read_raw_body 统一为 max_write_bytes（默认 16MB）。
+        # 这里原先自己藏着 64MB 的独立判定——所以出现「README 说 32MB、
+        # 使用说明说 16MB、JSON API 实测 40MB 照收」三个数字打架。
+        if length > int(self.agent.cfg.max_write_bytes):
+            self._drain_body()
+            raise PathError(
+                "too_large",
+                f"请求体 {human_size(length)} 超过上限 "
+                f"{human_size(int(self.agent.cfg.max_write_bytes))}",
+            )
         raw = self.rfile.read(length)
         if not raw:
             return {}
@@ -3475,6 +3704,7 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             return b""
         if length > int(self.agent.cfg.max_write_bytes):
+            self._drain_body()
             raise PathError(
                 "too_large",
                 f"请求体 {human_size(length)} 超过上限 "
@@ -3975,7 +4205,7 @@ def main(argv=None):
             print("    修好后重新启动；或清空 tls_cert / tls_key / tls_chain 先用 HTTP 跑起来。")
             return 4
 
-    httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
+    httpd = BoundedThreadingHTTPServer((cfg.host, cfg.port), Handler)
     httpd.daemon_threads = True
 
     scheme = "http"

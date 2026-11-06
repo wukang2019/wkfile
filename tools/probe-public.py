@@ -5,8 +5,12 @@ import subprocess
 import sys
 import urllib.request
 
-TARGET = sys.argv[1] if len(sys.argv) > 1 else "1.2.3.4"
-PORTS = [22, 3389, 8788, 10087, 80, 443, 8080]
+if len(sys.argv) < 2:
+    print("用法：python probe-public.py <服务器公网IP> [端口...]（默认探测 22/3389/8788/10087/80/443/8080）")
+    sys.exit(2)
+
+TARGET = sys.argv[1]
+PORTS = [int(p) for p in sys.argv[2:]] or [22, 3389, 8788, 10087, 80, 443, 8080]
 
 
 def tcp(host, port, timeout=4.0):

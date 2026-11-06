@@ -46,6 +46,7 @@ LAYOUT = [
     (f"{APP}.exe",                       f"dist/{APP}.exe"),
     ("使用说明.txt",                       "README-快速上手.txt"),
     ("README.md",                        "README.md"),
+    ("LICENSE",                          "LICENSE"),
     ("connect-check.py",                 "server/connect-check.py"),
     ("连接自检.bat",                       "server/连接自检.bat"),
     (f"{APP}.config.example.json",        f"server/{APP}.config.example.json"),
@@ -282,7 +283,10 @@ def main() -> int:
             dirnames.sort()
             for fn in sorted(filenames):
                 full = os.path.join(dirpath, fn)
-                arc = os.path.relpath(full, folder).replace(os.sep, "/")
+                # v1.7.12：zip 内容加顶层目录（文件夹同名）——之前没有顶层
+                # 目录，用户在资源管理器里双击解压会散落一地
+                arc = os.path.join(os.path.basename(folder),
+                                   os.path.relpath(full, folder)).replace(os.sep, "/")
                 info = zipfile.ZipInfo.from_file(full, arc)
                 info.flag_bits |= 0x800
                 info.compress_type = zipfile.ZIP_DEFLATED

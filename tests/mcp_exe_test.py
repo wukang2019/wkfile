@@ -339,19 +339,83 @@ def main():
               sc.get("start_line") == 4 and sc.get("returned_lines") == 2,
               body[:160])
 
-        # v1.7.11 围栏⑦：cwd 劫持防护（exe 冻结环境同样生效）
-        plant = os.path.join(share, "echo.bat")
+        # v1.7.12 围栏⑦（全链 + 内建名单）：cwd 劫持防护（exe 冻结环境同样生效）
+        # a) 外部程序 findstr：cwd 投放同名 .bat 必须拒
+        plant = os.path.join(share, "findstr.bat")
         with open(plant, "w", encoding="utf-8") as fh:
             fh.write("@echo planted-hijack-ran\n")
         st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "findstr x"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec cwd 投放同名 findstr.bat 劫持被拒（exe 环境）",
+              r["isError"] is True and "exec_hijack_suspected" in txt, txt[:200])
+        # b) 全链检测：首程序合法，链上第二段是投放文件 → 拒（外部实测的绕过）
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "echo ok && findstr.bat y"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec 链上第二段投放文件借道被拒（dir && payload.bat 场景）",
+              r["isError"] is True and "exec_hijack_suspected" in txt, txt[:200])
+        # c) cmd 内建：投放同名 echo.bat 劫持不了内建（不再误报）
+        plant2 = os.path.join(share, "echo.bat")
+        with open(plant2, "w", encoding="utf-8") as fh:
+            fh.write("@echo planted-hijack-ran\n")
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 24, "method": "tools/call",
                                     "params": {"name": "win_exec",
                                                "arguments": {"command": "echo innocent"}}},
                            headers={"Mcp-Session-Id": sid})
         r = json.loads(body)["result"]
         txt = " ".join(i.get("text", "") for i in r["content"])
-        check("win_exec cwd 投放同名 echo.bat 劫持被拒（exe 环境）",
-              r["isError"] is True and "exec_hijack_suspected" in txt, txt[:200])
+        check("win_exec cmd 内建（echo）不受 cwd 同名投放影响（不再误报）",
+              r["isError"] is False and "innocent" in txt, txt[:200])
         os.remove(plant)
+        os.remove(plant2)
+
+        # v1.7.12：win_read offset 游标——超限文件的尾部必须读得到
+        # （v1.7.11 的行号游标在 byte 截断文件上够不着尾部：实测尾部 99 行永久丢失）
+        big2 = ("TAILFILE-" + "y" * 79 + "\n") * 55000          # ~ 4.6MB > 4MB 读上限
+        big2 += "FINAL-LINE-MARKER-42\n"
+        st, _, body = post("/api/write", {"path": os.path.join(share, "tail-file.txt"),
+                                          "content": big2})
+        check("准备超读限文件（4.6MB）用于 offset 游标测试", st == 200, body[:120])
+        tail_path = os.path.join(share, "tail-file.txt")
+        seg_total, cur_off, cur_line, guard = 0, 0, 1, 0
+        while guard < 8:                                          # 防死循环
+            guard += 1
+            st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 30 + guard,
+                                        "method": "tools/call",
+                                        "params": {"name": "win_read",
+                                                   "arguments": {"path": tail_path,
+                                                                 "offset": cur_off,
+                                                                 "start_line": cur_line,
+                                                                 "max_lines": 60000}}},
+                               headers={"Mcp-Session-Id": sid})
+            r = json.loads(body)["result"]
+            sc = r.get("structuredContent") or {}
+            seg_total += int(sc.get("returned_lines") or 0)
+            if not sc.get("truncated"):
+                break
+            cur_off = sc["next_offset"]
+            cur_line = sc["next_start_line"]
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                                    "params": {"name": "win_read",
+                                               "arguments": {"path": tail_path,
+                                                             "offset": cur_off,
+                                                             "start_line": cur_line,
+                                                             "max_lines": 60000}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        sc = r.get("structuredContent") or {}
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_read offset 游标能读到超限文件的尾部（FINAL 标记可达）",
+              sc.get("truncated") is False and "FINAL-LINE-MARKER-42" in txt
+              and seg_total >= 55000,
+              f"segs={guard} seg_total={seg_total} tail={txt[-120:]!r}")
 
         # v1.7.9：/api/upload 原始字节直传（本地→远程大文件通道）
         import hashlib as _hl
