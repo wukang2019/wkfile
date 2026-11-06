@@ -1,0 +1,74 @@
+﻿启动 exe（首次运行可能被杀软扫描，耐心等）…
+  D:\deving\bigmodelstudy\trae-winfile\dist\wkfile.exe
+  服务就绪: True  (1.5s)
+
+========== 1. exe 的 health / 状态接口 ==========
+  [OK]   安全：/health 免鉴权且只回最小信息
+  [OK]   安全：GET / 不带 Token 被拒（401）
+  [OK]   GET / 带 Token 返回详情
+  [OK]   版本与源码一致（1.7.12）
+  [OK]   MCP 已启用
+  [OK]   MCP 注册了 34 个工具
+  [OK]   exe 的写入无痕：tools_disable 为空（exec 已开启）
+
+========== 2. exe 的 /mcp initialize ==========
+  [OK]   initialize 200
+  [OK]   下发会话 ID
+  [OK]   serverInfo 正常
+
+========== 3. exe 的 tools/list ==========
+  [OK]   34 个工具
+  [OK]   含 win_grep
+  [OK]   每个工具都带 annotations（打包后也没丢）
+  [OK]   win_read 标为只读
+  [OK]   win_trash 标为破坏性
+
+========== 4. exe 的 tools/call（真实读写） ==========
+  [OK]   win_list 看到 app.log
+  [OK]   win_write 成功
+  [OK]   win_grep 命中
+  [OK]   越权路径仍被拦截
+  [OK]   win_exec 在 exe 里真实执行（echo 输出回传）
+  [OK]   win_exec 白名单外命令（whoami）被拒
+  [OK]   win_exec 复合命令 && 不再拆链误拒
+  [OK]   win_exec 重定向 2>&1 不再拆出 1 误拒
+  [OK]   win_exec 带引号参数原样保留
+  [OK]   win_exec 管道 | 正常工作
+  [OK]   win_exec cmd /c 前缀照常可用
+  [OK]   win_exec cmd /c whoami 走私被拒
+  [OK]   win_exec stdin 直喂脚本（findstr 读标准输入）
+  [OK]   win_exec 返回 structuredContent（exit_code/duration_ms）
+  [OK]   准备大文件用于输出截断测试
+  [OK]   超限输出已落盘（output_truncated + output_file）
+  [OK]   win_read 能直读 exec 落盘的完整输出
+  [OK]   win_read 截断时返回 next_start_line 续读游标
+  [OK]   按游标续读从第 4 行开始（start_line 生效）
+  [OK]   win_exec cwd 投放同名 findstr.bat 劫持被拒（exe 环境）
+  [OK]   win_exec 链上第二段投放文件借道被拒（dir && payload.bat 场景）
+  [OK]   win_exec cmd 内建（echo）不受 cwd 同名投放影响（不再误报）
+  [OK]   准备超读限文件（4.6MB）用于 offset 游标测试
+  [OK]   win_read offset 游标能读到超限文件的尾部（FINAL 标记可达）
+  [OK]   POST /api/upload 直传成功 + sha256 校验一致
+  [OK]   上传内容可读回（原始字节无损）
+  [OK]   upload sha256 不匹配被拒（409 conflict）
+  [OK]   upload 无 Token 被拒（401）
+  [OK]   upload 覆盖已有文件自动备份
+  [OK]   win_write backup=false 正常写入
+  [OK]   win_write_b64 expected_sha256 一致时正常写入
+  [OK]   win_write_b64 sha256 不匹配 409 拒写 + 报错引导 /api/upload
+  [OK]   win_write_b64 模拟客户端截断被 hash 兜底拒写
+  [OK]   utf-8-sig 写入被拦（防 BOM 破坏 PHP）
+  [OK]   win_grep 用 pattern 参数名也能命中
+
+========== 5. exe 的鉴权 ==========
+  [OK]   无 Token 被拒 401
+
+========== 6. exe 的其余接口未受影响 ==========
+  [OK]   老 /api/list 仍可用
+
+========== 7. 写盘保护仍然生效 ==========
+  [OK]   覆盖前自动备份目录已生成
+
+==============================================================
+通过 53 项，失败 0 项
+==============================================================

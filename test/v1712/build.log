@@ -1,0 +1,109 @@
+﻿== build-exe.ps1 : wkfile ==
+[1/4] python : C:\Users\wk200\AppData\Local\Programs\Python\Python313\python.exe
+3.13.12 (tags/v3.13.12:1cbe481, Feb  3 2026, 18:22:25) [MSC v.1944 64 bit (AMD64)]
+      tkinter  : OK
+[2/4] reusing build venv
+[3/4] pyinstaller already present
+      pyinstaller: 6.22.3
+[4/4] building wkfile.exe (GUI, windowed) ...
+powershell : 91 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.8
+所在位置 行:15 字符: 3276
++ ... M = 'dumb'; powershell -ExecutionPolicy Bypass -File .\build-exe.ps1  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (91 INFO: PyInst...b hooks: 2026.8:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+92 INFO: Python: 3.13.12
+111 INFO: Platform: Windows-11-10.0.26300-SP0
+111 INFO: Python environment: D:\deving\bigmodelstudy\trae-winfile\.build\venv
+112 INFO: wrote D:\deving\bigmodelstudy\trae-winfile\.build\spec\wkfile.spec
+115 INFO: Removing temporary files and cleaning cache in C:\Users\wk200\AppData\Local\pyinstaller
+119 INFO: Module search paths (PYTHONPATH):
+['D:\\deving\\bigmodelstudy\\trae-winfile',
+ 'C:\\Users\\wk200\\AppData\\Local\\Programs\\Python\\Python313\\python313.zip',
+ 'C:\\Users\\wk200\\AppData\\Local\\Programs\\Python\\Python313\\DLLs',
+ 'C:\\Users\\wk200\\AppData\\Local\\Programs\\Python\\Python313\\Lib',
+ 'C:\\Users\\wk200\\AppData\\Local\\Programs\\Python\\Python313',
+ 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv',
+ 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv\\Lib\\site-packages',
+ 'D:\\deving\\bigmodelstudy\\trae-winfile\\server']
+311 INFO: checking Analysis
+311 INFO: Building Analysis because Analysis-00.toc is non existent
+311 INFO: Looking for Python shared library...
+311 INFO: Using Python shared library: C:\Users\wk200\AppData\Local\Programs\Python\Python313\python313.dll
+311 INFO: Running Analysis Analysis-00.toc
+311 INFO: Target bytecode optimization level: 0
+311 INFO: Initializing module dependency graph...
+312 INFO: Initializing module graph hook caches...
+319 INFO: Analyzing modules for base_library.zip ...
+1016 INFO: Processing standard module hook 'hook-math.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv\\
+Lib\\site-packages\\PyInstaller\\hooks'
+1024 INFO: Processing standard module hook 'hook-heapq.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv\
+\Lib\\site-packages\\PyInstaller\\hooks'
+1086 INFO: Processing standard module hook 'hook-encodings.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\v
+env\\Lib\\site-packages\\PyInstaller\\hooks'
+2370 INFO: Processing standard module hook 'hook-pickle.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv
+\\Lib\\site-packages\\PyInstaller\\hooks'
+3193 INFO: Caching module dependency graph...
+3213 INFO: Analyzing D:\deving\bigmodelstudy\trae-winfile\server\wkfile_gui.py
+3315 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build
+\\venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+3316 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+3543 INFO: Processing standard module hook 'hook-_tkinter.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\ve
+nv\\Lib\\site-packages\\PyInstaller\\hooks'
+3739 INFO: Processing standard module hook 'hook-difflib.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\ven
+v\\Lib\\site-packages\\PyInstaller\\hooks'
+4143 INFO: Processing standard module hook 'hook-xml.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv\\L
+ib\\site-packages\\PyInstaller\\hooks'
+4157 INFO: Processing standard module hook 'hook-xml.etree.cElementTree.py' from 'D:\\deving\\bigmodelstudy\\trae-winfi
+le\\.build\\venv\\Lib\\site-packages\\PyInstaller\\hooks'
+4197 INFO: Processing standard module hook 'hook-sysconfig.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\v
+env\\Lib\\site-packages\\PyInstaller\\hooks'
+4200 INFO: Processing standard module hook 'hook-_ctypes.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\ven
+v\\Lib\\site-packages\\PyInstaller\\hooks'
+4207 INFO: Processing module hooks (post-graph stage)...
+4235 INFO: Processing standard module hook 'hook-_tkinter.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\ve
+nv\\Lib\\site-packages\\PyInstaller\\hooks'
+4241 INFO: Performing binary vs. data reclassification (927 entries)
+4327 INFO: Looking for ctypes DLLs
+4368 INFO: Analyzing run-time hooks ...
+4369 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv\\Li
+b\\site-packages\\PyInstaller\\hooks\\rthooks'
+4371 INFO: Including run-time hook 'pyi_rth__tkinter.py' from 'D:\\deving\\bigmodelstudy\\trae-winfile\\.build\\venv\\L
+ib\\site-packages\\PyInstaller\\hooks\\rthooks'
+4385 INFO: Creating base_library.zip...
+4399 INFO: Looking for dynamic libraries
+4508 INFO: Extra DLL search directories (AddDllDirectory): []
+4508 INFO: Extra DLL search directories (PATH): []
+4731 INFO: Warnings written to D:\deving\bigmodelstudy\trae-winfile\.build\work-server\wkfile\warn-wkfile.txt
+4741 INFO: Graph cross-reference written to D:\deving\bigmodelstudy\trae-winfile\.build\work-server\wkfile\xref-wkfile.
+html
+4762 INFO: checking PYZ
+4762 INFO: Building PYZ because PYZ-00.toc is non existent
+4762 INFO: Building PYZ (ZlibArchive) D:\deving\bigmodelstudy\trae-winfile\.build\work-server\wkfile\PYZ-00.pyz
+4916 INFO: Building PYZ (ZlibArchive) D:\deving\bigmodelstudy\trae-winfile\.build\work-server\wkfile\PYZ-00.pyz complet
+ed successfully.
+4927 INFO: checking PKG
+4927 INFO: Building PKG because PKG-00.toc is non existent
+4927 INFO: Building PKG (CArchive) wkfile.pkg
+7063 INFO: Building PKG (CArchive) wkfile.pkg completed successfully.
+7075 INFO: Bootloader D:\deving\bigmodelstudy\trae-winfile\.build\venv\Lib\site-packages\PyInstaller\bootloader\Windows
+-64bit-intel\runw.exe
+7075 INFO: checking EXE
+7075 INFO: Building EXE because EXE-00.toc is non existent
+7075 INFO: Building EXE from EXE-00.toc
+7076 INFO: Copying bootloader EXE to D:\deving\bigmodelstudy\trae-winfile\dist\wkfile.exe
+7079 INFO: Copying icon to EXE
+7081 INFO: Copying version information to EXE
+7085 INFO: Copying 0 resources to EXE
+7085 INFO: Embedding manifest in EXE
+7087 INFO: Appending PKG archive to EXE
+7093 INFO: Fixing EXE headers
+7147 INFO: Building EXE from EXE-00.toc completed successfully.
+7158 INFO: Build complete! The results are available in: D:\deving\bigmodelstudy\trae-winfile\dist
+
+== done ==
+wkfile.exe               12.0 MB
+
+Smoke test:
+  D:\deving\bigmodelstudy\trae-winfile\dist\wkfile.exe --check-gui

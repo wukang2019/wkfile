@@ -1,0 +1,14 @@
+﻿PASS T1 字节游标续读至 EOF 行数完整
+PASS T1 首页 total_lines_partial=true
+PASS T2 offset+start_line 不切空
+PASS T2 行号连续
+PASS T3 max_lines 分页无丢行
+PASS T4 小文件 eof/total 准确
+PASS T5 offset==size 返回空页
+PASS T5 offset>size 报 bad_request
+PASS T6 op_replace 生效
+PASS T6 无临时文件残留
+PASS T7 tls 目录被围栏拦截
+PASS T8a tree 不列 junction
+PASS T8b grep 不读 junction
+ALL PASS

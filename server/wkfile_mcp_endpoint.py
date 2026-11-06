@@ -103,7 +103,7 @@ TOOLS = [
     },
     {
         "name": "win_read",
-        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，直到 eof=true；二进制文件请用 win_read_b64。",
+        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，是否读完只看 eof=true（不要用 returned_lines==0 或 truncated 判断结束）。某一页的 returned_lines 可能为 0：整行长度超过本页字节上限，该页只装了残行片段（line_fragment=true），此时 next_offset 仍会前进，继续读即可。二进制文件请用 win_read_b64。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -111,6 +111,7 @@ TOOLS = [
                 "offset": {"type": "integer", "description": "字节游标：填上一次返回的 next_offset，从该字节续读（优先于 start_line，默认 0）"},
                 "start_line": {"type": "integer", "description": "行号游标（从 1 计，默认 1）；与 offset 同时传时只作为行号编号基，不切片"},
                 "max_lines": {"type": "integer", "description": "最多返回多少行；0 或省略 = 本段全部（总量仍受 max_bytes 限制）"},
+                "max_bytes": {"type": "integer", "description": "本页最多返回多少字节（硬上限为服务端 max_read_bytes）；传小了只影响本页大小，长行会分成多个残行页（line_fragment=true），按 eof 续读到尾即可"},
                 "encoding": {"type": "string", "description": "编码，默认 auto（自动识别 UTF-8 / GBK）"},
                 "line_numbers": {"type": "boolean", "description": "是否带行号，默认 true"},
             },
@@ -679,7 +680,7 @@ def render(tool_name: str, data: dict) -> str:
         if data.get("next_offset"):
             head += (f"\n⚠️ 文件还有未读内容（字节层截断）：下次调用传 "
                      f"offset={data['next_offset']}"
-                     f" + start_line={data.get('next_start_line')} 续读，直至 truncated=false")
+                     f" + start_line={data.get('next_start_line')} 续读，直至 eof=true")
         elif data.get("next_start_line"):
             head += f"\n⚠️ 还有未读内容：下次调用传 start_line={data['next_start_line']} 续读"
         return head + "\n" + ("-" * 60) + "\n" + str(data.get("content", ""))

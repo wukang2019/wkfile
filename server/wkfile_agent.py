@@ -1818,7 +1818,8 @@ class Agent:
         if not os.path.isfile(full):
             raise PathError("not_found", f"文件不存在：{full}")
         size = os.path.getsize(full)
-        limit = min(int(req.get("max_bytes", self.cfg.max_read_bytes)), int(self.cfg.max_read_bytes))
+        limit = max(1, min(int(req.get("max_bytes", self.cfg.max_read_bytes)),
+                           int(self.cfg.max_read_bytes)))
         # v1.7.12：offset 字节游标。旧实现的致命伤是「先读前 4MB 再按行切片」，
         # total_lines 只是截断文本的行数——按 next_start_line 续读永远够不着
         # 文件尾部（实测 4.4MB 文件尾部 99 行永久丢失）。现在：
@@ -1840,6 +1841,10 @@ class Agent:
             # offset == size 是合法 EOF（续读恰好走到文件尾），返回空页而不是报错
             probe, raw = b"", b""
         else:
+            # v1.7.13（WK-001 收口）：本页字节上限就是
+            # min(调用方显式 max_bytes, max_read_bytes)，**不越过该上限做任何扩读**
+            # （旧实现会放大到 max_read_bytes，调用方明确限了 4KB 也会被烧成 4MB）。
+            # 多读 1 字节只用于判断「换行是否恰好压在窗口边界上」，不返回。
             with open(full, "rb") as fh:
                 fh.seek(offset)
                 probe = fh.read(8192)
@@ -1850,12 +1855,24 @@ class Agent:
                 "binary_file",
                 f"看起来是二进制文件（{human_size(size)}），请用 read_b64，或用 download 下载",
             )
-        byte_truncated = len(raw) > limit
-        if byte_truncated:
-            raw = raw[:limit]
-            cut = raw.rfind(b"\n")
-            if cut > 0:                      # 行对齐：回退到最后一个完整换行
+        # ---- 行对齐与残行判定（v1.7.13 WK-001 收口） ----
+        # 搜索范围含多读的那 1 字节（raw[limit]）：换行恰压在窗口边界时也算整行，
+        # 换行符一并消费，下一页不会以 "\n" 开头、splitlines() 不会凭空多出空行。
+        fragment_tail = False
+        if len(raw) > limit:
+            cut = raw.rfind(b"\n", 0, limit + 1)
+            if cut >= 0:                     # 窗口内（含边界）有换行：回退到最后一个完整换行
                 raw = raw[:cut + 1]
+            else:
+                # 窗口内没有换行：本页只返回残行片段，行号基不前进
+                raw = raw[:limit]
+                fragment_tail = True
+        # 本页是否从“上一行的中间”开始（上页截断点不在换行之后）
+        starts_mid_line = False
+        if 0 < offset < size:
+            with open(full, "rb") as fh:
+                fh.seek(offset - 1)
+                starts_mid_line = fh.read(1) != b"\n"
         consumed = len(raw)
         text, enc = decode_text(raw)
         lines = text.splitlines()
@@ -1886,12 +1903,21 @@ class Agent:
                 cut = nl + 1
             if cut > 0:
                 consumed = min(consumed, cut)
+        # 残行不计入 returned_lines；head 行只有在本页被换行终止时才算完整行
+        complete = len(selected)
+        if fragment_tail and consumed >= len(raw):
+            complete -= 1
+        head_terminated = raw.endswith(b"\n") or len(lines) > 1
+        if starts_mid_line and selected and not head_terminated:
+            complete -= 1
+        complete = max(complete, 0)
         numbered = bool(req.get("line_numbers", True))
         body = (
             "\n".join(f"{start + i:>6}\t{ln}" for i, ln in enumerate(selected))
             if numbered
             else "\n".join(selected)
         )
+        byte_truncated = (offset + len(raw)) < size
         byte_more = (offset + consumed) < size           # 文件里还有没读到的字节
         truncated = byte_more or lines_left > 0
         return {
@@ -1904,17 +1930,20 @@ class Agent:
             "total_lines": len(lines),
             # offset>0 或字节层截断时，total_lines 只是本段行数、不是全文件的
             "total_lines_partial": bool(offset > 0 or byte_truncated),
-            "returned_lines": len(selected),
+            "returned_lines": complete,
             "start_line": start,
             "line_number_base": start,
             "cursor_mode": "offset" if offset > 0 else "start_line",
+            # v1.7.13：残行状态显式化——本页末尾是半行 / 本页从上一行中间开始
+            "line_fragment": fragment_tail,
+            "continues_previous_line": starts_mid_line,
             "truncated": truncated,
             "eof": not truncated,
             "byte_truncated": byte_truncated,
             # 续读游标：字节层还有剩余 → offset 续读（唯一可靠的通道）；
             # 行号续读只在本段内有效
             "next_offset": (offset + consumed) if byte_more else None,
-            "next_start_line": (start + len(selected)) if truncated else None,
+            "next_start_line": (start + complete) if truncated else None,
             "content": body,
         }
 

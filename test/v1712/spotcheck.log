@@ -1,0 +1,52 @@
+﻿A. pages = 3 returned_lines = [1, 0, 3] consumed = [3, 4096, 911] bases = [1, 2, 2]
+PASS A1 续读到 EOF
+PASS A2 sum(consumed_bytes) == size
+PASS A3 sum(returned_lines) == 4
+PASS A4 next_offset 每页前进且与下一页 offset 对齐
+PASS A5 硬上限未被突破
+PASS A6 L3 行号 = 3
+PASS A7 L4 行号 = 4
+D. pages = 2 eof = True consumed = [4194304, 2097158] returned_lines = [0, 2]
+PASS D1 20 轮内到 EOF
+PASS D2 sum(consumed_bytes) == size
+PASS D3 累计行数 == 2
+PASS D4 每页不超 4MB
+PASS D5 offset 严格递增
+E[n=31] pages = 3 returned = [1, 1, 2] consumed = [3, 32, 6] frag = [False, False, False]
+PASS E[n=31]1 有限轮次内到 EOF
+PASS E[n=31]2 sum(consumed_bytes) == size
+PASS E[n=31]3 sum(returned_lines) == 逻辑行数 4
+PASS E[n=31]4 拼接行序列 == 逻辑行序列（无空串/重复/丢失）
+PASS E[n=31]5 每页内容字节数 <= 本页上限
+PASS E[n=31]6 任何一页都不以空行开头
+PASS E[n=31]7 逐页 content 可还原原文
+PASS E[n=31]8 L3/L4 行号为 3/4
+E[n=32] pages = 3 returned = [1, 1, 2] consumed = [3, 33, 6] frag = [False, False, False]
+PASS E[n=32]1 有限轮次内到 EOF
+PASS E[n=32]2 sum(consumed_bytes) == size
+PASS E[n=32]3 sum(returned_lines) == 逻辑行数 4
+PASS E[n=32]4 拼接行序列 == 逻辑行序列（无空串/重复/丢失）
+PASS E[n=32]5 每页内容字节数 <= 本页上限
+PASS E[n=32]6 任何一页都不以空行开头
+PASS E[n=32]7 逐页 content 可还原原文
+PASS E[n=32]8 L3/L4 行号为 3/4
+PASS E[n=32]9 换行压在边界不判残行
+E[n=33] pages = 3 returned = [1, 0, 3] consumed = [3, 32, 8] frag = [False, True, False]
+PASS E[n=33]1 有限轮次内到 EOF
+PASS E[n=33]2 sum(consumed_bytes) == size
+PASS E[n=33]3 sum(returned_lines) == 逻辑行数 4
+PASS E[n=33]4 拼接行序列 == 逻辑行序列（无空串/重复/丢失）
+PASS E[n=33]5 每页内容字节数 <= 本页上限
+PASS E[n=33]6 任何一页都不以空行开头
+PASS E[n=33]7 逐页 content 可还原原文
+PASS E[n=33]8 L3/L4 行号为 3/4
+PASS E[n=33]10 真残页 line_fragment=true 且行号基不前进
+PASS B1 备份失败拦住写
+PASS B1 原文件不变
+PASS B2 备份失败拦住覆盖移动
+PASS B2 源与目标都未变
+PASS B3 backup=false 逃生门可用
+PASS C1 恰好 100 字节允许
+PASS C2 101 字节拒绝
+PASS C2 拒绝后文件仍 100 字节
+ALL PASS
