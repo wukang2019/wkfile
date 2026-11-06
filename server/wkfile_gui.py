@@ -2269,25 +2269,28 @@ class Wizard:
         stopped = False
         if pid:
             try:
-                subprocess.run(
+                r = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     creationflags=0x08000000,
                 )
-                stopped = True
-                self.log(f"已终止服务进程 PID={pid}", "ok")
+                # v1.7.11：校验返回码——taskkill 找不到进程也会静默返回非 0，
+                # 之前不看码等于「假装杀了」
+                if r.returncode == 0:
+                    stopped = True
+                    self.log(f"已终止服务进程 PID={pid}", "ok")
+                else:
+                    err = (r.stderr or b"").decode("gbk", "replace").strip()
+                    self.log(f"taskkill 退出码 {r.returncode}：{err or 'PID 可能已不存在'}", "warn")
             except OSError as exc:
                 self.log(f"taskkill 失败：{exc}", "err")
         else:
-            self.log("没找到 PID 文件，尝试按进程名停止", "warn")
-            try:
-                subprocess.run(
-                    ["taskkill", "/IM", "wkfile.exe", "/T", "/F"],
-                    capture_output=True,
-                    creationflags=0x08000000,
-                )
-            except OSError:
-                pass
+            # v1.7.11：去掉按进程名兜底（taskkill /IM wkfile.exe 会把 GUI 自己
+            # 一起杀掉——GUI 和服务是同一个 exe）。PID 文件丢了就明说，
+            # 让用户去任务管理器按端口查 PID。
+            self.log(
+                "没找到 PID 文件，无法定位服务进程（不再按进程名杀——会把 GUI 自己也关掉）。"
+                "请在任务管理器按「监听端口」找到 wkfile 进程手动结束。", "warn")
         try:
             if os.path.isfile(PID_PATH):
                 os.remove(PID_PATH)

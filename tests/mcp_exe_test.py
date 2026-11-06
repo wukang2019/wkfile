@@ -316,6 +316,43 @@ def main():
               json.loads(body)["result"]["isError"] is False and "BIGLINE-" in txt,
               txt[:200])
 
+        # v1.7.11：win_read 续读游标 next_start_line（截断时直接给下一步参数）
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                                    "params": {"name": "win_read",
+                                               "arguments": {"path": out_file,
+                                                             "max_lines": 3}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        sc = r.get("structuredContent") or {}
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_read 截断时返回 next_start_line 续读游标",
+              sc.get("next_start_line") == 4 and "start_line=4" in txt,
+              txt[:160])
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                                    "params": {"name": "win_read",
+                                               "arguments": {"path": out_file,
+                                                             "start_line": 4,
+                                                             "max_lines": 2}}},
+                           headers={"Mcp-Session-Id": sid})
+        sc = json.loads(body)["result"].get("structuredContent") or {}
+        check("按游标续读从第 4 行开始（start_line 生效）",
+              sc.get("start_line") == 4 and sc.get("returned_lines") == 2,
+              body[:160])
+
+        # v1.7.11 围栏⑦：cwd 劫持防护（exe 冻结环境同样生效）
+        plant = os.path.join(share, "echo.bat")
+        with open(plant, "w", encoding="utf-8") as fh:
+            fh.write("@echo planted-hijack-ran\n")
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                                    "params": {"name": "win_exec",
+                                               "arguments": {"command": "echo innocent"}}},
+                           headers={"Mcp-Session-Id": sid})
+        r = json.loads(body)["result"]
+        txt = " ".join(i.get("text", "") for i in r["content"])
+        check("win_exec cwd 投放同名 echo.bat 劫持被拒（exe 环境）",
+              r["isError"] is True and "exec_hijack_suspected" in txt, txt[:200])
+        os.remove(plant)
+
         # v1.7.9：/api/upload 原始字节直传（本地→远程大文件通道）
         import hashlib as _hl
         payload = "uploaded-raw-payload-line\n" * 40                 # ~1.2KB 文本载荷

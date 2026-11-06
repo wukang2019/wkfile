@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.10"
+VERSION = "1.7.11"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1072,6 +1072,11 @@ class Config:
         merged.update({k: v for k, v in (data or {}).items() if v is not None})
         self.__dict__.update(merged)
         self.config_path = os.path.abspath(path)
+        # v1.7.11：把不属于 DEFAULT_CONFIG 的键原样记住，save 时写回去——
+        # 之前只序列化已知键，用户手写在配置里的自定义键（或新版配置被
+        # 旧版 GUI 保存一次）会被静默抹掉。
+        self._extra_keys = {k: v for k, v in (data or {}).items()
+                            if k not in DEFAULT_CONFIG and v is not None}
         # 日志 / 备份 / 回收站都放在配置文件旁边：默认就是 wkfile\ 数据目录，
         # 用 --config 指定别处时也不会串到其它实例的目录里
         self.base_dir = os.path.dirname(self.config_path) or data_dir()
@@ -1079,11 +1084,23 @@ class Config:
 
     def save(self, template: bool = False):
         data = {k: getattr(self, k) for k in DEFAULT_CONFIG}
+        data.update(self._extra_keys)
         body = json.dumps(data, ensure_ascii=False, indent=2)
         if template:
             body = _annotate_config(body)
-        with open(self.config_path, "w", encoding="utf-8") as fh:
-            fh.write(body)
+        # v1.7.11：原子写（tmp + replace）——直接覆盖写时进程若在半路
+        # 崩掉，配置文件就毁了，服务起不来；先写临时文件再 rename 不会。
+        tmp = f"{self.config_path}.{os.getpid()}-{secrets.token_hex(4)}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.replace(tmp, self.config_path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 # 自动生成的配置文件里插进哪些注释。JSON 本身不支持注释，但我们自己写、
@@ -1786,6 +1803,7 @@ class Agent:
             if numbered
             else "\n".join(selected)
         )
+        truncated = truncated or (start - 1 + len(selected)) < total_lines
         return {
             "path": full,
             "encoding": enc,
@@ -1794,7 +1812,10 @@ class Agent:
             "total_lines": total_lines,
             "returned_lines": len(selected),
             "start_line": start,
-            "truncated": truncated or (start - 1 + len(selected)) < total_lines,
+            "truncated": truncated,
+            # v1.7.11：续读游标——还有没读完的行时直接给出下一次 start_line，
+            # AI 不用自己算（算错会静默漏行）
+            "next_start_line": (start - 1 + len(selected) + 1) if truncated else None,
             "content": body,
         }
 
@@ -1861,6 +1882,25 @@ class Agent:
             "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
         }
 
+    def _atomic_write(self, full: str, data: bytes) -> None:
+        """原子落盘：先写临时文件再 rename（v1.7.11）。
+
+        临时名带 pid + 随机后缀——固定名（.wkfile-tmp）在两个并发请求写
+        同一个文件时会互相踩对方的半成品；写一半崩溃也不会毁掉原文件
+        （rename 在同卷上是原子的）。
+        """
+        tmp = f"{full}.{os.getpid()}-{secrets.token_hex(4)}.wkfile-tmp"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, full)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
     def op_write_b64(self, req: dict) -> dict:
         self._require_write()
         full = self.guard.resolve(req.get("path"))
@@ -1888,8 +1928,7 @@ class Agent:
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         self._preflight(full, data)
         backup = self._backup(full) if req.get("backup", True) else None
-        with open(full, "wb") as fh:
-            fh.write(data)
+        self._atomic_write(full, data)
         return {"path": full, "bytes": len(data), "backup": backup}
 
     def op_upload(self, req: dict) -> dict:
@@ -1924,10 +1963,7 @@ class Agent:
         self._preflight(full, raw)
         backup = self._backup(full) if req.get("backup", True) else None
         existed = os.path.isfile(full)
-        tmp = full + ".wkfile-tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(raw)
-        os.replace(tmp, full)
+        self._atomic_write(full, raw)
         st = os.stat(full)
         return {
             "path": full,
@@ -1959,7 +1995,17 @@ class Agent:
         new = req.get("new", "")
         if old is None or old == "":
             raise PathError("bad_request", "old 不能为空")
-        text, enc, _ = read_text_file(full, int(self.cfg.max_read_bytes))
+        # v1.7.11：截断标志必须接住——超限文件读进来就是砍半的，替换后写回
+        # 等于静默销毁 4MB 之后的所有内容（有备份可救，但那是赌运气）。
+        text, enc, truncated = read_text_file(full, int(self.cfg.max_read_bytes))
+        if truncated:
+            raise PathError(
+                "too_large",
+                f"文件超过读取上限 {human_size(int(self.cfg.max_read_bytes))}，"
+                "win_replace 只处理能完整读入的文件，拒绝在截断内容上做替换。"
+                "大文件请走分段方案：win_read 定位行号 → win_write 重写整文件，"
+                "或 POST /api/upload 直传新内容。",
+            )
         use_regex = bool(req.get("regex", False))
         limit = int(req.get("count", 0) or 0)
         if use_regex:
@@ -2715,6 +2761,42 @@ class Agent:
             return True
         return program + ".exe" in allowed
 
+    def _exec_guard_hijack(self, program: str, cwd: str) -> None:
+        """围栏⑦（v1.7.11）：堵 cwd 劫持。
+
+        Windows 下 cmd 执行不带路径的程序时搜索序是 **cwd 优先于 PATH**，
+        而 roots 恰恰是 AI 可写目录——往里面放一个与白名单程序同名的
+        php.bat / php.exe，"php xxx" 实际执行的就是投放文件，白名单
+        形同虚设。两道检查：
+          a) cwd 里存在首程序的任何可执行变体（.bat/.cmd/.exe/.com）
+             → 拒绝：有文件在抢这个名字，绝大多数就是投放；
+          b) shutil.which 按 PATH 解析到的真实路径落在 roots 内 → 拒绝：
+             PATH 里混进了 AI 可写目录，同样是投放面。
+        cmd 内建命令（dir/type/set 这类 which 找不到、cwd 里也不该有
+        同名文件）不受影响。
+        """
+        stem = program[:-4] if program.endswith(".exe") else program
+        for ext in (".bat", ".cmd", ".exe", ".com"):
+            candidate = os.path.join(cwd, stem + ext)
+            if os.path.isfile(candidate):
+                raise PathError(
+                    "exec_hijack_suspected",
+                    f"工作目录里存在与白名单程序同名的 {os.path.basename(candidate)}，"
+                    "拒绝执行——cwd 优先于 PATH 的程序搜索序会被它劫持。"
+                    "如确属正常使用，请换一个工作目录，或把该程序装到授权目录之外。",
+                )
+        resolved = shutil.which(program) or shutil.which(stem)
+        if resolved:
+            resolved_dir = os.path.normcase(os.path.dirname(os.path.abspath(resolved)))
+            for root in (self.cfg.roots or []):
+                r = os.path.normcase(os.path.abspath(root))
+                if resolved_dir == r or resolved_dir.startswith(r + os.sep):
+                    raise PathError(
+                        "exec_hijack_suspected",
+                        f"程序 {program} 经 PATH 解析到 {resolved}，落在授权可写目录内，"
+                        "拒绝执行。请从 PATH 移除该目录，或把程序安装到可信位置。",
+                    )
+
     # 热加载只覆盖"参数级"字段；exec_enabled 仍然必须重启 —— 它决定
     # win_exec 是否出现在 tools/list（Agent 构造时的快照），"能力开关必须
     # 显式重启"的安全语义保持不变。
@@ -2833,6 +2915,9 @@ class Agent:
         timeout = min(max(self._int_arg(req, "timeout",
                                         int(self.cfg.exec_timeout_sec or 60)) or 60, 1), 300)
         max_out = int(self.cfg.exec_max_output_bytes or 65536)
+        # 围栏⑦（v1.7.11）：cwd 劫持防护——cwd 默认就是 roots[0]（AI 可写），
+        # Windows 程序搜索序 cwd 优先于 PATH，不查的话白名单可被同名投放文件绕过
+        self._exec_guard_hijack(program, cwd)
         # stdin 直喂（v1.7.9）：php/python 这类读标准输入的程序不用再写
         # `php -r "引号嵌套地狱"`，把脚本放 stdin 参数里就行。
         # cmd /c 会把标准输入透传给被调程序，管道是通的。
@@ -3198,6 +3283,11 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"{SERVICE}/{VERSION}"
     protocol_version = "HTTP/1.1"
     agent: Agent = None  # 由 main 注入
+    # v1.7.11：socket 读超时（秒）。之前完全没有超时——一个只连不发数据的
+    # 慢连接会永远占着一个 ThreadingHTTPServer 线程；设了之后 BaseHTTPRequestHandler
+    # 在读请求行/头超时时自动结束连接。SSE 不受影响（它靠自己的 deadline 退出，
+    # 心跳是写方向）。
+    timeout = 120
 
     # 静默默认访问日志（审计日志已经记录）
     def log_message(self, fmt, *args):
@@ -3299,22 +3389,6 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PathError("bad_json", f"请求体不是合法 JSON：{exc}")
 
-    def _read_raw_body(self) -> bytes:
-        """读原始字节请求体（/api/upload 用）：超写入上限直接 413。"""
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            return b""
-        if length > int(self.agent.cfg.max_write_bytes):
-            raise PathError(
-                "too_large",
-                f"上传体积 {human_size(length)} 超过写入上限 "
-                f"{human_size(int(self.agent.cfg.max_write_bytes))}",
-            )
-        return self.rfile.read(length) or b""
-
     def _auth(self) -> bool:
         agent = self.agent
         ip = self._client_ip()
@@ -3388,15 +3462,25 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _read_raw_body(self) -> bytes:
+        """读原始字节请求体（/api/upload 与 MCP JSON 共用）：超上限直接 413。
+
+        v1.7.11：这里原来有两个同名方法（upload 版 16MB / MCP 版 32MB），
+        类内后者覆盖前者，upload 的上限逻辑实际是死代码——合并成一个，
+        上限统一为 max_write_bytes（默认 16MB）。
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
         if length <= 0:
             return b""
-        if length > 32 * 1024 * 1024:
-            raise PathError("too_large", "请求体过大")
-        return self.rfile.read(length)
+        if length > int(self.agent.cfg.max_write_bytes):
+            raise PathError(
+                "too_large",
+                f"请求体 {human_size(length)} 超过上限 "
+                f"{human_size(int(self.agent.cfg.max_write_bytes))}",
+            )
+        return self.rfile.read(length) or b""
 
     def _mcp_accepted(self) -> None:
         """202：收到通知，无需响应体"""

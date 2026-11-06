@@ -672,6 +672,9 @@ def render(tool_name: str, data: dict) -> str:
             f"{data.get('returned_lines')} 行"
             f"{', 已截断' if data.get('truncated') else ''}]"
         )
+        # v1.7.11：续读游标直接给下一步参数，AI 不用自己算行号（算错会静默漏行）
+        if data.get("next_start_line"):
+            head += f"\n⚠️ 还有未读内容：下次调用传 start_line={data['next_start_line']} 续读"
         return head + "\n" + ("-" * 60) + "\n" + str(data.get("content", ""))
 
     if tool_name == "win_list":
@@ -1040,11 +1043,11 @@ def call_tool(dispatch, params: dict, *, disabled=()) -> dict:
         data = dispatch(action, payload)
         result = {"content": [{"type": "text", "text": render(name, data)}],
                   "isError": False}
-        if name == "win_exec":
-            # MCP structuredContent（2025-06-18 规范字段，旧客户端自动忽略）：
-            # exit_code / duration_ms / output_file 等机器可读字段直接给结构化
-            # 结果，AI 不用再从文本头部解析「退出码 2」这种行
-            result["structuredContent"] = data
+        # MCP structuredContent（2025-06-18 规范字段，旧客户端自动忽略）：
+        # v1.7.9 起给 win_exec 附机器可读字段（exit_code/duration_ms/output_file），
+        # v1.7.11 起扩展到全部工具——win_read 的 next_start_line 游标等
+        # 结构化字段直接可读，AI 不用再从文本头部解析
+        result["structuredContent"] = data
         return result
     except Exception as exc:  # noqa: BLE001 —— 任何异常都要变成工具错误，不能让连接断
         msg = getattr(exc, "message", None) or str(exc)
