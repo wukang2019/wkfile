@@ -1999,6 +1999,8 @@ class Wizard:
                           err: str) -> None:
         """端口探测结束后回到主线程展示结果 / 弹窗。"""
         self._portcheck_busy = False
+        if not self._ui_alive():
+            return
         if err:
             self.log(f"端口检查失败：{err}", "err")
             self.set_hint("端口检查失败，详见日志", "err")
@@ -2421,11 +2423,28 @@ class Wizard:
 
         threading.Thread(target=worker, daemon=True, name="wk-status").start()
 
+    def _ui_alive(self) -> bool:
+        """窗口是否还能收回调。
+
+        工作线程用 after(0) 排队后，用户可能已经关窗；回调仍会执行，
+        此时碰 Tk 变量会抛 TclError 并打印一串「Exception in Tkinter
+        callback」噪音。没有窗口的桩件（自动化测试）一律视为存活。
+        """
+        try:
+            return bool(self.root.winfo_exists())
+        except AttributeError:
+            return True
+        except (tk.TclError, RuntimeError):
+            return False
+
     def _apply_status(self, ok: bool, snap: dict = None, host: str = "",
                       port: int = 0, scheme: str = "http", pid: int = 0,
                       detail: str = "") -> None:
         """工作线程跑完后回到主线程改界面（tkinter 不是线程安全的）。"""
         self._status_busy = False
+        if not self._ui_alive():
+            self._status_pending = False
+            return
         if ok:
             self.var_status.set("● 正在运行")
             self.lbl_status.configure(foreground="#137333")

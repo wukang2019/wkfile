@@ -1,0 +1,2 @@
+﻿FileVersion=1.7.17.0
+ProductVersion=1.7.17.0

@@ -130,11 +130,15 @@ def main():
         chk(tag + "3 sum(returned_lines) == 逻辑行数 4",
             sum(x["returned_lines"] for x in pages) == len(logical),
             sum(x["returned_lines"] for x in pages))
-        # 客户端视角：把每页 content 按“该页是否消费到行尾”拼回去，必须还原逻辑行
+        # 客户端视角：只用返回值里能拿到的 content_ends_with_newline 判断页尾换行。
+        # 以前这里用 data[offset:offset+consumed]（测试持有原文）来判，等于在验
+        # 「我说了什么」而不是「服务做了什么」——v1.7.17 改成客户端可得字段。
         seen = "".join(
-            x["content"] + ("\n" if data[x["offset"]: x["offset"] + x["consumed_bytes"]].endswith(b"\n") else "")
+            x["content"] + ("\n" if x["content_ends_with_newline"] else "")
             for x in pages
         )
+        chk(tag + "4b 只用返回字段逐字节还原原文",
+            seen.encode("utf-8") == data, (len(seen), len(data)))
         lines_all = seen.splitlines()
         chk(tag + "4 拼接行序列 == 逻辑行序列（无空串/重复/丢失）",
             lines_all == logical and "" not in lines_all, lines_all)
@@ -168,6 +172,30 @@ def main():
                 len(frag) == 1 and frag[0]["returned_lines"] == 0
                 and frag[0]["next_start_line"] == frag[0]["line_number_base"],
                 [(x["returned_lines"], x["next_start_line"], x["line_number_base"]) for x in frag])
+
+    # ---------- F. 末尾有/无换行 × 跨页/不跨页（v1.7.17 第三轮收口） ----------
+    # 前两轮都在「按 line_fragment / eof 猜页尾换行」上翻车：末尾无换行的
+    # 文件多补一个 \n，改成「非 eof 才补」又让末尾有换行的文件少一个 \n。
+    # 这里只用客户端可得字段重建，逐字节比对，并校验累计行数。
+    for label, data in (
+        ("F-noeol-cross", b"A" * (LIM + 1)),
+        ("F-eol-cross", b"X" * LIM + b"\nL2\n"),
+        ("F-noeol-plain", b"L1\nL2"),
+        ("F-eol-plain", b"L1\nL2\n"),
+    ):
+        pf = os.path.join(share3, label + ".txt")
+        with open(pf, "wb") as f:
+            f.write(data)
+        pages = read_all(agent3, pf, LIM, rounds=10)
+        rebuilt = "".join(
+            x["content"] + ("\n" if x["content_ends_with_newline"] else "")
+            for x in pages).encode("utf-8")
+        chk(label + "1 累计 returned_lines == 逻辑行数",
+            sum(x["returned_lines"] for x in pages) == len(data.decode().splitlines()),
+            [x["returned_lines"] for x in pages])
+        chk(label + "2 只用返回字段逐字节还原", rebuilt == data,
+            (len(rebuilt), len(data)))
+        chk(label + "3 有限轮次内到 EOF", pages[-1]["eof"] is True and len(pages) <= 10)
 
     # ---------- B. _backup 失败的影响面 ----------
     tgt = os.path.join(share, "t.txt")

@@ -8,6 +8,8 @@
 
 import os
 import sys
+import tempfile
+import shutil
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE, "server"))
@@ -65,7 +67,9 @@ def test_default_contract():
     check("响应去重阈值来自常量",
           m.human_bytes(m.STRUCTURED_CONTENT_OMIT_BYTES) in txt)
     check("写明续读只看 eof", "eof=true" in txt and "next_offset" in txt)
-    check("写明残页拼接规则", "line_fragment=true" in txt and "不补换行" in txt)
+    check("契约写明页尾换行字段", "content_ends_with_newline" in txt)
+    check("契约不再让用户按 line_fragment/eof 猜换行",
+          "其余页补一个" not in txt and "不要按 line_fragment / eof 猜" in txt)
     check("写明备份失败整体中止", "整体中止" in txt and "原文件不动" in txt)
     check("写明 backup=false", "backup=false" in txt)
     check("写明 BOM 限制", "utf-8-sig" in txt)
@@ -151,10 +155,109 @@ def test_threshold_is_shared():
           m.human_bytes(n) in m.runtime_contract(base_info()))
 
 
+def test_contract_matches_real_behavior():
+    """验「代码做了什么」，不是「契约说了什么」。
+
+    第三轮同一个坑的根因：契约写的是启发式拼接规则，测试只断言字符串存在。
+    这里喂真实文件给 Agent 逐页读，只用返回值里客户端能拿到的字段重建，
+    逐字节比对原文，并校验各页 returned_lines 之和等于逻辑行数。
+    """
+    print("\n========== 5. 行为断言：真实文件逐页读 + 逐字节还原 ==========")
+    base = tempfile.mkdtemp(prefix="wk-contract-")
+    old_rule_fails = False
+    trae_rule_fails = False
+    try:
+        share = os.path.join(base, "share")
+        os.makedirs(share)
+        N = 16
+        cfg = wa.Config({"roots": [share], "max_read_bytes": N,
+                         "max_write_bytes": 1 << 20},
+                        os.path.join(base, "c.json"))
+        agent = wa.Agent(cfg)
+        cases = [
+            ("单行超长跨页 无尾换行", b"A" * (N + 1)),
+            ("两行 末行长跨页 无尾换行", b"L1\n" + b"B" * (N + 1)),
+            ("普通两行 有尾换行", b"L1\nL2\n"),
+            ("普通两行 无尾换行", b"L1\nL2"),
+            ("跨页且末尾有换行", b"X" * N + b"\nL2\n"),
+            ("多行跨页 无尾换行",
+             b"A" * 20 + b"\n" + b"B" * 20 + b"\n" + b"C" * 20),
+        ]
+
+        def read_pages(ag, path, limit):
+            page = ag.op_read({"path": path, "max_bytes": limit,
+                               "line_numbers": False})
+            pages = [page]
+            while not page["eof"] and page["next_offset"]:
+                page = ag.op_read({"path": path,
+                                   "offset": page["next_offset"],
+                                   "start_line": page["next_start_line"],
+                                   "max_bytes": limit,
+                                   "line_numbers": False})
+                pages.append(page)
+                if len(pages) > 12:
+                    break
+            return pages
+
+        def verify(label, data, pages):
+            nonlocal old_rule_fails, trae_rule_fails
+            rebuilt = "".join(
+                x["content"] + ("\n" if x["content_ends_with_newline"] else "")
+                for x in pages).encode()
+            logical = len(data.decode().splitlines())
+            checks = {
+                "累计 returned_lines == 逻辑行数":
+                    sum(x["returned_lines"] for x in pages) == logical,
+                "按契约字段逐字节还原": rebuilt == data,
+                "字节不丢": sum(x["consumed_bytes"] for x in pages) == len(data),
+                "最后一页 eof": pages[-1]["eof"] is True,
+                "每页都下发页尾换行字段":
+                    all("content_ends_with_newline" in x for x in pages),
+            }
+            bad = [k for k, v in checks.items() if not v]
+            check("%s（%d 页）" % (label, len(pages)), not bad,
+                  ",".join(bad) or "")
+            # 反例保护：两种启发式规则都不能覆盖全部样本，否则新字段就白加了
+            old = "".join(x["content"] + ("" if x["line_fragment"] else "\n")
+                          for x in pages).encode()
+            trae = "".join(
+                x["content"] + ("" if (x["line_fragment"] or x["eof"]) else "\n")
+                for x in pages).encode()
+            old_rule_fails = old_rule_fails or old != data
+            trae_rule_fails = trae_rule_fails or trae != data
+
+        for label, data in cases:
+            p = os.path.join(share, "t.txt")
+            with open(p, "wb") as fh:
+                fh.write(data)
+            verify(label, data, read_pages(agent, p, N))
+
+        # Trae 的实测样本：4 MB + 1 字节、结尾无换行、跨页
+        big_n = 4 * 1024 * 1024
+        cfg_big = wa.Config({"roots": [share], "max_read_bytes": big_n,
+                             "max_write_bytes": big_n + 1024},
+                            os.path.join(base, "big.json"))
+        big_data = b"A" * (big_n + 1)
+        p = os.path.join(share, "big.txt")
+        with open(p, "wb") as fh:
+            fh.write(big_data)
+        bp = read_pages(wa.Agent(cfg_big), p, big_n)
+        verify("4MB+1 结尾无换行（Trae 复现样本）", big_data, bp)
+        check("4MB+1 确实跨成 2 页且累计行数为 1",
+              len(bp) == 2 and sum(x["returned_lines"] for x in bp) == 1,
+              str([(x["returned_lines"], x["eof"]) for x in bp]))
+
+        check("旧契约规则确实无法逐字节还原（反例有效）", old_rule_fails)
+        check("Trae 建议的 eof 规则也无法逐字节还原（反例有效）", trae_rule_fails)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_default_contract()
     test_follows_config()
     test_legacy_and_initialize()
     test_threshold_is_shared()
+    test_contract_matches_real_behavior()
     print("\nMCP_CONTRACT_TEST: %d PASS / %d FAIL" % (len(PASS), len(FAIL)))
     raise SystemExit(1 if FAIL else 0)

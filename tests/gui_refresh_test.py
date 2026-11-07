@@ -383,6 +383,44 @@ def test_notifier():
         g.messagebox = orig
 
 
+class FakeDeadRoot(FakeRoot):
+    """模拟 root.destroy() 之后 Tcl 解释器已释放。"""
+
+    def winfo_exists(self):
+        raise RuntimeError("invalid command name")
+
+
+def test_dead_window_callback():
+    print("\n=== 关窗后排队回调静默返回（无 TclError 噪音） ===")
+    app = make_app()
+    app.root = FakeDeadRoot()
+    before = app.var_status.value
+    app._status_pending = True
+    app._status_busy = True
+    err = ""
+    try:
+        app._apply_status(True, {}, "127.0.0.1", 8765, "http", 0, "")
+    except Exception as exc:  # noqa: BLE001
+        err = repr(exc)
+    check("关窗后状态回调不抛异常", not err, err)
+    check("关窗后不碰 Tk 变量", app.var_status.value == before)
+    check("关窗后放闸且清掉 pending",
+          app._status_busy is False and app._status_pending is False)
+
+    app._portcheck_busy = True
+    err = ""
+    try:
+        app._apply_port_check(8765, [], False, "")
+    except Exception as exc:  # noqa: BLE001
+        err = repr(exc)
+    check("关窗后端口回调不抛异常", not err, err)
+    check("关窗后不弹窗/不写日志", not app.logs and not app.hints)
+
+    live = make_app()          # 正常窗口不能被误判成已销毁
+    live._apply_status(True, {}, "127.0.0.1", 8765, "http", 0, "")
+    check("存活窗口仍正常刷新状态", live.var_status.value == "● 正在运行")
+
+
 if __name__ == "__main__":
     test_health_probe()
     test_refresh_async()
@@ -390,5 +428,6 @@ if __name__ == "__main__":
     test_start_timeout()
     test_runtime_snapshot()
     test_notifier()
+    test_dead_window_callback()
     print("\nGUI_REFRESH_TEST: %d PASS / %d FAIL" % (PASS, FAIL))
     raise SystemExit(1 if FAIL else 0)

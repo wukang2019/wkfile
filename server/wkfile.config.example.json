@@ -1,4 +1,5 @@
 {
+  "author": "吴康",
   "host": "0.0.0.0",
   "port": 8788,
   "token": "在这里填一个长随机串；用图形界面启动时点「生成」按钮即可",
@@ -13,6 +14,8 @@
   "allow_delete": true,
   "allow_move": true,
   "auto_backup": true,
+  "backup_max_bytes": 2147483648,
+  "trash_retain_days": 30,
   "preflight_check": true,
   "enable_mcp": true,
   "tools_disable": [],
@@ -27,6 +30,12 @@
   "max_write_bytes": 16777216,
   "max_list_entries": 3000,
   "max_grep_file_bytes": 2097152,
+  "grep_extensions": [
+    ".txt", ".log", ".md", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".conf", ".csv", ".tsv", ".xml", ".html", ".htm", ".css", ".js", ".ts", ".jsx", ".tsx",
+    ".py", ".ps1", ".bat", ".cmd", ".sh", ".java", ".go", ".rs", ".c", ".cpp", ".h", ".hpp",
+    ".sql", ".env", ".properties", ".gitignore", ".vue", ".php", ".rb", ".cs", ".kt", ".swift"
+  ],
   "audit_log": "logs/audit.jsonl",
   "audit_max_bytes": 5242880,
   "audit_backup_count": 3,

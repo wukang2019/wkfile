@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.16\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.17\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.16.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.17.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -112,7 +112,7 @@ trae-winfile\
 │   ├─ mcp-public-test.py          #   验 MCP 端点（initialize + tools/list）
 │   └─ mcp-call-test.py            #   真调一个工具（如 win_roots / win_list）
 ├─ tests\                          # 端到端测试套件（本地开发用）
-│   ├─ features_e2e.py             #   新增能力自测（自签证书、公网 IP、证书链、数据库、超时边界，227 用例）
+│   ├─ features_e2e.py             #   新增能力自测（自签证书、公网 IP、证书链、数据库、超时边界，207 用例）
 │   ├─ mcp_e2e.py                  #   MCP 端点（Streamable HTTP + SSE + 鉴权 + 越权拦截）
 │   ├─ local_e2e.py                #   本机端到端（源码路线）
 │   ├─ tls_e2e.py                  #   真 HTTPS 链路（需本机有 openssl，无则跳过）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.16\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.17\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -168,7 +168,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.16\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.17\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -668,6 +668,11 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      开关与白名单。数字全部取自代码常量，不会随文档漂移；**没有新增工具、
      没有新增调用、包里也没有多一份机读文档**。改了配置重启后，AI 下次连接
      看到的就是新值。
+   - **`win_read` 拼接只看事实字段**（v1.7.17）：每页返回
+     `content_ends_with_newline`，表示该页末行在原文里是否由换行终止；仅当它为
+     `true` 时页尾补一个 `\n`，否则直接接下一页。**不要按 `line_fragment` / `eof`
+     猜**——末尾有无换行的文件会各错一半。同时修好「末行无换行且跨页」时 EOF 页
+     少算一行的问题，各页 `returned_lines` 之和恒等于逻辑行数。
    - 改 Token / 白名单 / 端口后**必须重启服务**才生效（暂未做配置热重载）。
    - 不开 HTTPS 的话，Token 仍是明文过公网 —— 这是最大的剩余风险，见第 7 条。
 10. **开数据库之前请先想清楚这三件事**（v1.6.0 新增能力）：
@@ -727,7 +732,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 ```powershell
 cd trae-winfile
 python selftest.py                      # 老接口 + 安全机制 + MCP 协议回归：53 用例
-python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：227 用例
+python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：207 用例
 python tests\mcp_e2e.py                 # MCP 端点（源码）：48 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
@@ -738,7 +743,7 @@ python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：53 
 
 ````
 
-当前状态（v1.7.16 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、56/56、13/13、11/11、152/152、56/56 全通过**；另跑通 `test/v1712/spotcheck.py` A~E 段、`check.py` 13 项、`tests/gui_refresh_test.py` 46 项、`tests/mcp_contract_test.py` 43 项、structuredContent 去重定向断言 3 项与打包后 `wkfile.exe --check-gui` 自检。
+当前状态（v1.7.17 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、59/59、13/13、11/11、152/152、56/56 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 54 项与打包后 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：
 

@@ -192,6 +192,18 @@ def main():
 
     st, _, body = call_tool("win_read", {"path": os.path.join(share, "new.txt")}, sid)
     check("win_read 读回内容", "hello from mcp" in tool_text(body), body[:300])
+    sc = json.loads(body)["result"].get("structuredContent") or {}
+    check("MCP 下发页尾换行字段（有尾换行=true）",
+          sc.get("content_ends_with_newline") is True, str(sc)[:200])
+
+    st, _, body = call_tool("win_write", {"path": os.path.join(share, "noeol.txt"),
+                                          "content": "tail no newline"}, sid)
+    check("无尾换行样本写入成功",
+          json.loads(body)["result"]["isError"] is False, body[:200])
+    st, _, body = call_tool("win_read", {"path": os.path.join(share, "noeol.txt")}, sid)
+    sc = json.loads(body)["result"].get("structuredContent") or {}
+    check("MCP 下发页尾换行字段（无尾换行=false）",
+          sc.get("content_ends_with_newline") is False, str(sc)[:200])
 
     st, _, body = call_tool("win_replace", {"path": os.path.join(share, "new.txt"), "old": "mcp", "new": "MCP"}, sid)
     check("win_replace 成功", json.loads(body)["result"]["isError"] is False, body[:300])

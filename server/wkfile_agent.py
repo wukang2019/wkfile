@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.16"
+VERSION = "1.7.17"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1903,14 +1903,23 @@ class Agent:
                 cut = nl + 1
             if cut > 0:
                 consumed = min(consumed, cut)
-        # 残行不计入 returned_lines；head 行只有在本页被换行终止时才算完整行
+        # v1.7.17（第三轮同一处收口）：扣减只在「后面还有字节」时成立。
+        # 末行无换行且跨页时，EOF 页 starts_mid_line=True / head_terminated=False，
+        # 旧逻辑仍扣 1，导致累计 returned_lines 比逻辑行数少 1（极端样本累计 0）。
+        # 到了 EOF 这一行已经完整结束，必须计入。
+        byte_more = (offset + consumed) < size
         complete = len(selected)
-        if fragment_tail and consumed >= len(raw):
+        if byte_more and fragment_tail and consumed >= len(raw):
             complete -= 1
         head_terminated = raw.endswith(b"\n") or len(lines) > 1
-        if starts_mid_line and selected and not head_terminated:
+        if byte_more and starts_mid_line and selected and not head_terminated:
             complete -= 1
         complete = max(complete, 0)
+        # 客户端逐字节还原正文的唯一依据：本页最后一行在原文里是否由换行终止。
+        # content 是 "\n".join(行)，页尾换行不会出现在 content 里；以前只给
+        # line_fragment / eof 让客户端猜，末尾有/无换行的文件必然各错一半。
+        content_ends_with_newline = bool(selected) and (
+            lines_left > 0 or raw[:consumed].endswith(b"\n"))
         numbered = bool(req.get("line_numbers", True))
         body = (
             "\n".join(f"{start + i:>6}\t{ln}" for i, ln in enumerate(selected))
@@ -1918,7 +1927,6 @@ class Agent:
             else "\n".join(selected)
         )
         byte_truncated = (offset + len(raw)) < size
-        byte_more = (offset + consumed) < size           # 文件里还有没读到的字节
         truncated = byte_more or lines_left > 0
         return {
             "path": full,
@@ -1937,6 +1945,8 @@ class Agent:
             # v1.7.13：残行状态显式化——本页末尾是半行 / 本页从上一行中间开始
             "line_fragment": fragment_tail,
             "continues_previous_line": starts_mid_line,
+            # v1.7.17：显式下发页尾换行事实，客户端不再靠猜（见契约与行为测试）
+            "content_ends_with_newline": content_ends_with_newline,
             "truncated": truncated,
             "eof": not truncated,
             "byte_truncated": byte_truncated,

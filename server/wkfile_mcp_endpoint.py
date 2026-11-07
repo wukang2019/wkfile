@@ -124,7 +124,7 @@ TOOLS = [
     },
     {
         "name": "win_read",
-        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，是否读完只看 eof=true（不要用 returned_lines==0 或 truncated 判断结束）。某一页的 returned_lines 可能为 0：整行长度超过本页字节上限，该页只装了残行片段（line_fragment=true），此时 next_offset 仍会前进，继续读即可。拼接多页正文时：line_fragment=true 的残页末尾不补换行、其余页补一个换行，即可无损还原原文。二进制文件请用 win_read_b64。",
+        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，是否读完只看 eof=true（不要用 returned_lines==0 或 truncated 判断结束）。某一页的 returned_lines 可能为 0：整行长度超过本页字节上限，该页只装了残行片段（line_fragment=true），此时 next_offset 仍会前进，继续读即可。拼接多页正文时：仅当本页 content_ends_with_newline=true 时在页尾补一个 \\n（该字段精确表示本页最后一行在原文里是否由换行终止），否则直接接下一页；不要靠 line_fragment / eof 猜，末尾有无换行的文件会各错一半。这样可逐字节无损还原原文，且各页 returned_lines 之和等于逻辑行数。二进制文件请用 win_read_b64。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1010,7 +1010,9 @@ def runtime_contract(info: dict) -> str:
         f"响应正文超过 {omit} 时 structuredContent 省略重复 content"
         "（标记 content_omitted），全文取 content[0].text。",
         "win_read 读完只看 eof=true，用 next_offset / next_start_line 续读；"
-        "line_fragment=true 的页尾不补换行，其余页补一个。",
+        "拼接多页正文时，仅当该页 content_ends_with_newline=true 才在页尾补一个 \\n"
+        "（该字段说明本页末行在原文里是否由换行终止），否则直接接下一页；"
+        "不要按 line_fragment / eof 猜，末尾有无换行的文件会各错一半。",
         "自动备份" + ("开" if flags.get("auto_backup", True) else "关")
         + "：备份失败时覆盖/替换/移动/回滚整体中止且原文件不动；"
           "win_write / win_write_b64 可传 backup=false 跳过。",
