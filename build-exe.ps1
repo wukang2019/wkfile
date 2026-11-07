@@ -26,7 +26,7 @@ $Dist  = Join-Path $Root "dist"
 $PipIndex = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 $AppName = "wkfile"
-$AppVer  = "1.7.20"
+$AppVer  = "1.7.21"
 
 function Find-Python {
     $cands = @()
@@ -101,12 +101,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'wkfile'),
             StringStruct('FileDescription', 'wkfile - remote file agent for Windows (GUI installer)'),
-            StringStruct('FileVersion', '1.7.20.0'),
+            StringStruct('FileVersion', '1.7.21.0'),
             StringStruct('InternalName', 'wkfile'),
             StringStruct('LegalCopyright', 'MIT License'),
             StringStruct('OriginalFilename', 'wkfile.exe'),
             StringStruct('ProductName', 'wkfile'),
-            StringStruct('ProductVersion', '1.7.20.0')
+            StringStruct('ProductVersion', '1.7.21.0')
           ]
         )
       ]
@@ -132,6 +132,7 @@ Write-Host "[4/4] building $AppName.exe (GUI, windowed) ..."
     --paths (Join-Path $Root "server") `
     --version-file $vfServer `
     --hidden-import wkfile_selfcert `
+    --hidden-import wkfile_core `
     --hidden-import wkfile_mysql `
     --hidden-import wkfile_redis `
     --hidden-import wkfile_sqlsrv `

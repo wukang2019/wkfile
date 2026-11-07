@@ -35,7 +35,7 @@
 ```
 
 > **已实测打通**（2026-10-14）：从开发机经公网直连服务器 MCP 端点，  
-> `initialize` → `tools/list`（33 个工具，exec 未开启时；开启后 34）→ `win_roots` → `win_list` 全部成功，  
+> `initialize` → `tools/list`（36 个工具，exec 未开启时；开启后 37）→ `win_roots` → `win_list` 全部成功，  
 > 真实读到了服务器上 `E:\apps` 的目录列表。
 
 ### 端口说明（重要）
@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.20\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.21\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.20.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.21.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.20\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.21\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.20\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.21\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -226,7 +226,7 @@ python build-release.py                                     # 再重建 文件�
 }
 ```
 
-配好后客户端的 MCP 列表里 `wkfile` 显示 **Running**，工具列表里能看到 33 个 `win_*` 工具（默认 exec 关闭；开启后 34 个）。
+配好后客户端的 MCP 列表里 `wkfile` 显示 **Running**，工具列表里能看到 36 个 `win_*` 工具（默认 exec 关闭；开启后 37 个）。
 
 > 若客户端只认 SSE，把 `type` 改成 `"sse"`、`/mcp` 换成 `/sse`——服务端两个端点都开着。  
 > Trae 打开的是工作区根目录（如 `D:\my-projects`）时，项目级配置要放在  
@@ -305,6 +305,9 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 | `win_grep`            | 按正则搜文件内容（列日志、找报错）                  |
 | `win_read_b64`        | 读小二进制文件（base64）                    |
 | `win_write_b64`       | 写二进制文件（base64）                     |
+| `win_probe`           | **连不上/行为异常先调它**：一次自检版本、配置分层、目录可达性、审计健康、备份去重、安全开关与问题清单 |
+| `win_validate`        | 写前校验（不落盘）：路径白名单、乐观锁、old 命中、体积、目标语法一次验完 |
+| `win_patch`           | **多文件原子补丁**：全部预检通过才写，任一失败整体回滚；支持 dry_run |
 
 **数据库/缓存类（10 个，可选）**
 
@@ -645,7 +648,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
    | **凭据不回显**（新）   | 数据源列表、连接自检、审计日志里都只出现 `mysql://`、`sqlserver://` 这种摘要，**密码不会经任何接口回传**                                              |
    | **MCP 不写库**（新）   | 数据库配置只能从本机界面/配置文件改，没有对应的 MCP 工具 —— AI 拿不到、也改不了自己的数据库权限                                                            |
    | 审计日志           | **每次操作都记**（含 MCP 工具调用与 SQL 语句本体，v1.6.0 补上），JSONL 格式，含 IP、操作、路径、耗时、结果                                                  |
-   | 客户端风险提示        | 34 个工具全部带 MCP `annotations`，客户端才能正确区分只读/破坏性操作                                                                                |
+   | 客户端风险提示        | 37 个工具全部带 MCP `annotations`，客户端才能正确区分只读/破坏性操作                                                                                |
 9. **仍然存在的取舍**（有意保留，不是漏做）：
    - MCP 会话是「不带 `Mcp-Session-Id` 也放行」的宽容模式，方便用 `curl` 直接调试；  
      鉴权本身不受影响（`POST /mcp` 仍然要 Token）。
@@ -706,6 +709,31 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      `win_replace` 也补上了 `expected_sha256`（`dry_run` 与未命中路径同样校验），
      防止读取与替换之间别人的改动被静默覆盖。乐观锁比对统一走带体积上限的算法，
      超大文件明确拒绝写入而不是硬算哈希或静默跳过校验。
+   - **五项剩余待办一次收口**（v1.7.21）：
+     - **配置分层**：内置默认 < `wkfile.config.json` < 环境变量
+       `WKFILE_<键名大写>`（例：`WKFILE_PORT=9000`）。只允许覆盖已有键，
+       拼错/脏值忽略并在 `win_probe` 报告；环境变量**不会**被界面保存写回
+       文件，也不会被热加载冲掉（撤掉环境变量即恢复文件里的值）。
+     - **纯逻辑外提**：新增 `server/wkfile_core.py`，收拢编码/哈希/Token
+       有效期/超时夹取/配置合并/补丁预检等无状态函数；`wkfile_agent` 保持
+       旧名字导出，既有脚本与测试零改动，构建脚本补 `--hidden-import`。
+     - **审计降级**：审计盘写不进去时最近 N 条进内存缓冲（默认 200），
+       恢复后按原顺序自动补写；主操作绝不因账本失败而失败，`win_probe` 报出
+       降级状态与缓冲/丢弃/补写计数。
+     - **增量备份**：内容相同的历史版本用 NTFS 硬链接共用一份磁盘实体
+       （`backups/.objects/`），每个版本仍是**可直接读取与回滚的完整文件**；
+       不支持硬链接或超过 `backup_dedup_max_bytes`（默认 64 MB）时自动整份
+       复制，`backup_dedup=false` 可完全关掉。
+     - **三个新工具**：`win_validate` 写前校验（不落盘，只读 Token 也能调）、
+       `win_patch` 多文件原子补丁（全部预检通过才写，中途失败整体回滚）、
+       `win_probe` 一次自检出版本/配置分层/目录可达性/审计健康/备份去重/
+       安全开关与问题清单（不输出 Token）。
+     - **本版替运维拍板的假设**（与实际场景不符改配置即可，无需改代码）：
+       增量备份默认开且用硬链接而非 diff 链，回滚语义零变化；
+       `win_patch` 始终原子、不提供「允许部分成功」开关，单次最多 20 个
+       文件 / 合计 8 MB；审计缓冲 200 条；环境变量只认已有键。
+       **仍明确不做**：异步 `win_exec`、`win_db_query offset`、开放给 AI
+       删除备份（让 AI 删掉回滚兜底比写错文件更危险）。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -768,7 +796,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 ```powershell
 cd trae-winfile
 python selftest.py                      # 老接口 + 安全机制 + MCP 协议回归：53 用例
-python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：207 用例
+python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：208 用例
 python tests\mcp_e2e.py                 # MCP 端点（源码）：59 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
@@ -779,6 +807,7 @@ python tests\exec_output_test.py        # win_exec 双端压缩预览 + win_tail
 python tests\backup_retention_test.py   # 备份保留策略与配置键集合：26 用例
 python tests\write_backup_timeout_test.py  # backup=false 一致性 + 超时上限可配：51 用例
 python tests\optimistic_lock_test.py       # win_read(hash=true) + conflict 回传 + win_replace 乐观锁：44 用例
+python tests\v1721_test.py                 # 配置分层 + 纯逻辑外提 + 审计降级 + 增量备份 + validate/patch/probe：84 用例
 python tests\gui_refresh_test.py        # GUI 异步刷新（tkinter 桩）：52 用例
 python test\v1712\spotcheck.py          # win_read 边界 A~F 段：61 用例
 python test\v1712\check.py              # 围栏/原子写定点检查：13 用例
@@ -787,14 +816,14 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.20 实测，源码级）：**selftest 53/53、features 207/207（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 44 项；`py_compile` 与模块导入自检通过。
+当前状态（v1.7.21 实测，源码级）：**selftest 53/53、features 208/208（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 44 项、`tests/v1721_test.py` 84 项；`py_compile` 与模块导入自检通过。本轮把工具数量的硬编码断言改成按 `TOOLS` 动态校验，以后加工具不会再让回归假红。
 
 > ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
 > `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
-> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.20 均未改动 GUI 代码。上述源码级
-> 回归已覆盖本轮全部改动（含真实 `win_read(hash=true)` 逐页读取、真实
-> `win_write` / `win_replace` 冲突与重试闭环、纯文本渲染断言）。
+> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.21 均未改动 GUI 代码。上述源码级
+> 回归已覆盖本轮全部改动（真实配置分层/热加载、审计写盘失败与恢复补写、
+> 硬链接去重的实体与回滚、多文件补丁成功与中途失败回滚、MCP 双通道调用）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：

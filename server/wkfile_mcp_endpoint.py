@@ -567,6 +567,53 @@ TOOLS = [
             "required": ["command"],
         },
     },
+    {
+        "name": "win_validate",
+        "description": "写前校验（不落盘）：一次检查路径白名单、乐观锁、old 是否命中、体积上限与目标文件格式语法。只读 Token 也能调用。建议在 win_patch / win_write 之前跑一次，避免写完才发现语法错误或 old 没命中。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "单文件模式：目标文件绝对路径"},
+                "content": {"type": "string", "description": "单文件模式：打算整文件写入的内容"},
+                "old": {"type": "string", "description": "单文件模式：打算精确替换的原文"},
+                "new": {"type": "string", "description": "单文件模式：替换后的新文本"},
+                "count": {"type": "integer", "description": "old 命中多处时限定替换次数；0 = 要求唯一命中"},
+                "encoding": {"type": "string", "description": "编码，默认 utf-8"},
+                "expected_sha256": {"type": "string", "description": "文件当前 sha256，用于确认没被别人改过"},
+                "changes": {
+                    "type": "array",
+                    "description": "多文件模式：每项 {path, content 或 old/new, expected_sha256?}。与 path/content 单文件参数二选一",
+                    "items": {"type": "object"},
+                },
+            },
+        },
+    },
+    {
+        "name": "win_patch",
+        "description": "多文件原子补丁：全部文件预检通过才写入，任一文件失败就把已写的整体回滚。每项支持 content 整文件覆盖，或 old/new 精确替换（可带 expected_sha256 防并发覆盖）。一次改多个文件时优先用它，别逐个 win_write 留下半成品。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "changes": {
+                    "type": "array",
+                    "description": "补丁条目数组，每项 {path, content} 或 {path, old, new, count?, expected_sha256?, encoding?}；最多 20 项",
+                    "items": {"type": "object"},
+                },
+                "dry_run": {"type": "boolean", "description": "只预览不落盘，返回每项校验结论与写入字节数，默认 false"},
+                "backup": {"type": "boolean", "description": "每个文件写前备份，默认 true；传 false 可跳过"},
+            },
+            "required": ["changes"],
+        },
+    },
+    {
+        "name": "win_probe",
+        "description": "服务自检：一次返回版本、配置分层来源、各授权目录可达性、审计日志健康（是否在降级缓冲）、备份目录与增量去重统计、TLS/exec/MCP 开关、被禁用工具与具体问题清单。只读、不写文件、不输出 Token。连不上或行为异常时先调它。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+
 ]
 
 # 工具名 -> (中文短标题, 风险标注)
@@ -611,6 +658,9 @@ _TOOL_META = {
     # win_exec 权限最高（远程命令执行），保持 destructiveHint=True：
     # 默认服务端不开 exec_enabled，客户端弹确认是完全应该的
     "win_exec":          ("执行远程命令",   _WRITE),
+    "win_validate":      ("写前校验",       _READ_ONLY),
+    "win_probe":         ("服务自检",       _READ_ONLY),
+    "win_patch":         ("多文件原子补丁", _WRITE),
 }
 
 _unknown = sorted(set(_TOOL_META) - {t["name"] for t in TOOLS})
@@ -668,6 +718,9 @@ ROUTE_MAP = {
     "win_redis_get": "redis_get",
     "win_redis_write": "redis_write",
     "win_exec": "exec",
+    "win_validate": "validate",
+    "win_patch": "patch",
+    "win_probe": "probe",
 }
 
 
@@ -880,6 +933,64 @@ def render(tool_name: str, data: dict) -> str:
                      "可用 win_read 读全文、win_tail 直接看尾部报错）")
         flag = "（输出已截断）" if data.get("output_truncated") else ""
         return head + "\n" + ("-" * 60) + flag + "\n" + str(data.get("output") or "（无输出）")
+
+    if tool_name == "win_validate":
+        lines = ["写前校验：" + ("全部通过" if data.get("ok") else "未通过")
+                 + f"（共 {data.get('checked')} 项，磁盘未改动）"]
+        for it in data.get("results", []):
+            mark = "OK  " if it.get("ok") else "FAIL"
+            lines.append(f"  {mark} {it.get('path')}")
+            if not it.get("ok"):
+                lines.append("       " + "；".join(it.get("errors") or []))
+        for err in data.get("errors", []):
+            lines.append(f"  FAIL {err}")
+        return "\n".join(lines)
+
+    if tool_name == "win_patch":
+        if data.get("dry_run"):
+            lines = [f"预览：{data.get('would_apply')} 个文件可应用，磁盘未改动（原子补丁）"]
+            for it in data.get("changes", []):
+                lines.append(f"  {it.get('path')}  {it.get('bytes')} 字节  "
+                             f"{it.get('mode')}  替换 {it.get('replacements', 0)} 处")
+            return "\n".join(lines)
+        lines = [f"原子补丁已应用 {data.get('count')} 个文件（任一失败会整体回滚）："]
+        for it in data.get("changes", []):
+            lines.append(f"  {it.get('path')}  {it.get('bytes')} 字节  "
+                         f"sha256={it.get('sha256')}  备份={it.get('backup') or '无'}")
+        return "\n".join(lines)
+
+    if tool_name == "win_probe":
+        lay = (data.get("config") or {}).get("layers") or {}
+        by = lay.get("by_layer") or {}
+        lines = [f"wkfile {data.get('version')} 自检："
+                 + ("正常" if data.get("ok") else "发现问题") + f"  {data.get('time')}"]
+        lines.append(f"配置分层 默认<文件<环境变量：默认 {by.get('default', 0)} 项 / "
+                     f"文件 {by.get('file', 0)} 项 / 环境变量 {by.get('env', 0)} 项"
+                     + (f"；生效 {', '.join(lay.get('env_applied') or [])}"
+                        if lay.get("env_applied") else ""))
+        for r in data.get("roots", []):
+            lines.append(f"授权目录 {r.get('path')}  "
+                         f"{'存在' if r.get('exists') else '不存在'}  "
+                         f"{'可读' if r.get('readable') else '不可读'}  "
+                         f"{'可写' if r.get('writable') else '不可写'}")
+        a = data.get("audit") or {}
+        lines.append(f"审计：{a.get('state')}  缓冲 {a.get('buffered')}/{a.get('buffer_max')} 条  "
+                     f"失败 {a.get('failures')} 次  已补写 {a.get('flushed')} 条  "
+                     f"丢弃 {a.get('dropped')} 条")
+        b = data.get("backup") or {}
+        d = b.get("dedup") or {}
+        lines.append(f"备份目录 {'可写' if b.get('writable') else '不可写'}；"
+                     f"增量去重 {'开' if d.get('enabled') else '关'}  "
+                     f"命中 {d.get('hits')} 次 / 省下 {d.get('saved_human')}")
+        s = data.get("security") or {}
+        lines.append(f"安全：只读={s.get('read_only')}  本次 Token={s.get('token_scope')}  "
+                     f"TLS={s.get('tls')}  exec={s.get('exec_enabled')}  "
+                     f"MCP={s.get('mcp_enabled')}")
+        issues = data.get("issues") or []
+        lines.append("问题清单：" + ("无" if not issues else ""))
+        for msg in issues:
+            lines.append(f"  - {msg}")
+        return "\n".join(lines)
 
     if tool_name == "win_backup_list":
         # v1.7.18：策略快照也写进文本块 —— 只看 content[0].text 的客户端

@@ -16,6 +16,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE, "server"))
 
 import wkfile_agent as wa  # noqa: E402
+import wkfile_mcp_endpoint as mcp  # noqa: E402
 
 HOST = "127.0.0.1"
 PORT = 8815
@@ -146,7 +147,8 @@ def main():
     d = json.loads(body).get("data") or {}
     check("GET / 带 Token 返回详细状态", st == 200, f"status={st}")
     check("详细状态报告 mcp.enabled", d.get("mcp", {}).get("enabled") is True)
-    check("详细状态报告 34 个工具", d.get("mcp", {}).get("tools") == 34, str(d.get("mcp")))
+    check("详细状态工具数与 TOOLS 一致",
+          d.get("mcp", {}).get("tools") == len(mcp.TOOLS), str(d.get("mcp")))
     check("详细状态版本与源码常量一致", d.get("version") == wa.VERSION, str(d.get("version")))
 
     print("\n========== 2. Streamable HTTP：initialize ==========")
@@ -188,8 +190,9 @@ def main():
     tools = json.loads(body)["result"]["tools"]
     names = [t["name"] for t in tools]
     # exec_enabled 默认 false：win_exec 对客户端应该"不存在"而不是"看得见调不动"
-    check("exec 未开启时 tools/list 返回 33 个且不含 win_exec",
-          len(tools) == 33 and "win_exec" not in names, str(len(tools)))
+    check("exec 未开启时 tools/list 恰好少 win_exec 这一个",
+          set(names) == set(mcp.TOOL_MAP) - {"win_exec"} and "win_exec" not in names,
+          str(len(tools)))
     check("含 win_read / win_write / win_grep",
           all(n in names for n in ("win_read", "win_write", "win_grep")))
     check("每个工具都有 inputSchema", all("inputSchema" in t for t in tools))

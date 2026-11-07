@@ -74,14 +74,23 @@ def _raises(fn, exc=Exception):
 # ---------------------------------------------------------------------------
 section("A 工具 annotations / title")
 
-check("工具数量为 34（含默认关闭的 win_exec）", len(mcp.TOOLS) == 34, str(len(mcp.TOOLS)))
-check("每个工具都有 title + 4 项 annotations",
+# 数量断言按工具表动态校验，别写死数字：每加一个工具都要改一遍测试，
+# 很容易漏（v1.7.21 一次加 3 个就暴露了）。真正要保证的是三张表一致 +
+# 每个工具都归了类，以及新增工具的分类符合语义。
+check("TOOLS / TOOL_MAP / ROUTE_MAP 三者键集合一致",
+      len(mcp.TOOLS) == len(mcp.TOOL_MAP) == len(mcp.ROUTE_MAP)
+      and set(mcp.TOOL_MAP) == set(mcp.ROUTE_MAP), str(len(mcp.TOOLS)))
+check("所有工具都有 title + 4 项 annotations",
       all(t.get("title") and set(t.get("annotations", {})) ==
           {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"}
           for t in mcp.TOOLS))
-check("只读 21 / 写入 13（win_exec 属写）",
-      len(mcp.READ_ONLY_TOOLS) == 21 and len(mcp.WRITE_TOOLS) == 13,
+check("只读/写入分类不重不漏",
+      len(mcp.READ_ONLY_TOOLS) + len(mcp.WRITE_TOOLS) == len(mcp.TOOLS)
+      and not (mcp.READ_ONLY_TOOLS & mcp.WRITE_TOOLS),
       "%d/%d" % (len(mcp.READ_ONLY_TOOLS), len(mcp.WRITE_TOOLS)))
+check("v1.7.21 新工具分类正确（validate/probe 只读、patch 写入）",
+      {"win_validate", "win_probe"} <= mcp.READ_ONLY_TOOLS
+      and "win_patch" in mcp.WRITE_TOOLS)
 ro = {t["name"]: t["annotations"] for t in mcp.TOOLS}
 
 check("win_read 只读且非破坏",

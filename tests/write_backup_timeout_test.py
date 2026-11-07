@@ -39,9 +39,12 @@ def make_agent(base, share, **over):
 
 
 def backup_files(base):
+    """数「历史版本文件」——.objects 是 v1.7.21 增量备份的内容实体库，
+    不是一次改写产生的一份备份，不能混进这个计数里。"""
     root = os.path.join(base, wa.BACKUP_DIRNAME)
     out = []
-    for cur, _dirs, files in os.walk(root):
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != ".objects"]
         out.extend(os.path.join(cur, f) for f in files)
     return out
 

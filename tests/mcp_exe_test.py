@@ -25,7 +25,9 @@ def _read_version() -> str:
 
 
 EXPECT_VER = _read_version()
-EXPECT_TOOLS = 34
+# 黑盒期望值：TOOLS 里全部工具（本测试的配置把 exec_enabled 打开）。
+# 和源码里的 TOOLS 数量保持同步；新增工具时记得同步改这里。
+EXPECT_TOOLS = 37
 
 
 def _find_exe():

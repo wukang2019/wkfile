@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import difflib
 import fnmatch
 import hashlib
@@ -92,7 +93,19 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.20"
+
+# v1.7.21：纯逻辑外提到 wkfile_core（保持本模块旧名字可用，既有调用/测试不改）
+from wkfile_core import (  # noqa: E402
+    EXEC_TIMEOUT_HARD_CAP, MIN_TOKEN_LEN, WEAK_TOKENS,
+    _strip_json_comments, decode_text, exec_timeout_cap, expiry_state,
+    expiry_text, expiry_text_of, human_remain, human_size, is_loopback_bind,
+    is_private_ip, looks_binary, make_expiry, norm, now_iso, parse_expiry,
+    read_text_file, sha256_of, sha256_under_cap, token_strength, token_state,
+    cas_object_path, coerce_env_value, dedup_eligible, merge_config_layers,
+    patch_plan, strip_json_comments,
+)
+
+VERSION = "1.7.21"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -156,6 +169,18 @@ DEFAULT_CONFIG = {
     # 默认 0 是为了升级后不擅自删掉任何已有备份，需显式启用。
     "backup_retain_days": 0,
     "backup_retain_count": 0,
+    # v1.7.21 增量备份：内容相同的文件只存一份实体（NTFS 硬链接），
+    # 历史版本各自仍是可直接读取/还原的完整文件，回滚语义不变。
+    # 超过 backup_dedup_max_bytes 的文件不算哈希，直接整份复制。
+    # 设 backup_dedup=false 可完全回到旧版「每次全量复制」行为。
+    "backup_dedup": True,
+    "backup_dedup_max_bytes": 64 * 1024 * 1024,
+    # v1.7.21 审计降级：审计盘写不进去时，最近 N 条先进内存缓冲，
+    # 下次写成功自动补写；主操作绝不因审计失败而失败。
+    "audit_buffer_max": 200,
+    # v1.7.21 win_patch 单次多文件补丁的预算（纯结构预检，不碰磁盘）
+    "patch_max_files": 20,
+    "patch_max_total_bytes": 8 * 1024 * 1024,
     # 回收站保留天数：超过天数的条目整个清掉（0 = 永久保留，保持旧行为）。
     "trash_retain_days": 30,
     "tls_cert": "",
@@ -454,38 +479,13 @@ class RotatingLogWriter:
             return 0
 
 
-def now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def human_size(n: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    v = float(n)
-    for u in units:
-        if v < 1024 or u == units[-1]:
-            return f"{v:.1f} {u}" if u != "B" else f"{int(v)} B"
-        v /= 1024
-    return f"{n} B"
 
 
 # win_exec 超时天花板的绝对硬顶（防止误填 999999999 让请求线程永久挂住）。
-EXEC_TIMEOUT_HARD_CAP = 3600
 
 
-def exec_timeout_cap(value, *, default: int = 300) -> int:
-    """把 exec_timeout_max_sec 规整成合法上限（纯函数，v1.7.19）。
-
-    配置文件是给人手填的，热加载也会把任意 JSON 值直接 setattr 进来：
-    非整数、0、负数、字符串、超大值都必须夹回可运行区间，绝不能让
-    win_exec 因为一条脏配置抛异常或把线程挂死。
-    """
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
-        return default
-    if n < 1:
-        return default
-    return min(n, EXEC_TIMEOUT_HARD_CAP)
 
 
 # ---------------------------------------------------------------------------
@@ -507,14 +507,6 @@ def local_ipv4() -> str:
         s.close()
 
 
-def is_private_ip(ip: str) -> bool:
-    """是不是内网 / 回环 / 保留地址（判断「该不该换成公网 IP」用）。"""
-    try:
-        addr = ipaddress.ip_address(str(ip).strip())
-    except ValueError:
-        return False
-    return bool(addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
 
 
 # 公网 IP 回显服务：都是纯文本或近纯文本，顺序按「国内可达 + 响应干净」排
@@ -607,76 +599,16 @@ def generate_selfcert(cert_path: str, key_path: str, *, cn: str = "wkfile",
                           dns=dns or (), days=days, bits=bits)
 
 
-def norm(p: str) -> str:
-    """规范化路径用于比较：realpath + 大小写折叠。"""
-    return os.path.normcase(os.path.abspath(p))
 
 
-def decode_text(raw: bytes, encoding: str = "auto") -> tuple[str, str]:
-    """把字节解码成文本，返回 (文本, 实际编码)。"""
-    if encoding and encoding.lower() not in ("auto", ""):
-        names = [encoding]
-    else:
-        names = ["utf-8-sig", "gbk", "utf-8", "latin-1"]
-    for enc in names:
-        try:
-            return raw.decode(enc), enc
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw.decode("utf-8", errors="replace"), "utf-8"
 
 
-def looks_binary(raw: bytes) -> bool:
-    if not raw:
-        return False
-    if b"\x00" in raw[:8192]:
-        return True
-    sample = raw[:8192]
-    try:
-        sample.decode("utf-8")
-        return False
-    except UnicodeDecodeError:
-        pass
-    try:
-        sample.decode("gbk")
-        return False
-    except UnicodeDecodeError:
-        return True
 
 
-def read_text_file(path: str, limit: int) -> tuple[str, str, bool]:
-    with open(path, "rb") as fh:
-        raw = fh.read(limit + 1)
-    truncated = len(raw) > limit
-    if truncated:
-        raw = raw[:limit]
-    text, enc = decode_text(raw)
-    return text, enc, truncated
 
 
-def sha256_of(path: str) -> str:
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
-def sha256_under_cap(path: str, cap: int) -> tuple[str | None, str]:
-    """带体积上限地算**整个文件**的 sha256（纯函数，v1.7.20）。
-
-    几百 MB 的文件会把请求线程占住几十秒，等于变相 DoS。超限不硬算，
-    返回 (None, 原因) 让调用方自己决定报错还是降级——不能因为一个可选
-    参数把「读文件」这个主功能整个拒掉。乐观锁比对的是全文件 hash，
-    不是当前页，所以这里必须独立于分页读取去算。
-    """
-    size = os.path.getsize(path)
-    if size > cap:
-        return None, (f"文件 {human_size(size)} 超过哈希上限 "
-                      f"{human_size(cap)}，拒绝计算 sha256。")
-    return sha256_of(path), ""
 
 
 # --------------------------------------------------------------------------------------
@@ -791,16 +723,6 @@ def disabled_tools(cfg) -> frozenset:
     return frozenset(out)
 
 
-def is_loopback_bind(host: str) -> bool:
-    """判断监听地址是不是只绑本机（这类绑定无需 Token 也不会暴露）。"""
-    h = str(host or "").strip().lower()
-    if h in ("localhost",):
-        return True
-    if h.startswith("127."):
-        return True
-    if h in ("::1",):
-        return True
-    return False
 
 
 # --------------------------------------------------------------------------------------
@@ -1006,108 +928,24 @@ def chain_health(cert_path: str, chain_path: str = "") -> tuple:
 
 
 # 明显不合格的 Token：示例文件里的占位串、常见弱口令
-WEAK_TOKENS = frozenset({
-    "", "test", "token", "changeme", "change-me", "password", "secret",
-    "testtoken", "testtoken123456", "123456", "admin",
-    "在这里填一个长随机串，或运行 python wkfile_agent.py --init 自动生成",
-    # v1.7.12：示例配置实际用的占位串（此前黑名单文案改了、集合没跟上，
-    # 拿示例配置原样启动不会被拦）
-    "在这里填一个长随机串；用图形界面启动时点「生成」按钮即可",
-})
 
 # 低于这个长度算"偏弱"（只警告，不拦截）
-MIN_TOKEN_LEN = 16
 
 
-def token_strength(token: str) -> tuple[str, str]:
-    """返回 (等级, 说明)；等级取值 ok / weak / bad。"""
-    t = str(token or "").strip()
-    if not t:
-        return "bad", "未设置 Token"
-    if t in WEAK_TOKENS:
-        return "bad", "用的是示例里的占位值或常见弱口令"
-    if len(t) < MIN_TOKEN_LEN:
-        return "weak", f"长度只有 {len(t)} 位（建议至少 {MIN_TOKEN_LEN} 位）"
-    return "ok", ""
 
 
-def make_expiry(days) -> str:
-    """把「有效天数」换算成绝对到期时间（ISO）；<=0 返回空串 = 永久有效。"""
-    try:
-        days = float(days or 0)
-    except (TypeError, ValueError):
-        days = 0
-    if days <= 0:
-        return ""
-    return (datetime.now().astimezone() + timedelta(days=days)).isoformat(timespec="seconds")
 
 
-def parse_expiry(raw) -> tuple[str, object]:
-    """解析 token_expires_at：返回 (状态, 到期时间)。
-
-    状态：never（空 = 永久）/ ok / bad（写坏了，按永久处理但会警告）
-    """
-    s = str(raw or "").strip()
-    if not s:
-        return "never", None
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return "bad", None
-    if dt.tzinfo is None:
-        dt = dt.astimezone()          # 不写时区就按本机时区理解
-    return "ok", dt
 
 
-def expiry_state(expires_at) -> tuple[str, object, float]:
-    """按到期时间串算状态，返回 (状态, 到期时间, 剩余秒数)。
-
-    状态：never（永久）/ valid / expiring（不足 3 天）/ expired / bad
-    """
-    kind, dt = parse_expiry(expires_at)
-    if kind == "never":
-        return "never", None, float("inf")
-    if kind == "bad":
-        return "bad", None, 0.0
-    remain = (dt - datetime.now(dt.tzinfo)).total_seconds()
-    if remain <= 0:
-        return "expired", dt, remain
-    if remain < 3 * 86400:
-        return "expiring", dt, remain
-    return "valid", dt, remain
 
 
-def token_state(cfg) -> tuple[str, object, float]:
-    return expiry_state(getattr(cfg, "token_expires_at", ""))
 
 
-def human_remain(seconds: float) -> str:
-    if seconds == float("inf"):
-        return "永久"
-    if seconds <= 0:
-        return "已过期"
-    if seconds >= 86400:
-        # 刚设完 30 天时剩余是 29.9999 天，四舍五入显示成"30 天"更符合直觉
-        return f"{int(round(seconds / 86400))} 天"
-    if seconds >= 3600:
-        return f"{int(seconds // 3600)} 小时"
-    return f"{max(1, int(seconds // 60))} 分钟"
 
 
-def expiry_text_of(expires_at) -> str:
-    """给人看的一句话：某个到期时间的状态。"""
-    state, dt, remain = expiry_state(expires_at)
-    if state == "never":
-        return "永久有效"
-    if state == "bad":
-        return "有效期字段格式不对（已按永久有效处理）"
-    if state == "expired":
-        return f"已于 {dt:%Y-%m-%d %H:%M} 过期"
-    return f"{dt:%Y-%m-%d %H:%M} 到期（剩 {human_remain(remain)}）"
 
 
-def expiry_text(cfg) -> str:
-    return expiry_text_of(getattr(cfg, "token_expires_at", ""))
 
 
 # --------------------------------------------------------------------------------------
@@ -1116,10 +954,21 @@ def expiry_text(cfg) -> str:
 
 
 class Config:
-    def __init__(self, data: dict, path: str):
-        merged = dict(DEFAULT_CONFIG)
-        merged.update({k: v for k, v in (data or {}).items() if v is not None})
+    """三层配置：内置默认 < 配置文件 < 环境变量（v1.7.21）。
+
+    环境变量形如 WKFILE_PORT=9000 / WKFILE_EXEC_ENABLED=true，只在启动时
+    读取一次，用来给容器、CI、多实例部署提供不改文件的覆盖手段。
+    **只允许覆盖 DEFAULT_CONFIG 里已有的键**：拼错的键不会静默生效，
+    也不会被 save() 写回配置文件（避免 GUI 保存一次就把环境变量固化）。
+    """
+
+    def __init__(self, data: dict, path: str, env: dict | None = None):
+        merged, report = merge_config_layers(
+            DEFAULT_CONFIG, data, os.environ if env is None else env)
         self.__dict__.update(merged)
+        self._layers = report
+        # 环境变量覆盖的键：save() 跳过、热加载跳过，保持「环境说了算」
+        self._env_overridden = frozenset(report["env_applied"])
         self.config_path = os.path.abspath(path)
         # v1.7.11：把不属于 DEFAULT_CONFIG 的键原样记住，save 时写回去——
         # 之前只序列化已知键，用户手写在配置里的自定义键（或新版配置被
@@ -1131,8 +980,23 @@ class Config:
         self.base_dir = os.path.dirname(self.config_path) or data_dir()
         self.roots = [os.path.abspath(r) for r in (self.roots or [])]
 
+    def layers_report(self) -> dict:
+        """给 win_probe 用的来源快照（不含任何值，更不含 Token）。"""
+        return {
+            "order": list(self._layers["order"]),
+            "env_applied": list(self._layers["env_applied"]),
+            "env_warnings": list(self._layers["env_warnings"]),
+            "by_layer": {
+                name: sum(1 for src in self._layers["sources"].values() if src == name)
+                for name in ("default", "file", "env")
+            },
+        }
+
     def save(self, template: bool = False):
-        data = {k: getattr(self, k) for k in DEFAULT_CONFIG}
+        # 环境覆盖的键不落盘：否则一次「界面保存」就把部署环境的值固化进
+        # 配置文件，撤掉环境变量后服务行为悄悄变了，排障时极难发现。
+        data = {k: getattr(self, k) for k in DEFAULT_CONFIG
+                if k not in self._env_overridden}
         data.update(self._extra_keys)
         body = json.dumps(data, ensure_ascii=False, indent=2)
         if template:
@@ -1208,6 +1072,21 @@ _CONFIG_NOTES = {
         "// 上限自身会被夹到 1~3600 秒，防止误填超大值把请求线程挂死。",
         "// 长任务请拆成多次短命令，别靠拉长超时硬扛。",
     ],
+    '"backup_dedup"': [
+        "// 增量备份：内容完全相同的历史版本共用一份磁盘实体（NTFS 硬链接）。",
+        "// 每个版本仍是可直接读取/还原的完整文件；不支持硬链接时自动整份复制。",
+        "// 设 false 回到旧版行为。超过 backup_dedup_max_bytes 的文件不参与去重。",
+    ],
+    '"audit_buffer_max"': [
+        "// 审计日志写不进去时，最近 N 条先进内存，恢复后自动按序补写。",
+        "// 用 win_probe 可查看降级状态；主操作不会因审计失败而失败。",
+    ],
+    '"port"': [
+        "// ★ 配置分三层：内置默认 < 本文件 < 环境变量（WKFILE_ 前缀）。",
+        "// 例：WKFILE_PORT=9000 / WKFILE_EXEC_ENABLED=true 可临时覆盖，",
+        "// 只允许覆盖本文件里已有的键；拼错的键忽略并在 win_probe 里报告。",
+        "// 环境变量不会被界面保存写回本文件，撤掉即恢复本文件里的值。",
+    ],
     '"token"': [
         "// ★ 访问 Token。留空时程序会自动生成一个；也可以自己填任意长随机串。",
     ],
@@ -1233,21 +1112,9 @@ def _annotate_config(body: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def _strip_json_comments(text: str) -> str:
-    """把 _annotate_config 插进去的 "// " 整行注释剥掉。
-
-    只处理**整行**注释（我们只生成这种），不动字符串里的 //，
-    所以不需要一个完整的 JS 词法分析器。行尾注释我们也生成不了。
-    """
-    lines = []
-    for line in text.splitlines():
-        if line.lstrip().startswith("//"):
-            continue
-        lines.append(line)
-    return "\n".join(lines)
 
 
-def load_config(path: str) -> Config:
+def load_config(path: str, env: dict | None = None) -> Config:
     """读配置。
 
     文件不存在时会**自动落一份带完整注释的模板**（而不是只存在内存里）——
@@ -1267,9 +1134,9 @@ def load_config(path: str) -> Config:
         if "//" in text:
             text = _strip_json_comments(text)
         raw = json.loads(text)          # 解析失败会抛 ValueError，向上传播
-        return Config(raw, path)
+        return Config(raw, path, env=env)
 
-    cfg = Config({}, path)
+    cfg = Config({}, path, env=env)
     try:
         cfg.save(template=True)
     except OSError:
@@ -1406,6 +1273,17 @@ class Audit:
         self.backup_count = int(getattr(cfg, "audit_backup_count", 0) or 0)
         self.lock = threading.Lock()
         self._since_check = 0
+        # v1.7.21 审计降级：盘满/权限被改/目录被删时，账本不能就此停摆。
+        # 最近 N 条先进内存缓冲，下次写成功自动按原顺序补写；同时维护
+        # 可观测计数，让 win_probe 能报出「审计正在降级」而不是静默丢账。
+        cap = int(getattr(cfg, "audit_buffer_max", 200) or 0)
+        self._pending = collections.deque(maxlen=max(1, cap))
+        self.failures = 0
+        self.dropped = 0            # 缓冲被挤掉、确实无法补写的条数
+        self.flushed = 0            # 故障恢复后补写成功的条数
+        self.last_error = ""
+        self.last_ok_ts = 0.0
+        self._last_complain = 0.0
         # 父目录不存在时必须自己建出来：否则每次写都会 FileNotFoundError，
         # 而下面 write() 把 OSError 一律吞掉 —— 结果就是审计日志悄悄什么都不记。
         self._ensure_dir()
@@ -1419,33 +1297,79 @@ class Audit:
             pass
 
     def write(self, record: dict):
+        """写一条审计。**任何失败都不得冒泡** —— 账本是旁路，不能拖垮主操作。"""
         if not self.path:
             return
         record = dict(record)
         record.setdefault("ts", now_iso())
-        line = json.dumps(record, ensure_ascii=False)
+        try:
+            line = json.dumps(record, ensure_ascii=False)
+        except (TypeError, ValueError):
+            # 记录里混进了不可序列化对象时也不能让请求失败
+            line = json.dumps({"op": "audit", "ts": now_iso(),
+                               "error": "unserializable"}, ensure_ascii=False)
         with self.lock:
-            try:
-                self._rotate_if_needed()
-                with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
-            except FileNotFoundError:
-                # 目录可能是后来被删掉的，重建一次再试
-                self._ensure_dir()
-                try:
-                    with open(self.path, "a", encoding="utf-8") as fh:
-                        fh.write(line + "\n")
-                except OSError as exc:
-                    self._complain(exc)
-            except OSError as exc:
-                self._complain(exc)
+            pending = list(self._pending)
+            # 缓冲里的旧账 + 本次新账一起写，保证顺序；成功才清缓冲
+            if self._persist(pending + [line]):
+                if pending:
+                    self.flushed += len(pending)
+                    self._pending.clear()
+                self.last_ok_ts = time.time()
+            else:
+                if len(self._pending) == self._pending.maxlen:
+                    self.dropped += 1
+                self._pending.append(line)
 
-    @staticmethod
-    def _complain(exc: OSError) -> None:
-        # v1.7.12：审计写不进去不能无声无息——安全网关的账本停了，
-        # 运维必须能察觉。打到 stderr（运行日志），不打断请求本身。
-        print(f"[audit] 写入失败，审计日志可能不完整：{exc}",
-              file=sys.stderr, flush=True)
+    def _persist(self, batch: list[str]) -> bool:
+        try:
+            self._rotate_if_needed()
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(batch) + "\n")
+            return True
+        except FileNotFoundError:
+            # 目录可能是后来被删掉的，重建一次再试
+            self._ensure_dir()
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    fh.write("\n".join(batch) + "\n")
+                return True
+            except OSError as exc:
+                self._degrade(exc)
+                return False
+        except Exception as exc:  # noqa: BLE001 —— 轮转/编码等任何异常都只降级
+            self._degrade(exc)
+            return False
+
+    def _degrade(self, exc: Exception) -> None:
+        # v1.7.12：审计写不进去不能无声无息；v1.7.21：改成节流提示，
+        # 盘满时每秒几十条请求会把运行日志本身也刷爆。
+        self.failures += 1
+        self.last_error = str(exc)
+        now = time.time()
+        if now - self._last_complain >= 30:
+            self._last_complain = now
+            print(f"[audit] 写入失败，已进入降级缓冲（累计 {self.failures} 次）：{exc}",
+                  file=sys.stderr, flush=True)
+
+    def health(self) -> dict:
+        """给 win_probe 的审计健康快照（不输出绝对路径与请求内容）。"""
+        with self.lock:
+            buffered = len(self._pending)
+            return {
+                # 缓冲空了就算恢复；历史失败次数留在 failures 里供追溯，
+                # 不能让一次已经修好的盘满故障永远显示「降级」。
+                "state": "degraded" if buffered else "ok",
+                "recovered": bool(self.failures and not buffered),
+                "enabled": bool(self.path),
+                "buffered": buffered,
+                "buffer_max": self._pending.maxlen,
+                "failures": self.failures,
+                "dropped": self.dropped,
+                "flushed": self.flushed,
+                "last_error": self.last_error,
+                "last_ok_ts": self.last_ok_ts,
+            }
 
     def size(self) -> int:
         try:
@@ -1618,18 +1542,90 @@ class Agent:
         # 不往被操作的业务目录里塞东西
         dest = os.path.join(backup_root(self.cfg.base_dir), stamp, root_key(root), rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        try:
-            shutil.copy2(full, dest)
-        except OSError as exc:
-            # v1.7.12：备份失败必须报错拒绝写，而不是静默跳过——否则「写坏
-            # 了也没有退路」的操作会照常发生，用户却以为有备份兜底。
-            raise PathError(
-                "backup_failed",
-                f"写前备份失败，已拒绝本次写入：{exc}。"
-                "排查磁盘空间/权限后重试，或对本次调用显式传 backup=false。",
-            )
+        # v1.7.21 增量备份：先试内容寻址 + 硬链接；任何一步不支持/失败，
+        # 都静默回退到整份复制 —— 备份是写入的兜底，绝不能因优化而变脆。
+        if not self._backup_dedup(full, dest):
+            try:
+                shutil.copy2(full, dest)
+            except OSError as exc:
+                # v1.7.12：备份失败必须报错拒绝写，而不是静默跳过——否则「写坏
+                # 了也没有退路」的操作会照常发生，用户却以为有备份兜底。
+                raise PathError(
+                    "backup_failed",
+                    f"写前备份失败，已拒绝本次写入：{exc}。"
+                    "排查磁盘空间/权限后重试，或对本次调用显式传 backup=false。",
+                )
         self._maybe_cleanup_backups()
         return dest
+
+    def _backup_dedup(self, full: str, dest: str) -> bool:
+        """把 dest 做成内容实体的硬链接，返回是否成功走了去重路径。
+
+        同一份内容（例如 4MB 日志只改一行、或回滚后又写回原样）在磁盘上
+        只存一份；每个历史版本仍是普通可读文件，backup_list / restore /
+        清理逻辑都不用改。硬链接要求同卷 NTFS，不支持时返回 False。
+        """
+        cfg = self.cfg
+        if not bool(getattr(cfg, "backup_dedup", True)):
+            return False
+        cap = int(getattr(cfg, "backup_dedup_max_bytes", 0) or 0)
+        try:
+            size = os.path.getsize(full)
+            if not dedup_eligible(size, cap):
+                return False
+            digest, _why = sha256_under_cap(full, cap)
+            if not digest:
+                return False
+            obj = cas_object_path(
+                os.path.join(backup_root(self.cfg.base_dir), ".objects"), digest)
+            os.makedirs(os.path.dirname(obj), exist_ok=True)
+            if not os.path.isfile(obj):
+                shutil.copy2(full, obj)
+            os.link(obj, dest)
+        except OSError:
+            # 跨卷 / FAT / 权限 / 竞态：留下可能已建的 obj 给下次清理，
+            # 本次直接走普通复制，不影响写入安全
+            return False
+        self._dedup_hits = getattr(self, "_dedup_hits", 0) + 1
+        self._dedup_saved_bytes = getattr(self, "_dedup_saved_bytes", 0) + size
+        return True
+
+    def _prune_backup_objects(self) -> int:
+        """清掉没有任何历史版本引用的内容实体（nlink==1 即孤儿）。
+
+        时间戳目录被保留策略删掉后，实体还占着磁盘；只在节流的清理周期
+        里扫一次，避免每次写入都遍历对象库。
+        """
+        objects = os.path.join(backup_root(self.cfg.base_dir), ".objects")
+        if not os.path.isdir(objects):
+            return 0
+        removed = 0
+        for bucket in os.listdir(objects):
+            d = os.path.join(objects, bucket)
+            if not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                p = os.path.join(d, name)
+                try:
+                    if os.path.isfile(p) and os.stat(p).st_nlink <= 1:
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    continue
+            try:
+                os.rmdir(d)          # 空桶才删得掉，非空说明还有引用
+            except OSError:
+                pass
+        return removed
+
+    def dedup_stats(self) -> dict:
+        return {
+            "enabled": bool(getattr(self.cfg, "backup_dedup", True)),
+            "max_bytes": int(getattr(self.cfg, "backup_dedup_max_bytes", 0) or 0),
+            "hits": getattr(self, "_dedup_hits", 0),
+            "saved_bytes": getattr(self, "_dedup_saved_bytes", 0),
+            "saved_human": human_size(getattr(self, "_dedup_saved_bytes", 0)),
+        }
 
     # ---- 备份/回收站的容量与龄期清理 ----
     # 备份和回收站此前没有任何上限：长期运行会无限累积（尤其删大目录时
@@ -1641,6 +1637,9 @@ class Agent:
         if self._backup_cleanup_count % 32 != 1:
             return
         self.cleanup_backups()
+        # v1.7.21：时间戳目录被清掉后，回收不再被任何版本引用的内容实体
+        if bool(getattr(self.cfg, "backup_dedup", True)):
+            self._prune_backup_objects()
 
     @staticmethod
     def _backup_cleanup_plan(entries: list[dict], *, max_bytes: int = 0,
@@ -1672,7 +1671,9 @@ class Agent:
         base = backup_root(self.cfg.base_dir)
         try:
             stamps = sorted(d for d in os.listdir(base)
-                            if os.path.isdir(os.path.join(base, d)))
+                            # .objects 是增量备份的内容实体库，不是历史版本
+                            if not d.startswith(".")
+                            and os.path.isdir(os.path.join(base, d)))
         except OSError:
             return base, []
         out = []
@@ -1726,6 +1727,7 @@ class Agent:
             "total_bytes": total,
             "total_bytes_human": human_size(total),
             "would_remove": len(plan),
+            "dedup": self.dedup_stats(),
             "note": ("保留策略由服务端配置（backup_max_bytes / backup_retain_days / "
                      "backup_retain_count）控制，在服务启动与每 32 次备份时执行；"
                      "不开放给 AI 删除备份，需要手动清理请由运维在服务器上处理。"),
@@ -1781,6 +1783,239 @@ class Agent:
         return item
 
     # ---- 各接口 ----
+
+    # ------------------------------------------------------------------
+    # v1.7.21：写前校验 / 多文件原子补丁 / 环境自检
+    # ------------------------------------------------------------------
+
+    def _patch_target_bytes(self, ch: dict, full: str) -> tuple[bytes, dict, str]:
+        """算出补丁后应写入的字节，不落盘。返回 (data, 说明, 错误)。
+
+        win_validate 与 win_patch 共用这一个实现 —— 校验的结论必须和真正
+        写进去的内容完全一致，否则「预检通过、实际写崩」比没有预检更糟。
+        """
+        enc = ch.get("encoding") or "utf-8"
+        if ch.get("content") is not None:
+            try:
+                data = ch["content"].encode(enc)
+            except (LookupError, UnicodeEncodeError) as exc:
+                return b"", {}, f"内容编码失败（{enc}）：{exc}"
+            return data, {"mode": "write", "encoding": enc}, ""
+        if not os.path.isfile(full):
+            return b"", {}, "文件不存在（整文件覆盖请传 content）"
+        old = ch.get("old")
+        if old is None or old == "":
+            return b"", {}, "精确替换需要非空 old"
+        text, used_enc, truncated = read_text_file(full, int(self.cfg.max_read_bytes))
+        if truncated:
+            return b"", {}, (f"文件超过读取上限 "
+                             f"{human_size(int(self.cfg.max_read_bytes))}，拒绝在截断内容上替换")
+        occurrences = text.count(old)
+        if occurrences == 0:
+            return b"", {}, "old 在文件里没有命中（请先用 win_read 核对内容）"
+        limit = int(ch.get("count") or 0)
+        if limit == 0 and occurrences > 1:
+            return b"", {}, (f"old 命中 {occurrences} 处，请写得更精确或显式传 count 限定，"
+                             "避免一次静默改错多处")
+        n = min(occurrences, limit) if limit > 0 else occurrences
+        replaced = text.replace(old, ch.get("new") or "", limit if limit > 0 else -1)
+        write_enc = "utf-8" if used_enc == "utf-8-sig" else used_enc
+        try:
+            data = replaced.encode(write_enc)
+        except (LookupError, UnicodeEncodeError) as exc:
+            return b"", {}, f"替换结果无法按 {write_enc} 编码：{exc}"
+        return data, {"mode": "replace", "replacements": n,
+                      "encoding": write_enc}, ""
+
+    def _patch_check(self, ch: dict, full: str) -> tuple[bytes, dict]:
+        """单条目完整预检：乐观锁 → 目标字节 → 体积 → 语法。失败抛 PathError。"""
+        expected = ch.get("expected_sha256")
+        if expected and os.path.isfile(full):
+            cur, why = sha256_under_cap(full, int(self.cfg.max_read_bytes))
+            if cur is None:
+                raise PathError("too_large", f"{full}：{why}")
+            if cur.lower() != str(expected).lower():
+                raise PathError(
+                    "conflict",
+                    f"{full} 已被其他人修改：当前 sha256={cur}。"
+                    "请用 win_read(hash=true) 重读后把 expected_sha256 改成这个值。",
+                )
+        data, info, err = self._patch_target_bytes(ch, full)
+        if err:
+            raise PathError("precheck_failed", f"{full}：{err}")
+        cap = int(self.cfg.max_write_bytes)
+        if len(data) > cap:
+            raise PathError("too_large", f"{full}：补丁结果 {human_size(len(data))} 超过上限")
+        try:
+            self._preflight(full, data)
+        except PathError as exc:
+            raise PathError("preflight_failed", f"{full}：{exc.message}")
+        return data, dict(info, path=full, bytes=len(data))
+
+    def op_validate(self, req: dict) -> dict:
+        """写前校验：只检查不落盘，任何 Token（含只读）都能调用。
+
+        一次把路径白名单、乐观锁、old 命中、体积、目标格式语法全部验完，
+        AI 不必靠「先写一次看报不报错」来试错。
+        """
+        changes = req.get("changes")
+        if changes is None:
+            changes = [{"path": req.get("path"), "content": req.get("content"),
+                        "old": req.get("old"), "new": req.get("new"),
+                        "count": req.get("count"), "encoding": req.get("encoding"),
+                        "expected_sha256": req.get("expected_sha256")}]
+        planned, errors = patch_plan(
+            changes,
+            max_files=int(getattr(self.cfg, "patch_max_files", 20) or 20),
+            max_total_bytes=int(getattr(self.cfg, "patch_max_total_bytes", 0) or 0),
+        )
+        results = []
+        for ch in planned:
+            item = {"path": ch["path"]}
+            try:
+                full = self.guard.resolve(ch["path"])
+                _data, info = self._patch_check(ch, full)
+                item.update(ok=True, errors=[], **info)
+            except PathError as exc:
+                item.update(ok=False, errors=[exc.message], code=exc.code)
+            results.append(item)
+        ok = not errors and bool(results) and all(r["ok"] for r in results)
+        return {
+            "ok": ok,
+            "checked": len(results),
+            "errors": errors,
+            "results": results,
+            "hint": ("全部通过才表示可以安全写入；win_patch 会再做一次同样的预检，"
+                     "两阶段之间文件若被改动会由 expected_sha256 拦下。"),
+        }
+
+    def _rollback_patch(self, done: list[dict]) -> int:
+        """补丁执行到一半失败时，把已写入的文件按原始字节逐个还原。"""
+        restored = 0
+        for item in reversed(done):
+            try:
+                if item["original"] is None:
+                    if os.path.isfile(item["path"]):
+                        os.remove(item["path"])
+                else:
+                    self._atomic_write(item["path"], item["original"])
+                restored += 1
+            except OSError:
+                continue
+        return restored
+
+    def op_patch(self, req: dict) -> dict:
+        """多文件原子补丁：全部预检通过才动手，中途失败整体回滚。
+
+        解决的是「AI 一次改 5 个文件，第 3 个语法错了，前 2 个已经落盘、
+        后 2 个没改」这种半成品状态。dry_run 返回每项预览但绝不落盘。
+        """
+        self._require_write()
+        planned, errors = patch_plan(
+            req.get("changes"),
+            max_files=int(getattr(self.cfg, "patch_max_files", 20) or 20),
+            max_total_bytes=int(getattr(self.cfg, "patch_max_total_bytes", 0) or 0),
+        )
+        if errors:
+            raise PathError("bad_request", "；".join(errors))
+        prepared = []
+        for ch in planned:
+            full = self.guard.resolve(ch["path"])
+            data, info = self._patch_check(ch, full)
+            prepared.append((ch, full, data, info))
+        if req.get("dry_run"):
+            return {"dry_run": True, "applied": False, "would_apply": len(prepared),
+                    "changes": [i for _c, _f, _d, i in prepared]}
+
+        done: list[dict] = []
+        for ch, full, data, info in prepared:
+            try:
+                backup = self._backup(full) if req.get("backup", True) else None
+                try:
+                    with open(full, "rb") as fh:
+                        original = fh.read() if os.path.isfile(full) else None
+                except OSError:
+                    original = None
+                self._atomic_write(full, data)
+                done.append({"path": full, "original": original, "backup": backup,
+                             "bytes": len(data), "sha256": sha256_of(full),
+                             "mode": info["mode"]})
+            except Exception as exc:  # noqa: BLE001 —— 任何失败都要回滚已落盘部分
+                restored = self._rollback_patch(done)
+                code = getattr(exc, "code", "patch_failed")
+                msg = getattr(exc, "message", None) or str(exc)
+                if restored == len(done):
+                    tail = "磁盘已回到本次调用前的状态。"
+                else:
+                    tail = ("但可能有文件未还原成功，请用 win_backup_list 检查写前备份。")
+                raise PathError(
+                    code,
+                    f"补丁在 {full} 失败：{msg}。已回滚 {restored}/{len(done)} 个已写文件，"
+                    + tail,
+                )
+        return {
+            "applied": True,
+            "count": len(done),
+            "atomic": True,
+            "changes": done,
+            "rollback_hint": "本次为原子补丁：任一文件失败会整体回滚；每份改写仍有写前备份。",
+        }
+
+    def op_probe(self, req: dict) -> dict:
+        """一次自检出服务版本、配置分层、根目录、审计、备份与安全开关。
+
+        只读、不输出 Token 明文，也不写任何文件。运维/AI 排障不用再
+        「curl health + 翻日志 + 看配置文件」跑三趟。
+        """
+        cfg = self.cfg
+        layers = cfg.layers_report()
+        roots = []
+        for r in cfg.roots or []:
+            roots.append({"path": r, "exists": os.path.isdir(r),
+                          "readable": os.access(r, os.R_OK),
+                          "writable": os.access(r, os.W_OK)})
+        bdir = backup_root(cfg.base_dir)
+        parent = os.path.dirname(bdir) or "."
+        backup_ok = (os.access(bdir, os.W_OK) if os.path.isdir(bdir)
+                     else os.access(parent, os.W_OK))
+        audit = self.audit.health()
+        issues = []
+        if not roots:
+            issues.append("没有配置任何授权根目录（roots 为空），文件类工具全部不可用")
+        for r in roots:
+            if not r["exists"]:
+                issues.append(f"授权根目录不存在：{r['path']}")
+            elif not r["readable"]:
+                issues.append(f"授权根目录不可读：{r['path']}")
+        if audit["state"] != "ok":
+            issues.append(f"审计日志处于降级状态（缓冲 {audit['buffered']} 条 / "
+                          f"累计失败 {audit['failures']} 次）：{audit['last_error'][:120]}")
+        if not backup_ok:
+            issues.append("备份目录不可写，写入类操作会被拒绝（备份是强制兜底）")
+        if layers["env_warnings"]:
+            issues.append(f"有 {len(layers['env_warnings'])} 个环境变量未生效，"
+                          "详见 config.layers.env_warnings")
+        return {
+            "ok": not issues,
+            "version": VERSION,
+            "time": now_iso(),
+            "config": {"layers": layers, "file_exists": os.path.isfile(cfg.config_path)},
+            "roots": roots,
+            "audit": audit,
+            "backup": {"path": bdir, "writable": backup_ok,
+                       "exists": os.path.isdir(bdir), "dedup": self.dedup_stats()},
+            "security": {
+                "read_only": bool(self.effective_readonly()),
+                "token_scope": "readonly" if self.request_readonly() else "full",
+                "tls": bool(tls_enabled(cfg)),
+                "public_health": bool(getattr(cfg, "public_health", True)),
+                "exec_enabled": bool(getattr(cfg, "exec_enabled", False)),
+                "mcp_enabled": bool(getattr(cfg, "enable_mcp", True)),
+            },
+            "tools": {"disabled": sorted(self.disabled_tools),
+                      "count": len(self.ROUTES)},
+            "issues": issues,
+        }
 
     def op_roots(self, req: dict) -> dict:
         ro = self.effective_readonly()
@@ -2527,6 +2762,11 @@ class Agent:
                 "out_of_scope",
                 f"只能操作备份目录里的文件：{backup_root(self.cfg.base_dir)}",
             )
+        # v1.7.21：.objects 是增量备份的内部实体库，不是历史版本目录；
+        # 放它进来会让还原路径结构校验拿到无意义的三段路径。
+        objects = norm(os.path.join(backup_root(self.cfg.base_dir), ".objects"))
+        if norm(full) == objects or norm(full).startswith(objects.rstrip("\\") + os.sep):
+            raise PathError("out_of_scope", "内容实体库不对外开放，请用 win_backup_list 里的 backup_path")
         if not os.path.isfile(full):
             raise PathError("not_found", f"备份文件不存在：{full}")
         return full
@@ -2563,6 +2803,8 @@ class Agent:
         if not os.path.isdir(base):
             return
         for stamp in sorted(os.listdir(base), reverse=True):
+            if stamp.startswith("."):
+                continue
             stamp_dir = os.path.join(base, stamp)
             if not os.path.isdir(stamp_dir):
                 continue
@@ -2630,7 +2872,8 @@ class Agent:
         key = root_key(root)
         stamps = []
         try:
-            stamps = sorted(os.listdir(base), reverse=True)
+            stamps = sorted((d for d in os.listdir(base) if not d.startswith(".")),
+                            reverse=True)
         except OSError:
             stamps = []
         for stamp in stamps:
@@ -3197,8 +3440,10 @@ class Agent:
             data = json.loads(text)
         except (OSError, ValueError):
             return
+        # v1.7.21：环境变量优先级高于配置文件，热加载不能把覆盖值冲掉
+        overridden = getattr(self.cfg, "_env_overridden", ()) or ()
         for key in self._EXEC_HOT_KEYS:
-            if key in data:
+            if key in data and key not in overridden:
                 setattr(self.cfg, key, data[key])
 
     @staticmethod
@@ -3696,6 +3941,10 @@ class Agent:
         "redis_get": op_redis_get,
         "redis_write": op_redis_write,
         "exec": op_exec,
+        # v1.7.21：写前校验 / 多文件原子补丁 / 环境自检
+        "validate": op_validate,
+        "patch": op_patch,
+        "probe": op_probe,
     }
 
     def dispatch(self, action: str, req: dict) -> dict:
@@ -3832,6 +4081,11 @@ class Handler(BaseHTTPRequestHandler):
             rec["table"] = str(req["table"])
         if req.get("command"):
             rec["command"] = str(req["command"])[:300]   # win_exec：完整命令必须落账
+        # v1.7.21：win_patch / win_validate 的请求体里没有顶层 path，
+        # 不把涉及的文件捞出来落账，审计就只剩「有人调过 patch」。
+        if isinstance(req.get("changes"), list):
+            rec["files"] = [str(c.get("path") or "")[:200]
+                            for c in req["changes"] if isinstance(c, dict)][:20]
         if exc is not None:
             rec["error"] = getattr(exc, "code", None) or exc.__class__.__name__
         if self.agent.request_readonly():
