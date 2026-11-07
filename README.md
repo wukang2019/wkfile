@@ -373,8 +373,10 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > 前缀、换行也参与拆链）、含变量或转义的程序名一律拒绝、带路径的脚本引用
 > （`%cd%\x.bat`、`.\x.bat`、`sub\x.bat`）、cwd 里的同名可执行变体
 > （.bat/.cmd/.exe/.com/.ps1/.vbs），以及 `shutil.which` 按 PATH 解析到
-> roots 内的程序。`type deploy.ps1`、`copy payload.bat x` 这类只是读/复制
-> 文件的**参数**不查，避免误伤。
+> roots 内的程序。**无路径的纯文件名参数不查**（`type deploy.ps1`、`copy payload.bat x`
+> 里 deploy.ps1 / payload.bat 只是读/复制的目标，不带 `.\` 或子目录前缀，不会被
+> 当成投放脚本），避免误伤；但**带相对路径的 `type .\deploy.ps1`、`copy .\payload.bat x`
+> 会落到这条「带路径脚本引用」检查**（见下方白名单与围栏⑦的关系）。
 >
 > **已知限制（v1.7.24 起不再继续加固围栏）**——下面这些写法当前**不会被
 > 拦截**，围栏不承诺覆盖它们：
@@ -412,10 +414,17 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > `wkfile.config.json` 的 `exec_enabled` + `exec_allowed_commands` 后重启。
 >
 > **cmd 内建命令（type / copy / del / move / where / findstr 等）也要写进白名单**
-> 才会被放行：白名单只认「整条命令的首程序」，`type .\deploy.ps1`、`copy a b`
-> 这类命令的首程序是 `type` / `copy`，不在白名单里就会被拦（这不是围栏漏判，
-> 是白名单机制本身 —— 想用就加进去，别指望围栏替你放行）。推荐白名单里已经
-> 列了 `type`、`where`、`findstr`，按需自行补 `copy` / `del` 等。
+> 才会被放行：白名单只认「整条命令的首程序」，无路径的 `type a.txt`、`copy a b`
+> 这类命令首程序是 `type` / `copy`，不在白名单里会被拦 —— 想用就把 `type` / `copy`
+> 加进白名单。**但带相对路径引用的写法（`type .\deploy.ps1`、`copy .\payload.bat x`）
+> 即使 `type` / `copy` 已在白名单里也照样会被拦，而且拦它的不是白名单、是上面的
+> 围栏⑦ cwd 劫持防护**：护栏把 `.\x.ps1` / `sub\x.bat` 这类「cwd 优先于 PATH 的脚本
+> 引用」当潜在劫持处理，只要工作目录里真有同名脚本就拒绝执行（错误码
+> `exec_hijack_suspected`）。给 `type` / `copy` 加白名单**绕不过它**——这是常见
+> 排查坑：按「加白名单就能放行」去改配置是白费功夫。真要读/复制 cwd 里的这类文件，
+> 用绝对路径（`type C:\abs\deploy.ps1`）或走文件 API（win_read / win_copy），别在
+> cwd 内用 `.\` 引用脚本。推荐白名单里已经列了 `type`、`where`、`findstr`，按需自行
+> 补 `copy` / `del` 等。
 
 > **本地 → 远程传大文件：`POST /api/upload`（v1.7.9+）**——几 MB 的文件
 > 不再需要 base64 塞进 JSON（会超限/被截断）。请求体就是文件原始字节，
@@ -923,6 +932,19 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
        （孤儿真被删、有效版本真保留；删不掉的孤儿用 OS 级只读模拟而非 monkeypatch
        内部函数，仍如实报出），现 51/51 全绿。
      - `exec_enabled` 默认仍关闭；以上修正完成后才谈是否默认开。
+   - **v1.7.29——两条"发版前被低估"的审计项收口**（与 `host:null` 同源的 fail-open）：
+     - **`tls_cert` / `tls_key` / `tls_chain` 写成 `null` / 非字符串，或 cert 与 key 只
+       配一个，不再静默 fail-open 成明文 HTTP**。`host:null` 修了、`port:null` 拒启了，
+       这条同样"配置写了却被悄悄丢掉"的同源问题却一直没修——你以为 HTTPS 在跑、实际
+       明文。现在这几种写法都会写进 `config_warnings`（启动横幅 / `win_probe` / `/api/health`
+       都带得出，不再空着）；想关 TLS 请显式写空字符串 `""`。新增 `tests/v1729_test.py` 组 A 覆盖。
+     - **README 关于 `type .\deploy.ps1` 被拦原因的说明是错的**。旧文档说"首程序 `type`
+       不在白名单里就会被拦，加进白名单就能用"——实际拦它的是**围栏⑦ cwd 劫持防护**
+       （`.\deploy.ps1` 是 cwd 优先于 PATH 的脚本引用，cwd 里有同名脚本就拒，错误码
+       `exec_hijack_suspected`），**即便 `type` 已在白名单也照样拦，加白名单绕不过**。
+       按文档排查是白费功夫。已改正文档口径，并说明正确绕法：用绝对路径（`type C:\abs\deploy.ps1`）
+       或走文件 API（`win_read` / `win_copy`）。`tests/v1729_test.py` 组 B 用"type 已在白名单"
+       为前提证明其仍被 cwd 劫持拦下。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关

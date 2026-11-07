@@ -108,7 +108,7 @@ from wkfile_core import (  # noqa: E402
     SAFETY_BOOL_KEYS, SAFETY_LIST_KEYS,
 )
 
-VERSION = "1.7.28"
+VERSION = "1.7.29"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1035,9 +1035,49 @@ class Config:
                     "message": ("host 配置为空或类型不对，回退到默认 0.0.0.0"
                                 "（监听所有网卡）；若只想本机访问请显式填 127.0.0.1"),
                 })
-                # v1.7.27：告警里写了「回退到默认 0.0.0.0」，就必须真的回退，
-                # 否则绑定到空串/空白会按监听失败而不是 0.0.0.0，告警沦为谎言。
-                merged["host"] = DEFAULT_CONFIG.get("host", "0.0.0.0")
+            # v1.7.27：告警里写了「回退到默认 0.0.0.0」，就必须真的回退，
+            # 否则绑定到空串/空白会按监听失败而不是 0.0.0.0，告警沦为谎言。
+            merged["host"] = DEFAULT_CONFIG.get("host", "0.0.0.0")
+        # v1.7.29：tls_cert / tls_key / tls_chain 显式写成 null / 非字符串时，
+        # merge_config_layers 会当「没填」丢掉、回退默认空串，于是 tls_enabled()
+        # 静默返回 False——你以为 HTTPS 在跑，实际是明文 HTTP。这和 host:null
+        # 同源（都是「配置写了却因类型问题被悄悄丢掉」），但后果更危险：明文比
+        # 绑 0.0.0.0 严重得多。必须告警进 config_warnings（启动横幅 / win_probe /
+        # /health 都会带出来），不能静默 fail-open。想关 TLS 请显式写空字符串 ""。
+        for tkey in ("tls_cert", "tls_key", "tls_chain"):
+            if tkey in raw_data:
+                tv = raw_data[tkey]
+                if tv is None or not isinstance(tv, str):
+                    type_warnings.append({
+                        "key": tkey, "layer": "file", "action": "fallback",
+                        "expected": "证书/私钥/链文件路径字符串（想关 TLS 写空串 \"\"）",
+                        "got": "null" if tv is None else type(tv).__name__,
+                        "message": (
+                            "%s 配置为 %s（非字符串），已按「未配置」处理，TLS 不会"
+                            "启用，服务将以明文 HTTP 运行（你以为的 HTTPS 没生效）。"
+                            "想启用 HTTPS 请填有效的证书/私钥路径；想明确关闭请写成"
+                            "空字符串 \"\"。" % (
+                                tkey,
+                                "null" if tv is None else type(tv).__name__)),
+                    })
+                    merged[tkey] = ""
+        # cert / key 必须成对：只配了一个（且不是空串），TLS 同样无法启用，
+        # 但用户往往以为自己配好了 HTTPS。两者都是字符串时再判「一个空一个非空」。
+        _cert = raw_data.get("tls_cert")
+        _key = raw_data.get("tls_key")
+        _cert_set = bool(isinstance(_cert, str) and _cert.strip())
+        _key_set = bool(isinstance(_key, str) and _key.strip())
+        if isinstance(_cert, str) and isinstance(_key, str) and _cert_set != _key_set:
+            type_warnings.append({
+                "key": "tls_cert" if not _cert_set else "tls_key", "layer": "file",
+                "action": "fallback",
+                "expected": "tls_cert 与 tls_key 同时填写（或同时留空）",
+                "got": "只配了 " + ("tls_cert" if _cert_set else "tls_key"),
+                "message": (
+                    "tls_cert 与 tls_key 只配了其中一个，TLS 无法启用，服务将以明文 "
+                    "HTTP 运行（你以为的 HTTPS 没生效）。两者必须成对填写，或同时"
+                    "留空表示不开 TLS。"),
+            })
         self.__dict__.update(merged)
         self._layers = report
         self.config_warnings = type_warnings
