@@ -195,19 +195,21 @@ TOOLS = [
                 "count": {"type": "integer", "description": "替换几处。不传或 0 表示全部，但仅当匹配唯一时才允许；匹配多处时必须显式指定"},
                 "ignore_case": {"type": "boolean", "description": "正则模式下是否忽略大小写"},
                 "dry_run": {"type": "boolean", "description": "只预览不落盘：返回 unified diff，文件保持不动。默认 false"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true；传 false 可跳过备份（频繁改动同一文件时少留历史版本）"},
             },
             "required": ["path", "old"],
         },
     },
     {
         "name": "win_append",
-        "description": "在文件末尾追加内容（文件不存在则创建），适合写日志。",
+        "description": "在文件末尾追加内容（文件不存在则创建），适合写日志。非幂等：重复执行会追加两次。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "文件绝对路径"},
                 "content": {"type": "string", "description": "要追加的内容"},
                 "encoding": {"type": "string", "description": "编码，默认 utf-8"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true；高频写日志建议传 false，避免每次全量复制原文件"},
             },
             "required": ["path", "content"],
         },
@@ -544,7 +546,8 @@ TOOLS = [
                        "后面的参数、&&、||、| 管道、2>&1 重定向、带引号的字符串都原样交给 cmd 处理。"
                        "要跑一段脚本（引号嵌套难写）优先用 stdin 参数直喂，别硬拼 php -r \"...\"。"
                        "安全围栏：首程序必须在白名单 exec_allowed_commands 里（改白名单不用重启，"
-                       "保存配置文件后下次调用即生效）；工作目录必须在授权根目录内；超时默认 60 秒。"
+                       "保存配置文件后下次调用即生效）；工作目录必须在授权根目录内；"
+                       "超时默认 60 秒，服务端可配上限 exec_timeout_max_sec（默认 300），长任务请拆成小批。"
                        "输出超限时只回传「头 20 行 + 尾 40 行」压缩预览（output_truncated=true），"
                        "全文落盘到 output_file，用 win_tail 直接看尾部报错、win_read 看全文；"
                        "要更省 token 就传小一点的 max_output_bytes / head_lines / tail_lines。",
@@ -553,7 +556,7 @@ TOOLS = [
             "properties": {
                 "command": {"type": "string", "description": "要执行的命令，如 \"php -v\" 或 \"composer require phpspreadsheet\""},
                 "cwd": {"type": "string", "description": "工作目录（必须在授权根目录内），默认第一个根目录"},
-                "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 300"},
+                "timeout": {"type": "integer", "description": "超时秒数，默认取服务端 exec_timeout_sec（通常 60）；上限由服务端 exec_timeout_max_sec 决定（默认 300），实际值见 initialize 的运行时契约。长任务请拆批，不要靠拉长超时硬扛"},
                 "stdin": {"type": "string", "description": "喂给命令标准输入的文本（如整段 PHP/Python 脚本），免引号转义地狱"},
                 "max_output_bytes": {"type": "integer", "description": "本次响应里最多带多少字节输出，默认取服务端 exec_max_output_bytes（通常 65536）；只能调小不能调大，用来省 token"},
                 "head_lines": {"type": "integer", "description": "输出超限时预览保留开头多少行，默认 20，上限 500；启动上下文和早期报错在这里"},
@@ -1069,7 +1072,7 @@ def runtime_contract(info: dict) -> str:
         "不要按 line_fragment / eof 猜，末尾有无换行的文件会各错一半。",
         "自动备份" + ("开" if flags.get("auto_backup", True) else "关")
         + "：备份失败时覆盖/替换/移动/回滚整体中止且原文件不动；"
-          "win_write / win_write_b64 可传 backup=false 跳过。",
+          "写类工具均可传 backup=false 跳过。",
         ("删除走 win_trash（可恢复）；" if flags.get("allow_delete", True)
          else "当前禁止删除；")
         + "encoding 不接受 utf-8-sig（不静默写 BOM），请用 utf-8。",
@@ -1084,9 +1087,10 @@ def runtime_contract(info: dict) -> str:
         shown = "、".join(allowed[:6]) or "（空）"
         if len(allowed) > 6:
             shown += f" 等 {len(allowed)} 项"
+        cap = flags.get("exec_timeout_max_sec", 300)
         lines.append(
-            f"win_exec 已开启：白名单 {shown}；只校验整条命令的首个程序；"
-            f"超时 {flags.get('exec_timeout_sec', 60)} 秒"
+            f"win_exec 已开启：白名单 {shown}；只查首程序；"
+            f"超时 {flags.get('exec_timeout_sec', 60)} 秒、上限 {cap} 秒"
             + ("；严格链式校验开" if flags.get("exec_strict_chain") else "") + "。"
         )
     else:

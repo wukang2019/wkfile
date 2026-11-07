@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.18"
+VERSION = "1.7.19"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -200,6 +200,11 @@ DEFAULT_CONFIG = {
     "exec_allowed_commands": [],
     "exec_strict_chain": False,
     "exec_timeout_sec": 60,
+    # win_exec 单次超时的服务端天花板（v1.7.19）。以前硬编码 300，运维想跑
+    # 一次稍长的 composer install / 数据迁移都改不了。按调用传的 timeout
+    # 只会夹到这个值，不能放大；上限自身再夹到 [1, 3600]，防误填超大值
+    # 把请求线程挂死。默认 300 = 完全保持旧行为。
+    "exec_timeout_max_sec": 300,
     "exec_max_output_bytes": 65536,
     # 落盘前对 .py/.json/.jsonl/.xml/.toml 做一次语法校验，不通过则原文件不动
     "preflight_check": True,
@@ -461,6 +466,26 @@ def human_size(n: int) -> str:
             return f"{v:.1f} {u}" if u != "B" else f"{int(v)} B"
         v /= 1024
     return f"{n} B"
+
+
+# win_exec 超时天花板的绝对硬顶（防止误填 999999999 让请求线程永久挂住）。
+EXEC_TIMEOUT_HARD_CAP = 3600
+
+
+def exec_timeout_cap(value, *, default: int = 300) -> int:
+    """把 exec_timeout_max_sec 规整成合法上限（纯函数，v1.7.19）。
+
+    配置文件是给人手填的，热加载也会把任意 JSON 值直接 setattr 进来：
+    非整数、0、负数、字符串、超大值都必须夹回可运行区间，绝不能让
+    win_exec 因为一条脏配置抛异常或把线程挂死。
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n < 1:
+        return default
+    return min(n, EXEC_TIMEOUT_HARD_CAP)
 
 
 # ---------------------------------------------------------------------------
@@ -1161,6 +1186,12 @@ _CONFIG_NOTES = {
     '"exec_strict_chain"': [
         "// 严格模式：命令链每一段（&& / | 分隔）的首程序都要过白名单。",
         "// 默认 false（只查首程序）。追求极致安全再开 true。",
+    ],
+    '"exec_timeout_max_sec"': [
+        "// win_exec 单次超时的服务端天花板（默认 300 秒）。按调用传的 timeout",
+        "// 不能超过它；改这个键保存后下次调用即生效，不用重启服务。",
+        "// 上限自身会被夹到 1~3600 秒，防止误填超大值把请求线程挂死。",
+        "// 长任务请拆成多次短命令，别靠拉长超时硬扛。",
     ],
     '"token"': [
         "// ★ 访问 Token。留空时程序会自动生成一个；也可以自己填任意长随机串。",
@@ -2191,7 +2222,10 @@ class Agent:
             )
         if req.get("create_dirs", True):
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-        backup = self._backup(full)
+        # v1.7.19：与 op_write 对齐，允许按次跳过备份。append 每次全量复制
+        # 原文件（4MB 日志追加一行也要复制 4MB），高频写日志时开销很大；
+        # 契约已承诺 backup=false，此处补齐实现，避免「说了能跳过却照样复制」。
+        backup = self._backup(full) if req.get("backup", True) else None
         with open(full, "ab") as fh:
             fh.write(data)
         return {"path": full, "appended_bytes": len(data), "size": os.path.getsize(full),
@@ -2285,7 +2319,8 @@ class Agent:
 
         out_bytes = replaced_text.encode(enc if enc != "utf-8-sig" else "utf-8")
         self._preflight(full, out_bytes)
-        backup = self._backup(full)
+        # v1.7.19：与 op_write 对齐，backup=false 可跳过备份（契约口径统一）。
+        backup = self._backup(full) if req.get("backup", True) else None
         # v1.7.12（WK-006）：与 op_write 一致走原子写——固定 open("wb") 在
         # 写到一半崩溃时会把原文件截成半截，备份虽有但等于赌运气
         self._atomic_write(full, out_bytes)
@@ -3074,13 +3109,15 @@ class Agent:
     # 热加载只覆盖"参数级"字段；exec_enabled 仍然必须重启 —— 它决定
     # win_exec 是否出现在 tools/list（Agent 构造时的快照），"能力开关必须
     # 显式重启"的安全语义保持不变。
+    # v1.7.19：exec_timeout_max_sec 也在这里（它只是上限，不是能力开关）。
     _EXEC_HOT_KEYS = ("exec_allowed_commands", "exec_timeout_sec",
-                      "exec_max_output_bytes", "exec_strict_chain")
+                      "exec_timeout_max_sec", "exec_max_output_bytes",
+                      "exec_strict_chain")
 
     def _hotload_exec_cfg(self):
         """exec 参数热加载（v1.7.9）：改配置文件后不用重启服务，下次调用即生效。
 
-        检测配置文件 mtime，变了就重读上面四个字段。文件坏了/被截断时
+        检测配置文件 mtime，变了就重读 _EXEC_HOT_KEYS 里的字段。文件坏了/被截断时
         静默保持当前配置继续跑 —— 热加载失败绝不应该把正在工作的服务搞挂。
         """
         try:
@@ -3237,8 +3274,10 @@ class Agent:
         if not os.path.isdir(cwd):
             raise PathError("not_found", f"工作目录不存在：{cwd}")
 
-        timeout = min(max(self._int_arg(req, "timeout",
-                                        int(self.cfg.exec_timeout_sec or 60)) or 60, 1), 300)
+        # v1.7.19：天花板由服务端配置 exec_timeout_max_sec 决定（默认 300，
+        # 保持旧行为），按调用只能调小。计算抽成纯逻辑，脏配置由
+        # exec_timeout_cap 规整，不会抛异常也不会让线程挂死。
+        timeout = self._exec_timeout(req)
         # 服务端上限是天花板；按调用只能调小（省响应体积 / token），不能放大。
         cfg_max_out = int(self.cfg.exec_max_output_bytes or 65536)
         max_out = max(1, min(self._int_arg(req, "max_output_bytes", cfg_max_out)
@@ -3317,6 +3356,17 @@ class Agent:
             "output_preview_bytes": len(preview.encode("utf-8", "ignore")),
             "output": preview,
         }
+
+    def _exec_timeout(self, req: dict) -> int:
+        """算本次 win_exec 的超时秒数（纯逻辑，不启进程，v1.7.19）。
+
+        服务端天花板 exec_timeout_max_sec 优先于调用方传的 timeout：
+        AI 不能自己把超时放大到运维设定的上限之外。缺省取 exec_timeout_sec。
+        """
+        cap = exec_timeout_cap(getattr(self.cfg, "exec_timeout_max_sec", 300))
+        default = int(self.cfg.exec_timeout_sec or 60)
+        asked = self._int_arg(req, "timeout", default)
+        return min(max(asked or default, 1), cap)
 
     # ---- 分发 ----
 
@@ -3863,6 +3913,8 @@ class Handler(BaseHTTPRequestHandler):
                 "exec_allowed_commands": list(
                     getattr(cfg, "exec_allowed_commands", None) or []),
                 "exec_timeout_sec": int(getattr(cfg, "exec_timeout_sec", 60)),
+                "exec_timeout_max_sec": exec_timeout_cap(
+                    getattr(cfg, "exec_timeout_max_sec", 300)),
                 "exec_strict_chain": bool(getattr(cfg, "exec_strict_chain", False)),
             },
         }

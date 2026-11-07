@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.18\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.19\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.18.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.19.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.18\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.19\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.18\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.19\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -689,7 +689,18 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      `backup_retain_days=30`、`backup_retain_count=200`。`win_backup_list` 返回只读
      `policy` 快照（总份数 / 总体积 / 按策略会清几份），**不提供删除备份的工具**
      —— 让 AI 能删掉回滚兜底比写错文件更危险，手动清理请由运维在服务器上做。
-   - 改 Token / 白名单 / 端口后**必须重启服务**才生效（暂未做配置热重载）。
+   - **写类工具备份口径统一、命令超时上限可配**（v1.7.19）：
+     `win_write` / `win_write_b64` / `win_replace` / `win_append` 现在**都**支持
+     `backup=false` 按次跳过写前备份（此前只有前两个支持，`win_append` 每追加
+     一行都要把几 MB 的日志文件整份复制一遍）。`win_exec` 的超时天花板不再是
+     写死的 300 秒，新增服务端配置 `exec_timeout_max_sec`（默认 300 = 保持旧
+     行为，夹到 1~3600 秒，改完保存配置下次调用即生效）；按调用传的 `timeout`
+     只能调小到这个上限之内。**仍然不做异步 exec**：长任务请在工具描述与运行时
+     契约的提示下拆成多次短命令，不要靠拉长超时硬扛。
+   - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
+     `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
+     exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
+     仍必须重启）。
    - 不开 HTTPS 的话，Token 仍是明文过公网 —— 这是最大的剩余风险，见第 7 条。
 10. **开数据库之前请先想清楚这三件事**（v1.6.0 新增能力）：
    - **数据库账号权限别给太高**。最省事的做法是给这个服务单独建一个只读账号
@@ -749,23 +760,31 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 cd trae-winfile
 python selftest.py                      # 老接口 + 安全机制 + MCP 协议回归：53 用例
 python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：207 用例
-python tests\mcp_e2e.py                 # MCP 端点（源码）：48 用例
+python tests\mcp_e2e.py                 # MCP 端点（源码）：59 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
 python tests\tls_e2e.py                 # 真起 HTTPS 服务端到端（需 openssl，无则跳过）：11 用例
-python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：53 用例
+python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：59 用例
+python tests\mcp_contract_test.py       # initialize 运行时契约 + 逐页还原行为断言：65 用例
+python tests\exec_output_test.py        # win_exec 双端压缩预览 + win_tail 白名单口：25 用例
+python tests\backup_retention_test.py   # 备份保留策略与配置键集合：26 用例
+python tests\write_backup_timeout_test.py  # backup=false 一致性 + 超时上限可配：51 用例
+python tests\gui_refresh_test.py        # GUI 异步刷新（tkinter 桩）：52 用例
+python test\v1712\spotcheck.py          # win_read 边界 A~F 段：61 用例
+python test\v1712\check.py              # 围栏/原子写定点检查：13 用例
 ```
 
 
 ````
 
-当前状态（v1.7.18 实测，源码级）：**selftest 53/53、features 207/207（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项。
+当前状态（v1.7.19 实测，源码级）：**selftest 53/53、features 207/207（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项；`py_compile` 与模块导入自检通过。
 
-> ⚠️ **本轮 exe 黑盒未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
+> ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
-> `wkfile.exe --check-gui` 跑不起来。上一版 v1.7.17 用同一构建脚本产出的 exe
-> 黑盒 56/56 与真窗口自检均通过，且本轮**未改动 GUI 代码**；上述源码级回归已
-> 覆盖本轮全部改动（含真实 `op_exec` + `win_tail` 闭环、备份目录清理）。
+> `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
+> 56/56 与真窗口自检均通过；v1.7.18 / v1.7.19 均未改动 GUI 代码。上述源码级
+> 回归已覆盖本轮全部改动（含真实 `op_append` / `op_replace` 的备份行为、真实
+> `op_exec` 超时夹取、契约与 schema 口径一致性）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：

@@ -25,6 +25,7 @@
   "exec_allowed_commands": [],
   "exec_strict_chain": false,
   "exec_timeout_sec": 60,
+  "exec_timeout_max_sec": 300,
   "exec_max_output_bytes": 65536,
   "public_health": true,
   "ip_allowlist": [],
