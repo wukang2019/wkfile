@@ -136,7 +136,7 @@ TOOLS = [
     },
     {
         "name": "win_info",
-        "description": "查看单个文件或目录的详情（大小、修改时间、读写权限；文件可加 hash 取 sha256）。",
+        "description": "查看单个文件或目录的详情（大小、修改时间、读写权限；文件可加 hash 取 sha256）。只读内容时若顺便要 sha256，用 win_read(hash=true) 一次拿全，不必再单独调本工具。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -159,13 +159,14 @@ TOOLS = [
                 "max_bytes": {"type": "integer", "description": "本页最多返回多少字节（硬上限为服务端 max_read_bytes）；传小了只影响本页大小，长行会分成多个残行页（line_fragment=true），按 eof 续读到尾即可"},
                 "encoding": {"type": "string", "description": "编码，默认 auto（自动识别 UTF-8 / GBK）"},
                 "line_numbers": {"type": "boolean", "description": "是否带行号，默认 true"},
+                "hash": {"type": "boolean", "description": "顺带返回整个文件的 sha256（默认 false，零开销），写回时可直接传给 win_write / win_replace 的 expected_sha256 防并发覆盖；文件过大时会返回 sha256=null 与原因，不影响读取"},
             },
             "required": ["path"],
         },
     },
     {
         "name": "win_write",
-        "description": "写入/覆盖文本文件（自动建父目录，写前默认自动备份原文件）。覆盖前建议先用 win_read 读一遍，并把返回的 sha256 传给 expected_sha256 以防并发覆盖。",
+        "description": "写入/覆盖文本文件（自动建父目录，写前默认自动备份原文件）。覆盖前建议先用 win_read(hash=true) 读一遍，把返回的 sha256 传给 expected_sha256 以防并发覆盖；不匹配会拒绝写入，并在错误里给出当前 sha256 / 大小 / 修改时间，确认后可据此重试。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -173,7 +174,7 @@ TOOLS = [
                 "content": {"type": "string", "description": "完整的新内容"},
                 "encoding": {"type": "string", "description": "编码，默认 utf-8"},
                 "create_dirs": {"type": "boolean", "description": "自动创建父目录，默认 true"},
-                "expected_sha256": {"type": "string", "description": "可选：文件当前 sha256，不匹配则拒绝写入"},
+                "expected_sha256": {"type": "string", "description": "可选：文件当前 sha256（用 win_read(hash=true) 一次拿到；不是 win_read 默认返回值），不匹配则拒绝写入并在错误里给出当前值"},
                 "backup": {"type": "boolean", "description": "写前备份原文件，默认 true。频繁覆盖同一小文件（如 .env 改一行）时可传 false 少留历史版本"},
             },
             "required": ["path", "content"],
@@ -196,6 +197,7 @@ TOOLS = [
                 "ignore_case": {"type": "boolean", "description": "正则模式下是否忽略大小写"},
                 "dry_run": {"type": "boolean", "description": "只预览不落盘：返回 unified diff，文件保持不动。默认 false"},
                 "backup": {"type": "boolean", "description": "写前备份原文件，默认 true；传 false 可跳过备份（频繁改动同一文件时少留历史版本）"},
+                "expected_sha256": {"type": "string", "description": "可选：文件当前 sha256（用 win_read(hash=true) 一次拿到），不匹配则拒绝替换，防止读取与替换之间别人改动被静默覆盖"},
             },
             "required": ["path", "old"],
         },
@@ -741,6 +743,15 @@ def render(tool_name: str, data: dict) -> str:
                      f" + start_line={data.get('next_start_line')} 续读，直至 eof=true")
         elif data.get("next_start_line"):
             head += f"\n⚠️ 还有未读内容：下次调用传 start_line={data['next_start_line']} 续读"
+        # v1.7.20：hash=true 时把全文件 sha256 也放进文本头——纯文本客户端
+        # 不读 structuredContent，不写进这里等于这个能力对它们不存在。
+        # 明确标「全文件」，避免 AI 误以为是本页内容的 hash。
+        if "sha256" in data:
+            if data.get("sha256"):
+                head += (f"\n全文件 sha256={data['sha256']}"
+                         "（写回时传给 expected_sha256 可防并发覆盖）")
+            else:
+                head += f"\n全文件 sha256 未计算：{data.get('sha256_note') or '文件超过哈希上限'}"
         return head + "\n" + ("-" * 60) + "\n" + str(data.get("content", ""))
 
     if tool_name == "win_list":

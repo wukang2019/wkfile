@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.19"
+VERSION = "1.7.20"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -662,6 +662,21 @@ def sha256_of(path: str) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def sha256_under_cap(path: str, cap: int) -> tuple[str | None, str]:
+    """带体积上限地算**整个文件**的 sha256（纯函数，v1.7.20）。
+
+    几百 MB 的文件会把请求线程占住几十秒，等于变相 DoS。超限不硬算，
+    返回 (None, 原因) 让调用方自己决定报错还是降级——不能因为一个可选
+    参数把「读文件」这个主功能整个拒掉。乐观锁比对的是全文件 hash，
+    不是当前页，所以这里必须独立于分页读取去算。
+    """
+    size = os.path.getsize(path)
+    if size > cap:
+        return None, (f"文件 {human_size(size)} 超过哈希上限 "
+                      f"{human_size(cap)}，拒绝计算 sha256。")
+    return sha256_of(path), ""
 
 
 # --------------------------------------------------------------------------------------
@@ -1900,13 +1915,11 @@ class Agent:
             # v1.7.12（WK-009）：sha256 只对小文件算——几百 MB 的文件会把
             # 请求线程占住几十秒，等于一个变相 DoS。超限明确报错而不是硬算。
             if req.get("hash"):
-                if os.path.getsize(full) > int(self.cfg.max_read_bytes):
-                    raise PathError(
-                        "too_large",
-                        f"文件 {human_size(os.path.getsize(full))} 超过哈希上限 "
-                        f"{human_size(int(self.cfg.max_read_bytes))}，拒绝计算 sha256。",
-                    )
-                info["sha256"] = sha256_of(full)
+                # v1.7.20：与 win_read / conflict 路径共用同一个带上限的算法
+                digest, why = sha256_under_cap(full, int(self.cfg.max_read_bytes))
+                if digest is None:
+                    raise PathError("too_large", why)
+                info["sha256"] = digest
         return info
 
     def op_read(self, req: dict) -> dict:
@@ -2027,7 +2040,7 @@ class Agent:
         )
         byte_truncated = (offset + len(raw)) < size
         truncated = byte_more or lines_left > 0
-        return {
+        result = {
             "path": full,
             "encoding": enc,
             "size": size,
@@ -2055,6 +2068,14 @@ class Agent:
             "next_start_line": (start + complete) if truncated else None,
             "content": body,
         }
+        # v1.7.20：一次调用同时给内容 + 全文件 sha256，AI 写回时可直接塞进
+        # expected_sha256 做乐观锁，不必再单独跑一趟 win_info(hash=true)。
+        # 只在显式请求时算（默认零开销）；超限不中断读取，只降级说明原因。
+        if req.get("hash"):
+            digest, why = sha256_under_cap(full, int(self.cfg.max_read_bytes))
+            result["sha256"] = digest
+            result["sha256_note"] = why or None
+        return result
 
     def op_read_b64(self, req: dict) -> dict:
         full = self.guard.resolve(req.get("path"))
@@ -2088,11 +2109,28 @@ class Agent:
             )
         expected = req.get("expected_sha256")
         if expected and os.path.isfile(full):
-            actual = sha256_of(full)
+            # v1.7.20：乐观锁比对也走带上限的算法。以前对几百 MB 文件硬算
+            # sha256 会把请求线程占住；超限时**明确拒绝写入**，绝不能静默
+            # 跳过校验（那会让 expected_sha256 形同虚设、照样覆盖别人改动）。
+            actual, why = sha256_under_cap(full, int(self.cfg.max_read_bytes))
+            if actual is None:
+                raise PathError(
+                    "too_large",
+                    why + "大文件请改用 win_replace 精确替换，或去掉 "
+                          "expected_sha256（需自行确认没有并发写入）。",
+                )
             if actual.lower() != str(expected).lower():
+                # v1.7.20：把「当前事实」一次给全，AI 不用再跑一趟
+                # win_info(hash=true) 才能决定重试，也省掉盲写覆盖别人改动。
+                st = os.stat(full)
                 raise PathError(
                     "conflict",
-                    "文件已被其他人修改（sha256 不匹配），请先重新读取再写入",
+                    f"文件已被其他人修改（sha256 不匹配）：当前 sha256={actual}，"
+                    f"大小 {st.st_size} 字节，修改时间 "
+                    f"{datetime.fromtimestamp(st.st_mtime).isoformat(timespec='seconds')}。"
+                    "请先用 win_read(hash=true) 看当前内容并拿到这个 sha256，"
+                    "确认仍要覆盖后把 expected_sha256 改成上述当前值再写一次；"
+                    "别直接去掉 expected_sha256 重试（会静默覆盖别人的改动）。",
                 )
         if req.get("create_dirs", True):
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
@@ -2236,6 +2274,27 @@ class Agent:
         full = self.guard.resolve(req.get("path"))
         if not os.path.isfile(full):
             raise PathError("not_found", f"文件不存在：{full}")
+        # v1.7.20：与 win_write 对齐的乐观锁。校验必须在读内容之前——
+        # 读进来再比对等于拿旧内容做判断，别人刚改的那版已经被覆盖了。
+        # dry_run 也照样校验：预览一个过期版本的 diff 同样会误导 AI。
+        expected = req.get("expected_sha256")
+        if expected:
+            cur_hash, why = sha256_under_cap(full, int(self.cfg.max_read_bytes))
+            if cur_hash is None:
+                raise PathError(
+                    "too_large",
+                    why + "大文件请去掉 expected_sha256，或改用 win_write 重写。",
+                )
+            if cur_hash.lower() != str(expected).lower():
+                st = os.stat(full)
+                raise PathError(
+                    "conflict",
+                    f"文件已被其他人修改（sha256 不匹配）：当前 sha256={cur_hash}，"
+                    f"大小 {st.st_size} 字节，修改时间 "
+                    f"{datetime.fromtimestamp(st.st_mtime).isoformat(timespec='seconds')}。"
+                    "请先用 win_read(hash=true) 看当前内容并拿到这个 sha256，"
+                    "确认仍要替换后把 expected_sha256 改成上述当前值再调一次。",
+                )
         old = req.get("old")
         new = req.get("new", "")
         if old is None or old == "":

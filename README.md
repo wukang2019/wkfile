@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.19\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.20\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.19.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.20.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.19\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.20\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.19\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.20\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -287,11 +287,11 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 | `win_list`            | 列目录（支持递归、通配符过滤）                    |
 | `win_tree`            | 一次拿整个目录树概览（带缩进与大小），摸项目结构用          |
 | `win_info`            | 单个文件/目录详情，可算 sha256                |
-| `win_read`            | 读文本（带行号，可分段读大文件，自动识别 UTF-8/GBK）    |
+| `win_read`            | 读文本（带行号，可分段读大文件，自动识别 UTF-8/GBK）；`hash=true` 顺带返回全文件 sha256 |
 | `win_tail`            | **只看文件末尾 N 行** —— 查日志、看最新报错，不必读整个文件  |
 | `win_multi_read`      | 一次读多个文件（配置+日志+代码），单个失败不影响其它        |
 | `win_write`           | 写/覆盖文本（自动建目录、写前备份、可带 sha256 防并发覆盖） |
-| `win_replace`         | 精确字符串/正则替换；支持 `dry_run` **先看 unified diff 预览** |
+| `win_replace`         | 精确字符串/正则替换；支持 `dry_run` 预览与 `expected_sha256` 防并发覆盖 |
 | `win_append`          | 追加内容（写日志）                          |
 | `win_mkdir`           | 建目录                                |
 | `win_move`            | 移动/重命名                             |
@@ -636,7 +636,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
    | **只读 Token**（新）  | 用只读 Token 的请求整条链路被当成只读，写/删/移/回滚一律 `read_only` 拒绝；审计里带 `scope=readonly` 便于区分                                                 |
    | **数据目录隔离**（新）  | `wkfile\`（含配置里的 Token、日志、备份、回收站）**永远不可经接口读写**，AI 读不到自己的密码                                                                        |
    | **日志全部轮转**（新）  | 审计日志与运行日志（`logs\wkfile.log`）都按大小滚动，服务长年跑不会把磁盘写满                                                                                 |
-   | 并发保护           | 可选 `expected_sha256`，文件被别人改过就拒绝写入                                                                                               |
+   | 并发保护           | 可选 `expected_sha256`（`win_write` / `win_replace`），文件被别人改过就拒绝写入，并在错误里回传当前 sha256 / 大小 / 修改时间                                        |
    | 鉴权锁定           | 同一 IP 5 分钟内失败 20 次即临时拒绝；Token 比对用 `hmac.compare_digest` 防时序攻击                                                                   |
    | **数据库三重闸门**（新） | 写库要同时满足：数据源开了「允许写入」+ 服务端非只读 + 用主 Token。缺哪条就明确告诉你是哪条挡的                                                            |
    | **危险语句硬拒**（新）  | 多语句、`INTO OUTFILE`、`LOAD_FILE`、`FOR UPDATE`、`SLEEP()`、`FLUSHALL`、`CONFIG`、`EVAL`、`KEYS`、`xp_cmdshell`、`OPENROWSET`、`SELECT...INTO` 等，**任何配置下都不放行**（不依赖 allow_write）  |
@@ -697,6 +697,15 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      行为，夹到 1~3600 秒，改完保存配置下次调用即生效）；按调用传的 `timeout`
      只能调小到这个上限之内。**仍然不做异步 exec**：长任务请在工具描述与运行时
      契约的提示下拆成多次短命令，不要靠拉长超时硬扛。
+   - **并发覆盖保护的闭环补齐**（v1.7.20）：`win_write` 原先描述让 AI「把
+     `win_read` 返回的 sha256 传给 `expected_sha256`」，但 `win_read` 从来不返回
+     sha256 —— 照做必然拿不到值。现在 `win_read(hash=true)` 一次调用同时给内容和
+     **全文件** sha256（默认不开、零开销；文件过大时降级说明原因而不中断读取），
+     纯文本客户端的文本头里也能看到。`expected_sha256` 冲突时错误里直接回传
+     **当前** sha256 / 大小 / 修改时间和重试指引，AI 不用再跑一趟 `win_info` 探测；
+     `win_replace` 也补上了 `expected_sha256`（`dry_run` 与未命中路径同样校验），
+     防止读取与替换之间别人的改动被静默覆盖。乐观锁比对统一走带体积上限的算法，
+     超大文件明确拒绝写入而不是硬算哈希或静默跳过校验。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -769,6 +778,7 @@ python tests\mcp_contract_test.py       # initialize 运行时契约 + 逐页还
 python tests\exec_output_test.py        # win_exec 双端压缩预览 + win_tail 白名单口：25 用例
 python tests\backup_retention_test.py   # 备份保留策略与配置键集合：26 用例
 python tests\write_backup_timeout_test.py  # backup=false 一致性 + 超时上限可配：51 用例
+python tests\optimistic_lock_test.py       # win_read(hash=true) + conflict 回传 + win_replace 乐观锁：44 用例
 python tests\gui_refresh_test.py        # GUI 异步刷新（tkinter 桩）：52 用例
 python test\v1712\spotcheck.py          # win_read 边界 A~F 段：61 用例
 python test\v1712\check.py              # 围栏/原子写定点检查：13 用例
@@ -777,14 +787,14 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.19 实测，源码级）：**selftest 53/53、features 207/207（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项；`py_compile` 与模块导入自检通过。
+当前状态（v1.7.20 实测，源码级）：**selftest 53/53、features 207/207（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 44 项；`py_compile` 与模块导入自检通过。
 
 > ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
 > `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
-> 56/56 与真窗口自检均通过；v1.7.18 / v1.7.19 均未改动 GUI 代码。上述源码级
-> 回归已覆盖本轮全部改动（含真实 `op_append` / `op_replace` 的备份行为、真实
-> `op_exec` 超时夹取、契约与 schema 口径一致性）。
+> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.20 均未改动 GUI 代码。上述源码级
+> 回归已覆盖本轮全部改动（含真实 `win_read(hash=true)` 逐页读取、真实
+> `win_write` / `win_replace` 冲突与重试闭环、纯文本渲染断言）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：
