@@ -103,7 +103,7 @@ TOOLS = [
     },
     {
         "name": "win_read",
-        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，是否读完只看 eof=true（不要用 returned_lines==0 或 truncated 判断结束）。某一页的 returned_lines 可能为 0：整行长度超过本页字节上限，该页只装了残行片段（line_fragment=true），此时 next_offset 仍会前进，继续读即可。二进制文件请用 win_read_b64。",
+        "description": "读取文本文件内容（带行号）。大文件按返回的 next_offset / next_start_line 续读，是否读完只看 eof=true（不要用 returned_lines==0 或 truncated 判断结束）。某一页的 returned_lines 可能为 0：整行长度超过本页字节上限，该页只装了残行片段（line_fragment=true），此时 next_offset 仍会前进，继续读即可。拼接多页正文时：line_fragment=true 的残页末尾不补换行、其余页补一个换行，即可无损还原原文。二进制文件请用 win_read_b64。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1055,7 +1055,21 @@ def call_tool(dispatch, params: dict, *, disabled=()) -> dict:
         # v1.7.9 起给 win_exec 附机器可读字段（exit_code/duration_ms/output_file），
         # v1.7.11 起扩展到全部工具——win_read 的 next_start_line 游标等
         # 结构化字段直接可读，AI 不用再从文本头部解析
-        result["structuredContent"] = data
+        # v1.7.13：正文只发一份。content[0].text 里已经有 render() 渲染的全文，
+        # structuredContent 再原样带一遍 data["content"] 会把同一段大文本重复
+        # 塞进响应（win_read 读满 4MB 就等于 8MB 开销）。大正文时只留结构化
+        # 元数据，并显式标记；客户端仍能从文本块拿全文，旧客户端忽略该字段。
+        sc = data
+        if isinstance(data, dict):
+            body = data.get("content")
+            if isinstance(body, str):
+                n = len(body.encode("utf-8", "replace"))
+                if n > 4096:
+                    sc = dict(data)
+                    sc.pop("content", None)
+                    sc["content_omitted"] = True
+                    sc["content_bytes"] = n
+        result["structuredContent"] = sc
         return result
     except Exception as exc:  # noqa: BLE001 —— 任何异常都要变成工具错误，不能让连接断
         msg = getattr(exc, "message", None) or str(exc)
