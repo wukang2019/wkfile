@@ -1,20 +1,25 @@
 # -*- coding: utf-8 -*-
-"""v1.7.27 契约回归：热加载非法值丢弃 / patch 0 值不限制 / port 拒启 / 备份单遍清理。
+"""v1.7.27 / v1.7.28 契约回归：热加载规范化+告警 / patch 0 语义统一 / port 拒启 / 备份单遍清理。
 
 第六轮外部审计（v1.7.26 发布后仍残留的 9 条）里，落到「代码真 bug」或
-「实现口径错」的四条，本版逐一收口：
+「实现口径错」的四条，本版逐一收口；第七轮审计又补两刀：
 
   #1  exec_strict_chain 热加载写 null 可静默关掉严格链；
       exec_allowed_commands 热改数字 -> /api/exec 500。
       -> 热加载加类型守门，非法值丢弃并保留上次生效值 + stderr 告警。
-  #4  patch_max_total_bytes=0 被当成硬上限，每次补丁都被「超预算 0 字节」全拒。
-      -> <=0 视为「不限制」（与 backup_max_bytes=0 不清理同一约定）。
+  #4  patch_max_total_bytes=0 的语义：v1.7.27 把它当成「不限制」，
+      而同源的 patch_max_rollback_bytes=0 却是「回退内置 8MB 安全上限」——
+      同一个 0 两套语义（第七轮审计指出）。v1.7.28 统一为 0/负数 = 回退
+      内置默认上限（PATCH_MAX_TOTAL_BYTES），0 永不表示不限。
   #5  port:null / host:null 静默回退默认值，连错端口还以为服务没起。
       -> port 列为连通性关键键，脏值直接拒绝启动；host 仍回退 0.0.0.0 + 告警。
   #8  备份清理每轮都单独扫一遍 .objects 去 prune，与 _backup_entries 的枚举重复。
-      -> 复用 _backup_entries 已记下的孤儿路径直接删，单遍完成。
+      -> 复用 _backup_entries 已记下的孤儿路径直接删，单遍完成；_prune_backup_objects
+         成为死代码（第七轮审计指出），已删除。
 
-本文件先于「修复完成」写成，修复前应当成片报红；断言刻意避开恒真条件。
+第七轮审计额外要求：热加载对 exec_strict_chain 写 0 / "false" 这类「认得出但
+类型不对」的值，必须走 coerce_safety_bool 规范化后再写（0->False、"false"->False，
+两个方向都不再静默反方向），且告警要进 win_probe 与 /api/health，不能只躺 run log。
 """
 import io
 import json
@@ -83,14 +88,14 @@ def groupA():
         for val, ok in ((True, True), (False, True), ("true", True),
                         ("false", True), ("1", True), (0, True),
                         (None, False), ("yes", False), (1.0, False), (2, False)):
-            good, _why = validate("exec_strict_chain", val)
+            good, _why, _val, _norm = validate("exec_strict_chain", val)
             check("exec_strict_chain %r -> %s" % (val, "放行" if ok else "拒"),
                   good is ok, "%r got %r" % (val, good))
         # 白名单：字符串数组放行，非数组/含非字符串元素/数字 一律拒
         for val, ok in ((["php", "composer"], True), ([], True),
                         ("php", False), (["php", 1], False), (123, False),
                         (None, False)):
-            good, _why = validate("exec_allowed_commands", val)
+            good, _why, _val, _norm = validate("exec_allowed_commands", val)
             check("exec_allowed_commands %r -> %s" % (val, "放行" if ok else "拒"),
                   good is ok, "%r got %r" % (val, good))
         # 三个数值键：正整数放行，<=0 / 非 int / bool 一律拒
@@ -98,7 +103,7 @@ def groupA():
                     "exec_max_output_bytes"):
             for val, ok in ((30, True), (1, True), (0, False), (-1, False),
                             ("30", False), (True, False), (1.5, False)):
-                good, _why = validate(key, val)
+                good, _why, _val, _norm = validate(key, val)
                 check("%s %r -> %s" % (key, val, "放行" if ok else "拒"),
                       good is ok, "%r got %r" % (val, good))
 
@@ -160,29 +165,119 @@ def groupA():
 
 
 # ---------------------------------------------------------------------------
-# 组 B：patch_max_total_bytes=0 视为不限制（审计 #4）
+# 组 A2：热加载对「认得出但类型不对」的值必须规范化后再写，且告警进 health/probe
+#   （第七轮审计核心修正：v1.7.27 只「丢弃认不出的值」，于是 exec_strict_chain
+#    写 0 被当成 False 静默关链、写 "false" 被当成真值字符串静默开链，两个方向
+#    都不出声，比 null 更隐蔽；告警也只躺在 run log 里。）
+# ---------------------------------------------------------------------------
+def groupA2():
+    print("\n-- 组 A2：热加载规范化 + 告警进 health/probe（第七轮审计） --")
+    base = tempfile.mkdtemp(prefix="wk1727a2-")
+    try:
+        cfg_path = os.path.join(base, "wkfile.config.json")
+        before = {"host": "127.0.0.1", "port": 8788,
+                  "token": "abcdefghijklmnopqrstuvwxyz0123456789",
+                  "roots": [os.path.join(base, "share")],
+                  "exec_strict_chain": True,
+                  "exec_allowed_commands": ["php", "composer"],
+                  "public_health": True}
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(before, fh)
+        cfg = wa.Config(before, cfg_path, env={})
+        agent = wa.Agent(cfg)
+
+        # 1) exec_strict_chain: 0  -> 必须规范化成布尔 False 写进去（不再是裸 0），
+        #    且不能“静默反方向”：0 是 False（关链），并打一条 coerced 告警。
+        bad = dict(before)
+        bad["exec_strict_chain"] = 0
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(bad, fh)
+        agent._exec_cfg_mtime = None
+        buf = io.StringIO()
+        old = sys.stderr
+        sys.stderr = buf
+        try:
+            agent._hotload_exec_cfg()
+        finally:
+            sys.stderr = old
+        log = buf.getvalue()
+        check("exec_strict_chain:0 规范化写入的是布尔 False（不是裸 0）",
+              cfg.exec_strict_chain is False, repr(cfg.exec_strict_chain))
+        check("exec_strict_chain:0 触发规范化告警（不再静默）",
+              "规范化为" in log and "exec_strict_chain" in log, log[:300])
+        check("exec_strict_chain:0 的告警被记入 hotload_warnings",
+              any(w.get("key") == "exec_strict_chain" and w.get("action") == "coerced"
+                  for w in getattr(agent, "_hotload_warnings", [])),
+              str(getattr(agent, "_hotload_warnings", []))[:300])
+
+        # 2) exec_strict_chain: "false" 字符串 -> 同样规范化成布尔 False，
+        #    不能当成真值字符串（否则 if 判断为真 = 静默开链）。
+        bad2 = dict(before)
+        bad2["exec_strict_chain"] = "false"
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(bad2, fh)
+        agent._exec_cfg_mtime = None
+        buf2 = io.StringIO()
+        sys.stderr = buf2
+        try:
+            agent._hotload_exec_cfg()
+        finally:
+            sys.stderr = old
+        log2 = buf2.getvalue()
+        check("exec_strict_chain:\"false\" 规范化成布尔 False（不再被当真值）",
+              cfg.exec_strict_chain is False, repr(cfg.exec_strict_chain))
+        check("exec_strict_chain:\"false\" 也触发规范化告警",
+              "规范化为" in log2, log2[:300])
+
+        # 3) 告警必须进 win_probe（authenticated）与 /api/health（unauth 计数）。
+        probe = agent.op_probe({})
+        hw = (probe.get("config") or {}).get("hotload_warnings") or []
+        check("win_probe 暴露 hotload_warnings 且含 exec_strict_chain",
+              any(w.get("key") == "exec_strict_chain" for w in hw), str(hw)[:300])
+        check("win_probe issues 提到热加载告警",
+              any("配置热加载" in s for s in probe.get("issues", [])),
+              str(probe.get("issues"))[:300])
+        # 仿 health 端点逻辑：只读 self.agent._hotload_warnings 的计数
+        hlw = getattr(agent, "_hotload_warnings", [])
+        check("health 可见 hotload_warnings 计数 > 0",
+              len(hlw) > 0, "len=%d" % len(hlw))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 组 B：patch_max_total_bytes 的 0 语义（审计 #4 收口后的统一口径）
+#   配置层：0/负数 -> 回退内置 8MB 安全上限（与 patch_max_rollback_bytes=0 一致），
+#   不再表示「不限」（v1.7.27 曾把 0 当不限，v1.7.28 改回安全默认）。
+#   纯函数 patch_plan 自身仍认 max_total_bytes=0 为「不限」（由调用方先做 0->默认转换）。
 # ---------------------------------------------------------------------------
 def groupB():
-    print("\n-- 组 B：patch 预算 0/负数视为不限制（审计 #4） --")
+    print("\n-- 组 B：patch_max_total_bytes 0 语义（审计 #4） --")
     fn = getattr(wa, "patch_plan", None)
     check("patch_plan 可调用", callable(fn))
     if not callable(fn):
         return
+    # 配置层辅助函数：0/负数 -> 8MB 默认上限，与 rollback 同一口径
+    helper = getattr(wa.Agent, "_patch_max_total_bytes", None)
+    check("Agent._patch_max_total_bytes 可调用", callable(helper))
+    if callable(helper):
+        class _C:  # 最小桩对象：只提供 patch_max_total_bytes 一个属性
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+        check("配置 0 -> 回退内置 8MB 默认上限（与 rollback 一致）",
+              helper(_C(patch_max_total_bytes=0)) == 8 * 1024 * 1024)
+        check("配置 -1 -> 同样回退 8MB",
+              helper(_C(patch_max_total_bytes=-1)) == 8 * 1024 * 1024)
+        check("配置缺省 -> 回退 8MB",
+              helper(_C()) == 8 * 1024 * 1024)
+        check("配置 100 -> 100 生效",
+              helper(_C(patch_max_total_bytes=100)) == 100)
+    # 纯函数层：调用方传 0 才是不限；正常正整数仍按硬上限拦截（未退化）
     big = [{"path": "a.txt", "content": "x" * 2_000_000},
            {"path": "b.txt", "content": "y" * 1_000_000}]
-
-    planned, errors = fn(list(big), max_total_bytes=0)
-    check("max_total_bytes=0 不报错（视为不限制）", not errors, str(errors)[:200])
-    check("max_total_bytes=0 仍返回规范化条目", len(planned) == 2,
-          "planned=%d" % len(planned))
-
-    planned, errors = fn(list(big), max_total_bytes=-1)
-    check("max_total_bytes=-1 同样视为不限制", not errors, str(errors)[:200])
-
     planned, errors = fn(list(big), max_total_bytes=10)
     check("max_total_bytes=10 仍按硬上限拦截（未退化）",
           any("超过预算" in e for e in errors), str(errors)[:200])
-
     # 默认预算（PATCH_MAX_TOTAL_BYTES = 8MB）仍生效：超过 8MB 的单批应被拦
     huge = [{"path": "a.txt", "content": "x" * 5_000_000},
             {"path": "b.txt", "content": "y" * 5_000_000}]
@@ -344,6 +439,7 @@ def main():
     base = tempfile.mkdtemp(prefix="wk1727-")
     try:
         groupA()
+        groupA2()
         groupB()
         groupC(base)
         groupD(base)

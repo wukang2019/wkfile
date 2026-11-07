@@ -278,10 +278,12 @@ def test_backup_dedup():
                 d = os.path.join(bdir, name)
                 if os.path.isdir(d) and not name.startswith("."):
                     shutil.rmtree(d, ignore_errors=True)
-            removed = a._prune_backup_objects()
+            # v1.7.28：孤儿回收已内联进 cleanup_backups（_prune_backup_objects 删除），
+            # 不再有独立方法可调用；直接触发清理并断言孤儿实体被回收。
+            a.cleanup_backups()
             remain = [f for c, _d, fs in os.walk(objs) for f in fs]
-            check("无引用的内容实体被回收", removed >= 1 and not remain,
-                  "removed=%s remain=%s" % (removed, remain))
+            check("无引用的内容实体被回收（内联清理）", not remain,
+                  "remain=%s" % remain)
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

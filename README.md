@@ -901,6 +901,28 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
        `tests/v1723_test.py` 的 `test_docs` 从「形状断言」补成「内容断言」。
      - 新增 `tests/v1727_test.py`：热加载非法值丢弃不套用、`patch_max_total_bytes=0`
        视为不限制、port 脏值拒启、备份清理单遍遍历共四类。
+   - **第七轮外部体检补刀（v1.7.28）—— 上版"修对但发太快"的两类问题**：
+     - **配置热加载的"认得出但类型不对"仍会静默反方向**：v1.7.27 只"丢弃认不出
+       的值"，于是 `exec_strict_chain` 写 `0` 被 `coerce_safety_bool` 当成 `False`
+       **静默关掉严格链**、写 `"false"` 被当成真值字符串 **静默开链**（比 `null`
+       更隐蔽，`null` 至少长得像错）。现在热加载一律先 `coerce_safety_bool`
+       **规范化后再写布尔值**，`0`/`"false"`→`False`、`1`/`"true"`→`True`，且规范化
+       动作本身要打告警——不再把裸值 `setattr` 上去。
+     - **告警不能只躺在 run log 里**：热加载对非法值（跳过）与需规范化的值（已按
+       布尔处理）的处理，现在计入 `Agent._hotload_warnings`，并同时出现在**需鉴权的
+       `win_probe`** 与**免鉴权的 `/api/health`**（只报数量与键名，不带配置值）；
+       运维不查探针也能在健康检查里看到。
+     - **`patch_max_total_bytes=0` 与 `patch_max_rollback_bytes=0` 的 0 语义统一**：
+       v1.7.27 把前者当"不限制"、后者当"回退内置 8MB 安全上限"，同一个 0 两套解释，
+       迟早有人踩。v1.7.28 统一为 **0 / 负数 = 回退内置默认上限**
+       （`PATCH_MAX_TOTAL_BYTES` / `DEFAULT_ROLLBACK_CAP`），0 永不表示"不限"。
+     - **修掉上版带红测试发版**：v1.7.27 发布时 `tests/v1724_test.py` 是 43/47——
+       备份清理改成内联后 `_prune_backup_objects` 变成没人调用的死代码，而那个测试
+       正是靠 monkeypatch 它来验证的，于是"孤儿超删"的回归网彻底失效（4 条红但产品
+       行为是对的）。v1.7.28 删掉死代码，并把这 4 条红测试改写成**断言行为**
+       （孤儿真被删、有效版本真保留；删不掉的孤儿用 OS 级只读模拟而非 monkeypatch
+       内部函数，仍如实报出），现 51/51 全绿。
+     - `exec_enabled` 默认仍关闭；以上修正完成后才谈是否默认开。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关

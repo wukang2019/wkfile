@@ -96,7 +96,7 @@ except Exception:  # noqa: BLE001
 
 # v1.7.21：纯逻辑外提到 wkfile_core（保持本模块旧名字可用，既有调用/测试不改）
 from wkfile_core import (  # noqa: E402
-    EXEC_TIMEOUT_HARD_CAP, MIN_TOKEN_LEN, WEAK_TOKENS,
+    EXEC_TIMEOUT_HARD_CAP, MIN_TOKEN_LEN, PATCH_MAX_TOTAL_BYTES, WEAK_TOKENS,
     _strip_json_comments, decode_text, exec_timeout_cap, expiry_state,
     expiry_text, expiry_text_of, human_remain, human_size, is_loopback_bind,
     is_private_ip, looks_binary, make_expiry, norm, now_iso, parse_expiry,
@@ -108,7 +108,7 @@ from wkfile_core import (  # noqa: E402
     SAFETY_BOOL_KEYS, SAFETY_LIST_KEYS,
 )
 
-VERSION = "1.7.27"
+VERSION = "1.7.28"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1543,6 +1543,9 @@ class Agent:
         self.audit = Audit(cfg)
         self.fail_lock = threading.Lock()
         self.failures: dict[str, list[float]] = {}
+        # v1.7.28：配置热加载对非法/需规范化值的处理记录。会进 win_probe
+        # 与 /api/health，不能再像以前那样只躺在运行日志里。
+        self._hotload_warnings: list[dict] = []
         # 启动时先把超限/超龄的备份与回收站清一遍（此后靠节流触发）
         try:
             self.cleanup_backups()
@@ -1748,34 +1751,6 @@ class Agent:
         self._dedup_hits = getattr(self, "_dedup_hits", 0) + 1
         self._dedup_saved_bytes = getattr(self, "_dedup_saved_bytes", 0) + size
         return True
-
-    def _prune_backup_objects(self) -> int:
-        """清掉没有任何历史版本引用的内容实体（nlink==1 即孤儿）。
-
-        时间戳目录被保留策略删掉后，实体还占着磁盘；只在节流的清理周期
-        里扫一次，避免每次写入都遍历对象库。
-        """
-        objects = os.path.join(backup_root(self.cfg.base_dir), ".objects")
-        if not os.path.isdir(objects):
-            return 0
-        removed = 0
-        for bucket in os.listdir(objects):
-            d = os.path.join(objects, bucket)
-            if not os.path.isdir(d):
-                continue
-            for name in os.listdir(d):
-                p = os.path.join(d, name)
-                try:
-                    if os.path.isfile(p) and os.stat(p).st_nlink <= 1:
-                        os.remove(p)
-                        removed += 1
-                except OSError:
-                    continue
-            try:
-                os.rmdir(d)          # 空桶才删得掉，非空说明还有引用
-            except OSError:
-                pass
-        return removed
 
     def dedup_stats(self) -> dict:
         return {
@@ -2130,7 +2105,7 @@ class Agent:
         planned, errors = patch_plan(
             changes,
             max_files=int(getattr(self.cfg, "patch_max_files", 20) or 20),
-            max_total_bytes=int(getattr(self.cfg, "patch_max_total_bytes", 0) or 0),
+            max_total_bytes=self._patch_max_total_bytes(self.cfg),
         )
         results = []
         for ch in planned:
@@ -2172,6 +2147,18 @@ class Agent:
             except OSError:
                 continue
         return restored
+
+    @staticmethod
+    def _patch_max_total_bytes(cfg) -> int:
+        """patch_max_total_bytes 的「0/负数 → 回退内置默认」处理。
+
+        v1.7.28：此前 0 表示「不限」，而同源的 patch_max_rollback_bytes=0
+        却是「回退内置 8MB 安全上限」—— 同一个 0 两套语义，迟早有人踩。
+        现在统一为 0/负数 = 回退内置默认上限（PATCH_MAX_TOTAL_BYTES），
+        与 rollback 口径一致：0 永不表示不限。
+        """
+        raw = int(getattr(cfg, "patch_max_total_bytes", 0) or 0)
+        return raw if raw > 0 else PATCH_MAX_TOTAL_BYTES
 
     def _patch_rollback_budget(self, prepared: list[tuple]) -> int:
         """写前算清回滚要留在内存里的原文字节，超限直接拒（v1.7.22）。
@@ -2217,7 +2204,7 @@ class Agent:
         planned, errors = patch_plan(
             req.get("changes"),
             max_files=int(getattr(self.cfg, "patch_max_files", 20) or 20),
-            max_total_bytes=int(getattr(self.cfg, "patch_max_total_bytes", 0) or 0),
+            max_total_bytes=self._patch_max_total_bytes(self.cfg),
         )
         if errors:
             raise PathError("bad_request", "；".join(errors))
@@ -2344,6 +2331,14 @@ class Agent:
                 + "、".join(str(w.get("key", "?")) for w in config_warnings)
                 + "；数值键请填纯整数、不要带单位，布尔开关请写 true/false，"
                   "详见 config.layers.config_warnings（启动横幅也会打印）")
+        hotload_warnings = getattr(self, "_hotload_warnings", []) or []
+        if hotload_warnings:
+            issues.append(
+                f"配置热加载累计 {len(hotload_warnings)} 条告警（"
+                + "、".join(sorted({str(w.get("key")) for w in hotload_warnings}))
+                + "）：非法值被跳过、需规范化的写法已按布尔处理；"
+                  "详情见 config.hotload_warnings（启动后来自配置热加载，"
+                  "不写在启动横幅里）")
         if int(getattr(cfg, "patch_max_rollback_bytes", 0) or 0) <= 0:
             issues.append("patch_max_rollback_bytes 配成了 0 或负数，已回退到内置 "
                           "8MB 安全上限；该配置不支持「0=不限」，请改成正数")
@@ -2354,7 +2349,8 @@ class Agent:
             "ok": not issues,
             "version": VERSION,
             "time": now_iso(),
-            "config": {"layers": layers, "file_exists": os.path.isfile(cfg.config_path)},
+            "config": {"layers": layers, "file_exists": os.path.isfile(cfg.config_path),
+                       "hotload_warnings": hotload_warnings},
             "roots": roots,
             "audit": audit,
             "backup": {"path": "<redacted>" if redacted else bdir,
@@ -3913,43 +3909,65 @@ class Agent:
         for key in self._EXEC_HOT_KEYS:
             if key not in data or key in overridden:
                 continue
-            ok, why = self._validate_hot_key(key, data[key])
-            if ok:
-                setattr(self.cfg, key, data[key])
-            else:
-                # v1.7.27：热加载绝不静默套用非法值。exec_strict_chain 写 null
-                # 会被 op_exec 当成 False 静默关掉严格链（安全降级）；
-                # exec_allowed_commands 写成数字会让 `for c in ...` 抛 TypeError
-                # 导致 /api/exec 直接 500 —— 两类都是「改了配置反而更危险」的
-                # 退化，必须丢弃并保留上次生效值，同时打告警到运行日志。
+            ok, why, value, normalized = self._validate_hot_key(key, data[key])
+            if not ok:
+                # v1.7.28：非法值绝不套用，丢弃并保留上次生效值，同时记一条
+                # 可被 win_probe / /api/health 看到的告警（不能只躺在 run log）。
                 sys.stderr.write(
                     "[wkfile] 配置热加载跳过非法键 %s：%s，保留上次生效值\n"
                     % (key, why))
+                self._record_hotload_warning({
+                    "key": key, "action": "skipped", "reason": why,
+                    "message": "配置热加载跳过非法值 %s，保留上次生效值" % key,
+                })
+                continue
+            # v1.7.28：先按 coerce_safety_bool 规范化再写，绝不把原始值直接
+            # setattr。此前 exec_strict_chain 写 0 被当成 False 静默关链、写
+            # "false" 被当成真值字符串静默开链，两个方向都不出声，比 v1.7.26
+            # 的 null 更隐蔽；规范化后写布尔值，且规范化动作本身也要告警
+            # （进 health/probe），不能再只躺在运行日志里。
+            setattr(self.cfg, key, value)
+            if normalized:
+                sys.stderr.write(
+                    "[wkfile] 配置热加载将 %s 的值规范化为 %s（原写法 %r 非标准），"
+                    "请确认是否符合预期\n" % (key, value, data[key]))
+                self._record_hotload_warning({
+                    "key": key, "action": "coerced", "to": value,
+                    "message": "配置热加载将 %s 的值规范化为 %s" % (key, value),
+                })
+
+    def _record_hotload_warning(self, info: dict) -> None:
+        """累计配置热加载的告警，供 win_probe / /api/health 读取。"""
+        lst = getattr(self, "_hotload_warnings", None)
+        if lst is None:
+            lst = self._hotload_warnings = []
+        lst.append(info)
 
     @staticmethod
-    def _validate_hot_key(key: str, val) -> tuple[bool, str]:
-        """热加载字段的类型守门：非法值返回 (False, 原因)，绝不套用。
+    def _validate_hot_key(key: str, val) -> tuple[bool, str, object, bool]:
+        """热加载字段的类型守门：返回 (是否合法, 原因, 应写入的值, 是否做了规范化)。
 
-        v1.7.27：此前直接 setattr，于是 exec_strict_chain 写 null 会被 op_exec
-        的 `if getattr(..., 'exec_strict_chain', False)` 当成 False，严格链静默
-        关闭；exec_allowed_commands 写成数字会让 `for c in ...` 抛 TypeError 导致
-        /api/exec 500。这些热加载字段都来自运维手改的配置，必须有类型守门，
-        非法就丢弃并保留上次生效值（绝不猜一个默认值继续跑）。
+        v1.7.28：此前只「丢弃认不出的值」，但认得出却类型不对的会原样 setattr
+        —— exec_strict_chain 写 0 被当成 False 静默关链、写 "false" 被当成真值
+        字符串静默开链，两个方向都不出声，比 v1.7.26 的 null 更隐蔽。现在一律
+        先 coerce_safety_bool 规范化再返回「应写入的布尔值」，规范化动作本身也
+        要告警（进 health/probe）。exec_allowed_commands / 三个超时键不做规范化，
+        合法时原值返回、normalized=False。
         """
         if key == "exec_strict_chain":
-            coerced, _ = coerce_safety_bool(val)
+            coerced, normalized = coerce_safety_bool(val)
             if coerced is None:
-                return False, "安全开关必须是 true/false（不能是 null 或字符串）"
-            return True, ""
+                return False, "安全开关必须是 true/false（不能是 null 或非 0/1 整数）", None, False
+            return True, "", coerced, normalized
         if key == "exec_allowed_commands":
             if not isinstance(val, list) or \
                     not all(isinstance(x, str) for x in val):
-                return False, "必须是字符串数组（如 [\"php\", \"composer\"]）"
-            return True, ""
+                return False, "必须是字符串数组（如 [\"php\", \"composer\"]）", None, False
+            return True, "", val, False
         # exec_timeout_sec / exec_timeout_max_sec / exec_max_output_bytes：正整数
         if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
-            return False, "必须是正整数"
-        return True, ""
+            return False, "必须是正整数", None, False
+        return True, "", val, False
 
     @staticmethod
     def _exec_preview(output: str, output_file: str | None, max_out: int,
@@ -4965,6 +4983,15 @@ class Handler(BaseHTTPRequestHandler):
                 "count": len(cw),
                 "keys": [w["key"] for w in cw],
                 "hint": "普通数值已回退默认值 / 安全开关已严格解析，详见 win_probe（需鉴权）",
+            }
+        # v1.7.28：配置热加载的告警（非法跳过 / 需规范化）也不能只躺在日志里，
+        # 它是启动后唯一会改变 exec 安全开关的通道，运维不查 win_probe 就永远不知道。
+        hlw = getattr(self.agent, "_hotload_warnings", None) or []
+        if hlw:
+            out["hotload_warnings"] = {
+                "count": len(hlw),
+                "keys": sorted({str(w.get("key")) for w in hlw}),
+                "hint": "配置热加载对非法/需规范化的值做了处理，详情见 win_probe（需鉴权）",
             }
         return out
 

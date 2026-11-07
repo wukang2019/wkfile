@@ -574,3 +574,20 @@ win_* 工具（win_ 前缀表示"Windows 上的操作"，与产品名无关；
   * 8788 端口        —— 内置默认值而已，你实际用 10087。
   * 旧名 WinFile / agent.config.json / .winfile-backups —— 1.5.1 已统一改成
                        wkfile / wkfile.config.json / wkfile\backups。
+
+
+----------------------------------------
+附：版本更新说明（与 README.md 对齐）
+----------------------------------------
+
+  * v1.7.27 / v1.7.28 的关键变更（本说明书随包发布，跟着版本走）：
+    - 备份兜底：backup_required（默认 false）改成 true 后，即使 AI 在请求里传
+      backup=false 想跳过写前备份，服务端也强制先备份再写，关不掉这个兜底；
+      备份只能由运维在服务器上清，AI 没有删除备份的权限（见上方 ② 备份兜底）。
+    - 配置热加载（exec 参数）现在对"认得出但写法不规范"的值会规范化并告警：
+      exec_strict_chain 写 0 / "false" 一律按布尔处理（0=false、"false"=false），
+      且告警会进 win_probe 与免鉴权的 /api/health，不再只躺在运行日志里。
+    - patch_max_total_bytes 与 patch_max_rollback_bytes 的 0 语义已统一：
+      0 / 负数 = 回退内置 8MB 安全上限（0 不再表示"不限"），两个补丁键口径一致。
+    - port 脏值（null / 字符串 / 越界）直接拒绝启动；host 脏值回退 0.0.0.0 并告警。
+    - exec_enabled 默认仍关闭，开启需显式配置并重启服务。

@@ -144,35 +144,63 @@ def test_orphan_no_overdelete():
 
 
 def test_prune_failed_fallback():
-    print("\n========== 2. prune 失败（权限/竞态）时也不能拿有效备份陪葬 ==========")
-    base = tempfile.mkdtemp(prefix="wk-noprune24-")
+    print("\n========== 2. 孤儿回收：正常删得掉就删；删不掉也不拿有效备份陪葬且如实报 ==========")
+    # A. 正常回收路径：孤儿被内联清理直接删掉，有效版本一份不丢，额度里不含孤儿。
+    #    （这条断言行为、不 monkeypatch 内部函数——回归网只验证真实动作。）
+    base = tempfile.mkdtemp(prefix="wk-prune24a-")
+    try:
+        share, broot, orphan = make_orphan_scenario(base)
+        a, _cfg = make_agent(base, share, backup_max_bytes=1500000,
+                             backup_dedup=True)
+        check("正常清理回收孤儿实体（不再白占额度）", not os.path.isfile(orphan))
+        check("正常清理两个有效版本都还在", len(stamps_of(broot)) == 2)
+        pol = a._backup_policy()
+        check("回收后 orphan_objects 归零", int(pol.get("orphan_objects", 0)) == 0,
+              str(pol.get("orphan_objects")))
+        check("回收后 physical_bytes 不含孤儿", pol["physical_bytes"] < 1000,
+              str(pol["physical_bytes"]))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    # B. 删除失败路径（权限/竞态）：用 OS 级只读让 os.remove 抛错，模拟 prune
+    #    失败，而不是 monkeypatch 内部函数。失败时必须：孤儿仍在磁盘上、有效
+    #    版本一份不删、物理占用不含孤儿、且 policy / 文本块如实报出孤儿。
+    base = tempfile.mkdtemp(prefix="wk-prune24b-")
     try:
         share, broot, orphan = make_orphan_scenario(base)
         a, cfg = make_agent(base, share, backup_max_bytes=0)  # 启动不删版本
-        # 启动清理本身就会回收孤儿；这里重新投放一份，模拟「prune 因权限或
-        # 竞态完全失败、孤儿仍然残留」的最坏情况。不这么做上面那条断言是假绿。
+        # 启动清理本身会回收孤儿；重新投放一份并设为只读，模拟「删不掉」的最坏情况
         put_raw(orphan, b"O" * (2 << 20))
-        cfg.backup_max_bytes = 1500000
-        a._prune_backup_objects = lambda: 0   # 模拟 prune 完全失败
-        a.cleanup_backups()
-        left = stamps_of(broot)
-        check("prune 失败时有效版本仍全部保留", len(left) == 2, "剩余 %s" % left)
-        check("孤儿本身仍在（没权限删，但不能算进额度）",
-              os.path.isfile(orphan))
-        pol = a._backup_policy()
-        check("physical_bytes 排除删不掉的孤儿",
-              pol["physical_bytes"] < 1000, str(pol["physical_bytes"]))
-        check("不可回收占用被如实报出来",
-              int(pol.get("unreclaimable_bytes", 0)) >= (2 << 20),
-              str(pol.get("unreclaimable_bytes")))
-        check("孤儿个数被如实报出来",
-              int(pol.get("orphan_objects", 0)) == 1,
-              str(pol.get("orphan_objects")))
-        json_safe("带孤儿告警的 policy 可序列化", pol)
-        rendered = m.render("win_backup_list", a.op_backup_list({}))
-        check("文本块如实报出孤儿且不虚报删除",
-              "无版本引用的内容实体" in rendered
-              and "按策略会清掉 0 份" in rendered, rendered[:240])
+        try:
+            os.chmod(orphan, 0o444)   # Windows/Linux 下 os.remove 会变 PermissionError
+        except OSError:
+            pass
+        try:
+            cfg.backup_max_bytes = 1500000
+            a.cleanup_backups()
+            left = stamps_of(broot)
+            check("孤儿删不掉时仍在（不虚报删除）", os.path.isfile(orphan))
+            check("孤儿删不掉时有效版本仍全部保留", len(left) == 2, "剩余 %s" % left)
+            pol = a._backup_policy()
+            check("physical_bytes 排除删不掉的孤儿",
+                  pol["physical_bytes"] < 1000, str(pol["physical_bytes"]))
+            check("不可回收占用被如实报出来",
+                  int(pol.get("unreclaimable_bytes", 0)) >= (2 << 20),
+                  str(pol.get("unreclaimable_bytes")))
+            check("孤儿个数被如实报出来",
+                  int(pol.get("orphan_objects", 0)) == 1,
+                  str(pol.get("orphan_objects")))
+            json_safe("带孤儿告警的 policy 可序列化", pol)
+            rendered = m.render("win_backup_list", a.op_backup_list({}))
+            check("文本块如实报出孤儿且不虚报删除",
+                  "无版本引用的内容实体" in rendered
+                  and "按策略会清掉 0 份" in rendered, rendered[:240])
+        finally:
+            # 还原权限，否则外层 rmtree 在只读文件上可能失败
+            try:
+                os.chmod(orphan, 0o666)
+            except OSError:
+                pass
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
