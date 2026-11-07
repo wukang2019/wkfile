@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import json
 import secrets
 import socket
 import subprocess
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -202,6 +204,91 @@ def health_probe(port: int, first: str, timeout: float):
 STATUS_MIN_INTERVAL = 0.4
 
 
+def read_audit_tail(path: str, max_lines: int = 400,
+                    max_bytes: int = 131072) -> tuple:
+    """只读审计日志尾部，避免整份加载（日志可能几十 MB）。
+
+    返回 (records, truncated)；truncated=True 表示没看全，统计只代表尾部样本。
+    坏行（写了一半的行、编码错）直接跳过，不能让一条坏记录弄崩界面。
+    """
+    if not path or not os.path.isfile(path):
+        return [], False
+    try:
+        size = os.path.getsize(path)
+        start = max(0, size - max_bytes)
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            raw = fh.read()
+    except OSError:
+        return [], True
+    lines = raw.splitlines()
+    truncated = start > 0
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+    if start > 0 and lines:
+        lines = lines[1:]  # 起点可能落在一行中间，丢掉半行
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out, truncated
+
+
+def _audit_time(rec: dict):
+    try:
+        dt = datetime.fromisoformat(str(rec.get("ts") or ""))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def summarize_runtime(audit_path: str, window_sec: int = 3600,
+                      tail_lines: int = 400, now: datetime = None) -> dict:
+    """汇总本地审计尾部，给 GUI「运行状态」区用。
+
+    纯函数、不发网络请求、不读 Tk 变量，可安全放进工作线程 / 单测。
+    """
+    now = now or datetime.now()
+    recs, truncated = read_audit_tail(audit_path, tail_lines)
+    cutoff = now - timedelta(seconds=window_sec)
+    recent = []
+    for rec in recs:
+        stamp = _audit_time(rec)
+        if stamp is not None and stamp >= cutoff:
+            recent.append(rec)
+    auth_fail = sum(1 for r in recent
+                    if r.get("op") == "auth" and not r.get("ok"))
+    failed = sum(1 for r in recent if not r.get("ok"))
+    last = []
+    for rec in list(reversed(recs[-3:])):
+        stamp = _audit_time(rec)
+        hhmmss = stamp.strftime("%H:%M:%S") if stamp else "--:--:--"
+        op = str(rec.get("op") or "?")
+        detail = str(rec.get("command") or rec.get("sql")
+                     or rec.get("path") or "").replace("\\", "/")
+        if len(detail) > 42:
+            detail = "…" + detail[-41:]
+        state = "OK" if rec.get("ok") else "FAIL"
+        if rec.get("error"):
+            state += ":" + str(rec["error"])
+        last.append("%s  %-10s %-26s %s" % (hhmmss, op, state, detail))
+    return {
+        "recent_total": len(recent),
+        "auth_fail": auth_fail,
+        "failed": failed,
+        "last": last,
+        "truncated": truncated,
+        "has_log": bool(recs),
+    }
+
+
 def enable_dpi_awareness() -> None:
     if sys.platform != "win32":
         return
@@ -247,6 +334,63 @@ def ensure_stdio(path: str = "", config_path: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
+class _Notifier:
+    """统一提示出口（v1.7.15）。
+
+    「精简弹窗」开启时，成功 / 信息 / 一般警告只落到常驻状态条 + 日志，
+    不再弹模态框打断批量操作；错误与破坏性确认永远弹窗，避免漏看。
+    所有调用都发生在主线程（异步结果也先 after(0) 回来），不碰 Tk 线程安全。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    def _quiet(self) -> bool:
+        try:
+            return bool(self.app.var_quiet.get())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _to_hint(self, msg, level):
+        text = str(msg)
+        # 长说明（比如自签证书生成结果）全文进日志区，状态条只留首行摘要，
+        # 否则单行状态条会被多行文本撑坏。
+        short = (text.splitlines()[0].strip()[:80] if text else "") or "完成"
+        try:
+            self.app.log(text, level)  # log() 内部会写一次状态条
+            self.app.set_hint(short, level)  # 用摘要覆盖掉，避免长文挤进状态条
+        except Exception:  # noqa: BLE001
+            pass
+        return "ok"
+
+    def report(self, kind: str, title: str, msg: str, level: str = "ok", **kw):
+        """结果类提示的唯一出口：日志/状态条恒有，精简模式下不弹窗。
+
+        调用方不要再额外 log 一次，否则日志里会出现两行相同内容。
+        """
+        self._to_hint(msg, level)
+        if self._quiet():
+            return "ok"
+        fn = getattr(messagebox, kind, messagebox.showinfo)
+        return fn(title, msg, **kw)
+
+    def showinfo(self, title, msg, **kw):
+        if self._quiet():
+            return self._to_hint(msg, "ok")
+        return messagebox.showinfo(title, msg, **kw)
+
+    def showwarning(self, title, msg, **kw):
+        if self._quiet():
+            return self._to_hint(msg, "warn")
+        return messagebox.showwarning(title, msg, **kw)
+
+    def showerror(self, title, msg, **kw):
+        return messagebox.showerror(title, msg, **kw)
+
+    def askyesno(self, title, msg, **kw):
+        return messagebox.askyesno(title, msg, **kw)
+
+
 class Wizard:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -288,6 +432,12 @@ class Wizard:
         self.var_audit_mb = tk.StringVar(value="5")
         self.var_runlog_mb = tk.StringVar(value="2")
         self.var_status = tk.StringVar(value="● 状态未知")
+        # v1.7.15：常驻运行态视图（按需刷新，不轮询）+ 精简弹窗开关
+        self.var_runtime_head = tk.StringVar(value="● 状态读取中…")
+        self.var_runtime_stats = tk.StringVar(value="—")
+        self.var_runtime_tail = tk.StringVar(value="（暂无审计记录）")
+        self.var_quiet = tk.BooleanVar(value=True)
+        self.msg = _Notifier(self)
         self.var_puburl = tk.StringVar()
         self.var_hint = tk.StringVar(value="就绪。配置完成后依次点「保存配置」→「启动服务」。")
         # ---- 数据库页（④）----
@@ -327,7 +477,7 @@ class Wizard:
             return wa.load_config(CONFIG_PATH)
         except ValueError as exc:
             try:
-                messagebox.showerror(
+                self.msg.showerror(
                     "配置文件有语法错误",
                     f"读取 {CONFIG_PATH} 失败：\n\n{exc}\n\n"
                     "通常是手改时少了逗号/引号，或 // 注释后面还写了别的字。\n"
@@ -483,8 +633,34 @@ class Wizard:
     def _tab_basic(self) -> ttk.Frame:
         outer, f = self._scroll_tab()
 
+        # ---- v1.7.15：常驻运行态 --------------------------------------
+        # 部署/排障时第一眼要看的东西。数据全部来自本机审计日志与 PID 文件，
+        # 复用 refresh_status 的后台线程，按需刷新、绝不自动轮询。
+        rt = ttk.LabelFrame(f, text=" 运行状态（按需刷新，不自动轮询） ", padding=(12, 10))
+        rt.pack(fill="x")
+        r0 = ttk.Frame(rt)
+        r0.pack(fill="x")
+        ttk.Label(r0, textvariable=self.var_runtime_head,
+                  font=(FONT, 10, "bold")).pack(side="left")
+        ttk.Button(r0, text="刷新状态", width=10,
+                   command=self.refresh_status).pack(side="right")
+        ttk.Label(rt, textvariable=self.var_runtime_stats,
+                  foreground="#444", justify="left").pack(anchor="w", pady=(6, 0))
+        self.lbl_runtime_tail = ttk.Label(
+            rt, textvariable=self.var_runtime_tail, justify="left", anchor="w",
+            font=(MONO, 9), foreground="#555")
+        self.lbl_runtime_tail.pack(fill="x", pady=(4, 0))
+        r1 = ttk.Frame(rt)
+        r1.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(
+            r1, text="精简弹窗（成功/提示只进状态条，不打断批量操作；错误与确认仍弹窗）",
+            variable=self.var_quiet,
+        ).pack(side="left")
+        ttk.Label(rt, text="数据来源：本机审计日志 + PID 文件；不发起额外网络请求，也不做后台轮询。",
+                  foreground="#888", justify="left").pack(anchor="w", pady=(4, 0))
+
         g1 = ttk.LabelFrame(f, text=" 监听地址 ", padding=(12, 10))
-        g1.pack(fill="x")
+        g1.pack(fill="x", pady=(12, 0))
         row = ttk.Frame(g1)
         row.pack(fill="x")
         ttk.Label(row, text="监听地址：").pack(side="left")
@@ -1692,12 +1868,12 @@ class Wizard:
         try:
             form = self.collect()
         except ValueError as exc:
-            messagebox.showerror("配置有误", str(exc), parent=self.root)
+            self.msg.showerror("配置有误", str(exc), parent=self.root)
             return False
 
         if not form["roots"]:
             if not silent:
-                messagebox.showwarning(
+                self.msg.showwarning(
                     "缺少目录",
                     "请先在「基础设置」页添加至少一个允许操作的目录。",
                     parent=self.root,
@@ -1724,7 +1900,7 @@ class Wizard:
         try:
             cfg.save()
         except OSError as exc:
-            messagebox.showerror("保存失败", f"写配置失败：{exc}", parent=self.root)
+            self.msg.showerror("保存失败", f"写配置失败：{exc}", parent=self.root)
             return False
 
         missing = [r for r in cfg.roots if not os.path.isdir(r)]
@@ -1788,12 +1964,12 @@ class Wizard:
         except ValueError:
             msg = f"端口「{raw}」不是数字，请填 1-65535 之间的整数"
             self.log(msg, "err")
-            messagebox.showerror("端口无效", msg, parent=self.root)
+            self.msg.showerror("端口无效", msg, parent=self.root)
             return
         if not (1 <= port <= 65535):
             msg = f"端口 {port} 超出范围，请填 1-65535"
             self.log(msg, "err")
-            messagebox.showerror("端口无效", msg, parent=self.root)
+            self.msg.showerror("端口无效", msg, parent=self.root)
             return
 
         if self._portcheck_busy:
@@ -1828,10 +2004,9 @@ class Wizard:
             self.set_hint("端口检查失败，详见日志", "err")
             return
         if not owners and not reachable:
-            msg = f"端口 {port} 空闲可用，直接用它就行。"
-            self.log(msg, "ok")
-            self.set_hint(msg, "ok")
-            messagebox.showinfo("端口检查", msg, parent=self.root)
+            self.msg.report("showinfo", "端口检查",
+                            f"端口 {port} 空闲可用，直接用它就行。", "ok",
+                            parent=self.root)
             return
 
         who = (
@@ -1841,17 +2016,13 @@ class Wizard:
         )
         if reachable:
             msg = f"端口 {port} 正在被本服务使用：{who}。健康检查通过，属于正常情况。"
-            self.log(msg, "ok")
-            self.set_hint(msg, "ok")
-            messagebox.showinfo("端口检查", msg, parent=self.root)
+            self.msg.report("showinfo", "端口检查", msg, "ok", parent=self.root)
         else:
             msg = f"端口 {port} 已被占用：{who}。请换一个端口，或先结束该进程。"
-            self.log(msg, "err")
-            self.set_hint(msg, "err")
             if owners:
                 pids = "、".join(str(p) for p, _ in owners)
                 self.log(f"   结束办法：任务管理器 → 详细信息 → 按 PID {pids} 找到进程 → 右键结束任务")
-            messagebox.showwarning("端口检查", msg, parent=self.root)
+            self.msg.report("showwarning", "端口检查", msg, "err", parent=self.root)
 
     def cmd_add_root(self) -> None:
         d = filedialog.askdirectory(title="选择允许 AI 操作的目录", parent=self.root)
@@ -1868,7 +2039,7 @@ class Wizard:
     def cmd_del_root(self) -> None:
         sel = list(self.lst_roots.curselection())
         if not sel:
-            messagebox.showinfo("提示", "请先在列表里选中要移除的目录", parent=self.root)
+            self.msg.showinfo("提示", "请先在列表里选中要移除的目录", parent=self.root)
             return
         for i in reversed(sel):
             self.lst_roots.delete(i)
@@ -1884,9 +2055,9 @@ class Wizard:
         try:
             days = self._ttl_days()
         except ValueError as exc:
-            messagebox.showerror("有效期有误", str(exc), parent=self.root)
+            self.msg.showerror("有效期有误", str(exc), parent=self.root)
             return
-        if not messagebox.askyesno(
+        if not self.msg.askyesno(
             "重新生成 Token",
             "生成新 Token 后，客户端（跑 MCP 的那台机器）的旧 Token 会立即失效，\n"
             "需要重新把新 Token 填过去。确定继续？",
@@ -2048,7 +2219,7 @@ class Wizard:
             return
         key_path = os.path.splitext(path)[0] + ".key"
         if os.path.exists(path) or os.path.exists(key_path):
-            if not messagebox.askyesno(
+            if not self.msg.askyesno(
                 "覆盖确认",
                 f"下面这些文件已存在，继续会覆盖：\n\n{path}\n{key_path}\n\n确定要覆盖吗？",
                 parent=self.root,
@@ -2109,7 +2280,7 @@ class Wizard:
         self.log(f"自签证书已生成（用时 {spent:.1f} 秒）：{cert_path}", "ok")
         self.log(f"  私钥：{key_path}（不要外传）")
         if ok:
-            messagebox.showinfo(
+            self.msg.showinfo(
                 "自签证书已生成",
                 "证书和私钥都已生成并填入本页，检查通过。\n\n"
                 f"证书：{cert_path}\n"
@@ -2119,7 +2290,7 @@ class Wizard:
                 parent=self.root,
             )
         else:
-            messagebox.showwarning(
+            self.msg.showwarning(
                 "自签证书已生成，但检查未通过",
                 "证书已生成并填入本页，但配对检查没通过，详见下方日志。",
                 parent=self.root,
@@ -2145,7 +2316,7 @@ class Wizard:
         try:
             days = self._ttl_days()
         except ValueError as exc:
-            messagebox.showerror("有效期有误", str(exc), parent=self.root)
+            self.msg.showerror("有效期有误", str(exc), parent=self.root)
             return
         self.var_token_exp.set(wa.make_expiry(days))
         self._refresh_token_exp_label()
@@ -2193,11 +2364,13 @@ class Wizard:
         return health_probe(port, first, timeout)
 
     def refresh_status(self) -> None:
-        """异步刷新状态：网络探测在工作线程，界面绝不被等待冻住。
+        """异步刷新状态：网络探测与审计汇总在工作线程，界面绝不被等待冻住。
 
         v1.7.14：原先 health()（最坏 1.5s × 2 种协议）同步跑在 Tk 主线程，
         端口不通时点一下「刷新状态」就白屏 3 秒。现在探测挪走，并加
         in-flight 去重 + 最小间隔节流，连点不会排队叠加请求。
+        v1.7.15：同一次后台任务顺带汇总本地审计尾部，喂给常驻运行态视图；
+        不额外起线程、不额外发请求、也不引入任何自动轮询。
         """
         if self._status_busy:
             self._status_pending = True
@@ -2213,17 +2386,34 @@ class Wizard:
         except (ValueError, tk.TclError):
             port = 0
         try:
+            host = str(self.var_host.get()).strip()
             first = "https" if self.var_tls_on.get() else "http"
         except tk.TclError:
-            first = "http"
+            host, first = "", "http"
+        try:
+            audit_path = self._audit_path()
+        except Exception:  # noqa: BLE001
+            audit_path = ""
+        pid_path = PID_PATH
 
         def worker() -> None:
             try:
-                ok, _detail = health_probe(port, first, 1.5) if port else (False, "")
+                ok, detail = health_probe(port, first, 1.5) if port else (False, "")
             except Exception:  # noqa: BLE001 —— 探测异常一律按「未运行」呈现
-                ok = False
+                ok, detail = False, ""
             try:
-                self.root.after(0, lambda: self._apply_status(ok))
+                snap = summarize_runtime(audit_path)
+            except Exception as exc:  # noqa: BLE001
+                snap = {"error": str(exc), "last": [], "has_log": False}
+            pid = 0
+            try:
+                with open(pid_path, "r", encoding="utf-8") as fh:
+                    pid = int(fh.read().strip() or 0)
+            except (OSError, ValueError):
+                pass
+            try:
+                self.root.after(0, lambda: self._apply_status(
+                    ok, snap, host, port, first, pid, detail))
             except (tk.TclError, RuntimeError):
                 # 窗口已经关掉：没有界面可更新，把闸门放开即可。
                 self._status_busy = False
@@ -2231,8 +2421,10 @@ class Wizard:
 
         threading.Thread(target=worker, daemon=True, name="wk-status").start()
 
-    def _apply_status(self, ok: bool) -> None:
-        """工作线程探测结束后回到主线程改界面（tkinter 不是线程安全的）。"""
+    def _apply_status(self, ok: bool, snap: dict = None, host: str = "",
+                      port: int = 0, scheme: str = "http", pid: int = 0,
+                      detail: str = "") -> None:
+        """工作线程跑完后回到主线程改界面（tkinter 不是线程安全的）。"""
         self._status_busy = False
         if ok:
             self.var_status.set("● 正在运行")
@@ -2241,11 +2433,40 @@ class Wizard:
             self.var_status.set("● 未运行")
             self.lbl_status.configure(foreground="#b3261e")
         self._refresh_audit_size()
+        self._render_runtime(ok, snap or {}, host, port, scheme, pid, detail)
         # 探测期间又点了刷新：合并成一次补刷，不丢结果也不排队。
         if self._status_pending:
             self._status_pending = False
             self.root.after(int(STATUS_MIN_INTERVAL * 1000) + 20,
                             self.refresh_status)
+
+    def _render_runtime(self, ok: bool, snap: dict, host: str, port: int,
+                        scheme: str, pid: int, detail: str) -> None:
+        """把运行态快照写进页①的常驻区（只从主线程调用）。"""
+        version = ""
+        try:
+            v = str(json.loads(detail).get("version") or "")
+            version = " · v" + v if v else ""
+        except (ValueError, TypeError, AttributeError):
+            pass
+        where = "%s:%s (%s)" % (host or "127.0.0.1", port or "?", scheme)
+        suffix = (" · PID %d" % pid) if (pid and ok) else ""
+        self.var_runtime_head.set(
+            ("● 正在运行" if ok else "● 未运行") + version
+            + " · 监听 " + where + suffix)
+        if snap.get("error"):
+            self.var_runtime_stats.set("审计日志读取失败（详见运行日志）")
+        elif not snap.get("has_log"):
+            self.var_runtime_stats.set("近 1 小时：暂无审计记录")
+        else:
+            scope = ("近 1 小时" if not snap.get("truncated")
+                     else "近 1 小时（仅尾部样本）")
+            self.var_runtime_stats.set(
+                "%s：请求 %d 次 · 失败 %d 次 · 失败鉴权 %d 次"
+                % (scope, snap.get("recent_total", 0), snap.get("failed", 0),
+                   snap.get("auth_fail", 0)))
+        self.var_runtime_tail.set(
+            "\n".join(snap.get("last") or []) or "（暂无审计记录）")
 
     def cmd_start(self) -> None:
         if self.busy:
@@ -2264,7 +2485,7 @@ class Wizard:
                 "解决：去「安全」页点「生成」换一个随机 Token，再启动。"
             )
             self.log("拒绝启动：" + msg.splitlines()[0], "err")
-            messagebox.showerror("拒绝启动", msg, parent=self.root)
+            self.msg.showerror("拒绝启动", msg, parent=self.root)
             self.nb.select(1)
             return
         ro_token = str(getattr(cfg, "readonly_token", "") or "")
@@ -2277,7 +2498,7 @@ class Wizard:
                     "解决：去「安全」页的「只读 Token」栏点「生成」换一个随机的再启动。"
                 )
                 self.log("拒绝启动：" + msg.splitlines()[0], "err")
-                messagebox.showerror("拒绝启动", msg, parent=self.root)
+                self.msg.showerror("拒绝启动", msg, parent=self.root)
                 self.nb.select(1)
                 return
         if (
@@ -2292,7 +2513,7 @@ class Wizard:
                 "如果只是让 AI 帮你「看」代码，建议勾上「只读模式」。\n\n"
                 "仍要继续启动吗？（本次运行不再重复询问）"
             )
-            if not messagebox.askyesno("确认高风险配置", msg, parent=self.root):
+            if not self.msg.askyesno("确认高风险配置", msg, parent=self.root):
                 self.log("已取消启动（高风险配置未确认）", "warn")
                 return
             self._danger_ack = True
@@ -2312,8 +2533,8 @@ class Wizard:
         if owners:
             who = "、".join(f"{n}（PID {p}）" for p, n in owners)
             msg = f"端口 {port} 已被 {who} 占用，换一个端口再启动。"
-            self.log(msg, "err")
-            messagebox.showwarning("端口被占用", msg, parent=self.root)
+            self.msg.report("showwarning", "端口被占用", msg, "err",
+                            parent=self.root)
             self.nb.select(0)
             return
 
@@ -2323,7 +2544,7 @@ class Wizard:
             subprocess.Popen(cmd, cwd=DATA_DIR, close_fds=True, creationflags=flags)
         except OSError as exc:
             self.log(f"启动失败：{exc}", "err")
-            messagebox.showerror("启动失败", str(exc), parent=self.root)
+            self.msg.showerror("启动失败", str(exc), parent=self.root)
             return
         self.log(f"已拉起服务进程：{os.path.basename(cmd[0])} --run")
         self.busy = True
@@ -2427,7 +2648,7 @@ class Wizard:
         if not self.save_config():
             return
         if not is_admin():
-            messagebox.showwarning(
+            self.msg.showwarning(
                 "需要管理员权限",
                 "安装开机自启会注册系统计划任务，请关掉本窗口，\n"
                 "右键 exe → 以管理员身份运行后再试。",
@@ -2456,11 +2677,12 @@ class Wizard:
             ]
         )
         if r.returncode == 0:
-            self.log(f"开机自启已安装（计划任务 {TASK_NAME}）", "ok")
-            messagebox.showinfo("完成", f"已安装开机自启计划任务：{TASK_NAME}", parent=self.root)
+            self.msg.report("showinfo", "完成",
+                            f"开机自启已安装（计划任务 {TASK_NAME}）", "ok",
+                            parent=self.root)
         else:
             self.log(f"安装失败（{r.returncode}）：{(r.stdout or r.stderr).strip()[:300]}", "err")
-            messagebox.showerror(
+            self.msg.showerror(
                 "安装失败",
                 f"schtasks 返回 {r.returncode}\n{(r.stdout or r.stderr).strip()[:400]}",
                 parent=self.root,
@@ -2468,7 +2690,7 @@ class Wizard:
 
     def cmd_uninstall_autostart(self) -> None:
         if not is_admin():
-            messagebox.showwarning(
+            self.msg.showwarning(
                 "需要管理员权限", "请以管理员身份重新运行本程序。", parent=self.root
             )
             return
@@ -2493,7 +2715,7 @@ class Wizard:
 
     def cmd_fw_add(self) -> None:
         if not is_admin():
-            messagebox.showwarning(
+            self.msg.showwarning(
                 "需要管理员权限",
                 "操作防火墙规则需要管理员权限，\n请以管理员身份重新运行本程序。",
                 parent=self.root,
@@ -2502,7 +2724,7 @@ class Wizard:
         try:
             port = int(str(self.var_port.get()).strip())
         except ValueError:
-            messagebox.showerror("端口无效", "端口必须是数字", parent=self.root)
+            self.msg.showerror("端口无效", "端口必须是数字", parent=self.root)
             return
         self._netsh(
             [
@@ -2535,7 +2757,7 @@ class Wizard:
 
     def cmd_fw_del(self) -> None:
         if not is_admin():
-            messagebox.showwarning(
+            self.msg.showwarning(
                 "需要管理员权限", "请以管理员身份重新运行本程序。", parent=self.root
             )
             return
@@ -2661,7 +2883,7 @@ class Wizard:
         if not existing:
             self.log("没有审计日志文件可清空", "warn")
             return
-        if not messagebox.askyesno(
+        if not self.msg.askyesno(
             "确认清空",
             "将删除以下审计日志文件（含历史滚动文件）：\n\n"
             + "\n".join(existing)
@@ -2802,6 +3024,23 @@ def _check_gui() -> int:
             note("状态刷新       : 异步探测 + 节流（闸门与回调齐备）")
         except Exception as exc:
             problems.append(f"状态刷新闸门检查异常: {exc}")
+        try:
+            # v1.7.15：常驻运行态视图 + 统一提示出口（精简弹窗）
+            for _field in ("var_runtime_head", "var_runtime_stats",
+                           "var_runtime_tail", "var_quiet"):
+                if not hasattr(app, _field):
+                    problems.append(f"运行态/精简弹窗变量缺失: {_field}")
+            if not app.lbl_runtime_tail.winfo_exists():
+                problems.append("运行态审计尾部控件缺失")
+            if not isinstance(getattr(app, "msg", None), _Notifier):
+                problems.append("统一提示出口未装配")
+            _snap = summarize_runtime(app._audit_path())
+            for _k in ("recent_total", "auth_fail", "failed", "last", "has_log"):
+                if _k not in _snap:
+                    problems.append(f"运行态汇总缺字段: {_k}")
+            note("运行态视图     : 变量/控件/汇总函数齐备（按需刷新，无轮询）")
+        except Exception as exc:
+            problems.append(f"运行态视图检查异常: {exc}")
         try:
             if not app.ent_ro_token.winfo_exists():
                 problems.append("只读 Token 输入框缺失")

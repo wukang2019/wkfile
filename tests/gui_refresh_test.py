@@ -4,8 +4,11 @@
 刻意不创建真实 Tk 窗口：用桩件验证「网络探测不阻塞主线程」「连点合并」
 「Tk 变量只被主线程读取」三件事，可在无桌面 / CI 环境跑。
 """
+import datetime
+import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -101,21 +104,35 @@ class FakeMessageBox:
     def showerror(self, *a, **kw):
         self._hit("err", *a, **kw)
 
+    def askyesno(self, *a, **kw):
+        self._hit("ask", *a, **kw)
+        return True
+
 
 def make_app():
     w = g.Wizard.__new__(g.Wizard)  # 跳过 __init__，不建真实窗口
     w.root = FakeRoot()
     w.var_port = FakeVar("8765")
+    w.var_host = FakeVar("0.0.0.0")
     w.var_tls_on = FakeVar(False)
     w.var_status = FakeVar("● 状态未知")
+    w.var_runtime_head = FakeVar("")
+    w.var_runtime_stats = FakeVar("")
+    w.var_runtime_tail = FakeVar("")
+    w.var_quiet = FakeVar(False)  # 默认关精简，保留弹窗路径的断言
+    w.msg = g._Notifier(w)
     w.lbl_status = FakeWidget()
     w._status_busy = False
     w._status_pending = False
     w._status_last = 0.0
     w._portcheck_busy = False
     w._refresh_audit_size = lambda: None
-    w.set_hint = lambda msg, level="info": None
-    w.log = lambda *a, **kw: None
+    w._audit_path = lambda: ""
+    w.hints = []
+    w.logs = []
+    w.set_hint = lambda msg, level="info": w.hints.append((str(msg), level))
+    w.log = lambda msg, level="info": (w.logs.append((str(msg), level)),
+                                       w.set_hint(msg, level))
     return w
 
 
@@ -275,10 +292,103 @@ def test_start_timeout():
     check("启动前检查仍保留 1.5s", 1.5 in waits, waits)
 
 
+def test_runtime_snapshot():
+    print("[5] 运行态汇总（P0，纯函数 / 只读尾部）")
+    folder = tempfile.mkdtemp(prefix="wk-rt-")
+    path = os.path.join(folder, "audit.jsonl")
+    now = datetime.datetime.now().astimezone()
+
+    def ts(minutes_ago):
+        return (now - datetime.timedelta(minutes=minutes_ago)).isoformat(
+            timespec="seconds")
+
+    recs = [
+        {"op": "read", "ok": True, "path": "D:/x/a.txt", "ts": ts(1)},
+        {"op": "auth", "ok": False, "error": "unauthorized", "path": "", "ts": ts(2)},
+        {"op": "auth", "ok": False, "error": "unauthorized", "path": "", "ts": ts(3)},
+        {"op": "write", "ok": False, "error": "denied", "path": "D:/x/b.txt", "ts": ts(4)},
+        {"op": "read", "ok": True, "path": "D:/x/old.txt", "ts": ts(200)},
+        {"op": "read", "ok": True, "path": "D:/x/last.txt", "ts": ts(0)},
+    ]
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in recs:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fh.write("BROKEN LINE\n")  # 写了一半的行不能弄崩界面
+    tail, truncated = g.read_audit_tail(path)
+    check("尾部读取跳过坏行", len(tail) == 6, len(tail))
+    check("小文件不标记截断", truncated is False)
+    snap = g.summarize_runtime(path)
+    check("近 1 小时请求数 = 5（排除 200 分钟前）",
+          snap["recent_total"] == 5, snap["recent_total"])
+    check("失败鉴权 = 2", snap["auth_fail"] == 2, snap["auth_fail"])
+    check("失败操作 = 3（含鉴权失败）", snap["failed"] == 3, snap["failed"])
+    check("尾部摘要 3 条且最新在前",
+          len(snap["last"]) == 3 and "last.txt" in snap["last"][0], snap["last"])
+    check("审计存在标记", snap["has_log"] is True)
+    check("空路径不抛异常", g.summarize_runtime("")["has_log"] is False)
+
+    big = os.path.join(folder, "big.jsonl")
+    line = json.dumps({"op": "read", "ok": True, "ts": ts(0), "path": "x"}) + "\n"
+    with open(big, "w", encoding="utf-8") as fh:
+        fh.write(line * 20000)
+    t2, trunc2 = g.read_audit_tail(big)
+    check("大文件只读尾部且标记截断",
+          trunc2 is True and 0 < len(t2) <= 400, (len(t2), trunc2))
+    check("大文件仍可读出行数", os.path.getsize(big) > 131072)
+
+
+def test_notifier():
+    print("[6] 精简弹窗（P1，统一提示出口）")
+    app = make_app()
+    box = FakeMessageBox()
+    orig = g.messagebox
+    g.messagebox = box
+    try:
+        app.var_quiet.set(True)
+        app.msg.showinfo("标题", "操作成功", parent=app.root)
+        check("精简模式不弹信息框", len(box.calls) == 0, box.calls)
+        check("精简模式写日志 + 状态条",
+              len(app.logs) == 1 and app.hints[-1][0] == "操作成功",
+              (app.logs, app.hints))
+        app.msg.showwarning("标题", "一般警告", parent=app.root)
+        check("精简模式不弹警告框", len(box.calls) == 0)
+        app.msg.showerror("标题", "出错了", parent=app.root)
+        check("错误恒弹窗", len(box.calls) == 1 and box.calls[0][0] == "err", box.calls)
+        app.msg.askyesno("标题", "确定删除？", parent=app.root)
+        check("破坏性确认恒弹窗",
+              len(box.calls) == 2 and box.calls[1][0] == "ask", box.calls)
+
+        app.hints.clear()
+        app.logs.clear()
+        long_text = "第一行摘要\n" + "第二行很长的说明" * 10
+        app.msg.showinfo("标题", long_text, parent=app.root)
+        check("长文本状态条只留首行摘要",
+              len(app.hints[-1][0]) <= 80, len(app.hints[-1][0]))
+        check("长文本全文进日志（含换行与后续行）",
+              "第二行" in app.logs[0][0] and "\n" in app.logs[0][0],
+              app.logs[0][0][:60])
+
+        app.var_quiet.set(False)
+        app.msg.showinfo("标题", "又成功了", parent=app.root)
+        check("关闭精简后恢复弹窗", len(box.calls) == 3, box.calls)
+
+        app.hints.clear()
+        app.logs.clear()
+        box.calls.clear()
+        app.var_quiet.set(True)
+        app.msg.report("showinfo", "标题", "结果消息", "ok", parent=app.root)
+        check("report 日志只写一次", len(app.logs) == 1, app.logs)
+        check("report 精简模式不弹窗", len(box.calls) == 0)
+    finally:
+        g.messagebox = orig
+
+
 if __name__ == "__main__":
     test_health_probe()
     test_refresh_async()
     test_port_check_async()
     test_start_timeout()
+    test_runtime_snapshot()
+    test_notifier()
     print("\nGUI_REFRESH_TEST: %d PASS / %d FAIL" % (PASS, FAIL))
     raise SystemExit(1 if FAIL else 0)

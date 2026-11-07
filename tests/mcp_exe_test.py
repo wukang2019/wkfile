@@ -528,11 +528,24 @@ def main():
         check("覆盖前自动备份目录已生成", os.path.isdir(bk), bk)
 
     finally:
-        proc.terminate()
+        # v1.7.15：PyInstaller onefile 是「bootloader 父进程 + 真正跑服务的子进程」。
+        # 只 terminate() 父进程会留下子进程继续监听端口、占着 dist/wkfile.exe，
+        # 下一次 PyInstaller 构建删不掉旧 exe 就直接失败。/T 杀整棵树。
         try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001 —— 源码版 / 非 Windows 下退化到下面的处理
+            pass
+        try:
+            proc.terminate()
             proc.wait(timeout=8)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     print("\n" + "=" * 62)
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

@@ -1,0 +1,32 @@
+=== wkfile 图形界面自检  v1.7.15 ===
+frozen   : True
+exe/脚本 : D:\deving\bigmodelstudy\trae-winfile\dist
+数据目录 : D:\deving\bigmodelstudy\trae-winfile\dist\wkfile
+管理员   : False
+窗口与控件创建：OK
+窗口尺寸       : 900x880 (屏幕 2560x1600)
+工具开关数量   : 34
+写前语法校验   : True
+工具目录       : 34 个（只读 21 个）
+审计轮转大小   : 5 MB
+运行日志轮转   : 2 MB
+状态刷新       : 异步探测 + 节流（闸门与回调齐备）
+运行态视图     : 变量/控件/汇总函数齐备（按需刷新，无轮询）
+只读 Token     : (未启用)
+TLS 证书       : (未启用)
+TLS 中间链     : (未设，按 fullchain 处理)
+服务器地址     : http://192.168.1.119:8788
+本机内网 IP    : 192.168.1.119
+地址改写/公网回填: OK
+数据库页(④)     : OK（增删改/回填/重名、端口与连接超时校验/collect 含 MySQL+Redis+SQL Server 全通过）
+作者署名       : 吴康 / 微信号 wukang
+页签           : ① 基础设置 | ② 安全与权限 | ③ 安装与运行 | ④ 数据库 | ⑤ 关于
+关于页(⑤)      : OK（署名/微信号回填/复制/页签计数）
+配置自动落盘   : OK（3398 字节，含 databases 示例与注释）
+状态条(操作反馈): OK
+collect()      : port=8788 host=0.0.0.0 roots=0 ips=0 token_len=48 disabled_tools=0 audit_max_bytes=5242880 run_log_max_bytes=2097152 ro_token=no tls=off tls_chain=no databases=0
+服务启动命令   : D:\deving\bigmodelstudy\trae-winfile\dist\wkfile.exe --run --config D:\deving\bigmodelstudy\trae-winfile\dist\wkfile\wkfile.config.json
+port_in_use(8788)  : False
+port_owner(8788)   : []
+配置中的目录   : (空)
+[OK] GUI 自检通过：窗口、控件、配置读写均正常
