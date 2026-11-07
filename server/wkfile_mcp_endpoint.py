@@ -590,7 +590,7 @@ TOOLS = [
     },
     {
         "name": "win_patch",
-        "description": "多文件原子补丁：全部文件预检通过才写入，任一文件失败就把已写的整体回滚。每项支持 content 整文件覆盖，或 old/new 精确替换（可带 expected_sha256 防并发覆盖）。一次改多个文件时优先用它，别逐个 win_write 留下半成品。",
+        "description": "多文件原子补丁：全部文件预检通过才写入，任一文件失败就把已写的整体回滚。每项支持 content 整文件覆盖，或 old/new 精确替换（可带 expected_sha256 防并发覆盖）。一次改多个文件时优先用它，别逐个 win_write 留下半成品。失败或超时后不要盲目重试：先用 win_read(hash=true) 对照响应里的 original_sha256，或在下一次调用带 expected_sha256 让服务端拦下对已改文件的重复应用。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -957,6 +957,10 @@ def render(tool_name: str, data: dict) -> str:
         for it in data.get("changes", []):
             lines.append(f"  {it.get('path')}  {it.get('bytes')} 字节  "
                          f"sha256={it.get('sha256')}  备份={it.get('backup') or '无'}")
+        # v1.7.22：固定一行，不随文件数增长。写前摘要放 structuredContent，
+        # 客户端重试前据此判断「这一处是不是已经改过了」。
+        lines.append("重试前先用 win_read(hash=true) 核对；各项 original_sha256 / "
+                     "original_bytes 见 structuredContent.changes。")
         return "\n".join(lines)
 
     if tool_name == "win_probe":

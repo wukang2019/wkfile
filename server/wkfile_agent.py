@@ -105,7 +105,7 @@ from wkfile_core import (  # noqa: E402
     patch_plan, strip_json_comments,
 )
 
-VERSION = "1.7.21"
+VERSION = "1.7.22"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -181,6 +181,9 @@ DEFAULT_CONFIG = {
     # v1.7.21 win_patch 单次多文件补丁的预算（纯结构预检，不碰磁盘）
     "patch_max_files": 20,
     "patch_max_total_bytes": 8 * 1024 * 1024,
+    # v1.7.22 原子回滚要在内存里留一份原文件字节：这个值同时是单文件与
+    # 单次总量的上限，写前就结清，超限直接拒（0 = 不限制，不推荐）。
+    "patch_max_rollback_bytes": 8 * 1024 * 1024,
     # 回收站保留天数：超过天数的条目整个清掉（0 = 永久保留，保持旧行为）。
     "trash_retain_days": 30,
     "tls_cert": "",
@@ -1081,6 +1084,11 @@ _CONFIG_NOTES = {
         "// 审计日志写不进去时，最近 N 条先进内存，恢复后自动按序补写。",
         "// 用 win_probe 可查看降级状态；主操作不会因审计失败而失败。",
     ],
+    '"patch_max_rollback_bytes"': [
+        "// win_patch 原子回滚要在内存里留一份写前原文字节：这个值同时是",
+        "// 单文件与单次总量的上限，超过就在写前拒绝（不会改一半才失败）。",
+        "// 默认 8MB；调大会等比放大单次请求的内存占用。设 0 = 不限制（不推荐）。",
+    ],
     '"port"': [
         "// ★ 配置分三层：内置默认 < 本文件 < 环境变量（WKFILE_ 前缀）。",
         "// 例：WKFILE_PORT=9000 / WKFILE_EXEC_ENABLED=true 可临时覆盖，",
@@ -1890,19 +1898,57 @@ class Agent:
         }
 
     def _rollback_patch(self, done: list[dict]) -> int:
-        """补丁执行到一半失败时，把已写入的文件按原始字节逐个还原。"""
+        """补丁执行到一半失败时，把已写入的文件按原始字节逐个还原。
+
+        _original 是**内部回滚数据**，绝不进响应。v1.7.21 把它当 original
+        返回，bytes 让 HTTP / MCP 的 json.dumps 当场炸掉（500 / 断连），
+        可文件已经落盘、审计也已记成功 —— 客户端一重试就把同一处补丁
+        重复应用到已经改过的文件上。
+        """
         restored = 0
         for item in reversed(done):
             try:
-                if item["original"] is None:
+                if item["_original"] is None:
                     if os.path.isfile(item["path"]):
                         os.remove(item["path"])
                 else:
-                    self._atomic_write(item["path"], item["original"])
+                    self._atomic_write(item["path"], item["_original"])
                 restored += 1
             except OSError:
                 continue
         return restored
+
+    def _patch_rollback_budget(self, prepared: list[tuple]) -> int:
+        """写前算清回滚要留在内存里的原文字节，超限直接拒（v1.7.22）。
+
+        原子回滚必须留原字节，但不设上限时一个 >4MB 的目标文件就能让请求
+        线程同时扛着原文 + 新内容 + 响应体。预算在动第一个文件之前结清，
+        避免「改了一半才发现装不下」。返回本次允许单文件读入的字节上限。
+        """
+        cap = int(getattr(self.cfg, "patch_max_rollback_bytes", 0) or 0)
+        if cap <= 0:
+            return 0
+        total = 0
+        for _ch, full, _data, _info in prepared:
+            try:
+                size = os.path.getsize(full) if os.path.isfile(full) else 0
+            except OSError:
+                size = 0
+            if size > cap:
+                raise PathError(
+                    "too_large",
+                    f"{full} 原文件 {human_size(size)} 超过单次补丁回滚上限 "
+                    f"{human_size(cap)}，拒绝写入。请改用 win_write 单独覆盖，"
+                    "或调大 patch_max_rollback_bytes（会等比放大单次请求内存）。",
+                )
+            total += size
+        if total > cap:
+            raise PathError(
+                "too_large",
+                f"本次补丁需要保存 {human_size(total)} 原文件字节用于原子回滚，"
+                f"超过上限 {human_size(cap)}，拒绝写入。请拆成多次 win_patch。",
+            )
+        return cap
 
     def op_patch(self, req: dict) -> dict:
         """多文件原子补丁：全部预检通过才动手，中途失败整体回滚。
@@ -1927,19 +1973,36 @@ class Agent:
             return {"dry_run": True, "applied": False, "would_apply": len(prepared),
                     "changes": [i for _c, _f, _d, i in prepared]}
 
+        # v1.7.22：回滚体积闸必须在动第一个文件之前结清。
+        cap = self._patch_rollback_budget(prepared)
+
         done: list[dict] = []
         for ch, full, data, info in prepared:
             try:
                 backup = self._backup(full) if req.get("backup", True) else None
                 try:
                     with open(full, "rb") as fh:
-                        original = fh.read() if os.path.isfile(full) else None
+                        # 上限内读满；多读 1 字节用来抓「预检后被改大」的竞态，
+                        # 绝不放任一次无边界的 fh.read() 打爆请求线程。
+                        original = fh.read(cap + 1) if cap > 0 else fh.read()
                 except OSError:
                     original = None
+                if original is not None and cap > 0 and len(original) > cap:
+                    raise PathError(
+                        "too_large",
+                        f"{full} 在写入前变大，超过回滚上限 {human_size(cap)}，已拒绝本次补丁",
+                    )
                 self._atomic_write(full, data)
-                done.append({"path": full, "original": original, "backup": backup,
-                             "bytes": len(data), "sha256": sha256_of(full),
-                             "mode": info["mode"]})
+                done.append({
+                    "path": full, "backup": backup, "bytes": len(data),
+                    "sha256": sha256_of(full), "mode": info["mode"],
+                    # 只回摘要，不回原文字节：客户端据此判断「是不是已经改过了」
+                    "original_sha256": (hashlib.sha256(original).hexdigest()
+                                        if original is not None else None),
+                    "original_bytes": len(original) if original is not None else 0,
+                    # 下划线开头 = 仅供 _rollback_patch 使用，构造响应时剔除
+                    "_original": original,
+                })
             except Exception as exc:  # noqa: BLE001 —— 任何失败都要回滚已落盘部分
                 restored = self._rollback_patch(done)
                 code = getattr(exc, "code", "patch_failed")
@@ -1953,12 +2016,20 @@ class Agent:
                     f"补丁在 {full} 失败：{msg}。已回滚 {restored}/{len(done)} 个已写文件，"
                     + tail,
                 )
+        # 响应在审计之后才被 json.dumps，一旦混进 bytes 就是「写成功但客户端
+        # 看到失败」。这里按白名单式的剔除生成公共视图，内部回滚数据不外泄。
+        changes = [{k: v for k, v in it.items() if not k.startswith("_")}
+                   for it in done]
         return {
             "applied": True,
             "count": len(done),
             "atomic": True,
-            "changes": done,
-            "rollback_hint": "本次为原子补丁：任一文件失败会整体回滚；每份改写仍有写前备份。",
+            "changes": changes,
+            "rollback_hint": (
+                "本次为原子补丁：任一文件失败会整体回滚；每份改写仍有写前备份。"
+                "失败或超时后不要盲目重试——先用 win_read(hash=true) 对照 "
+                "changes[*].original_sha256，或下一次调用带 expected_sha256，"
+                "服务端会拦下对已改文件的重复应用。"),
         }
 
     def op_probe(self, req: dict) -> dict:
@@ -3278,6 +3349,24 @@ class Agent:
 
     _CMD_SAFE_SWITCHES = ("/c", "/d", "/s", "/q")
 
+    @staticmethod
+    def _exec_split_tokens(text: str) -> list[str]:
+        """按空白切 token，引号内的空白不算数（cmd 的引号语义跟 shlex 不同）。"""
+        tokens, cur, in_quote = [], [], False
+        for ch in text:
+            if ch == '"':
+                in_quote = not in_quote
+                cur.append(ch)
+            elif ch in " \t" and not in_quote:
+                if cur:
+                    tokens.append("".join(cur))
+                    cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            tokens.append("".join(cur))
+        return tokens
+
     def _exec_norm_program(self, token: str) -> str:
         """把首程序 token 归一化成可比对的名字：剥引号、取 basename、小写。
 
@@ -3297,19 +3386,7 @@ class Agent:
           /k 是常驻交互模式，直接拒绝；
         - 返回归一化后的程序名。
         """
-        tokens, cur, in_quote = [], [], False
-        for ch in command:
-            if ch == '"':
-                in_quote = not in_quote
-                cur.append(ch)
-            elif ch in " \t" and not in_quote:
-                if cur:
-                    tokens.append("".join(cur))
-                    cur = []
-            else:
-                cur.append(ch)
-        if cur:
-            tokens.append("".join(cur))
+        tokens = self._exec_split_tokens(command)
         if not tokens:
             raise PathError("bad_request", "command 不能为空")
         head = self._exec_norm_program(tokens[0])
@@ -3352,23 +3429,100 @@ class Agent:
         "md", "mkdir", "rd", "rmdir", "ren", "rename", "del", "erase",
         "copy", "move", "path", "title", "prompt", "rem", "assoc", "ftype",
         "date", "time", "call", "exit", "pause", "shift", "goto",
-        "setlocal", "endlocal",
+        "setlocal", "endlocal", "start",
     })
 
+    # 转发型前缀（v1.7.22）：这些内建/前缀自己不执行文件，真正被执行的
+    # 程序藏在后面。旧版把 call / start 当普通内建「整段跳过」，于是
+    # "dir && call payload.bat" 可以执行 cwd 里的投放脚本。cmd /c 同理，
+    # 白名单解析早就剥了它，围栏⑦却没跟上。
+    _CMD_FORWARDERS = frozenset({"call", "start", "cmd", "cmd.exe"})
+    _CMD_START_VALUE_SWITCHES = frozenset({"/d", "/node", "/machine", "/affinity"})
+    _EXEC_SCRIPT_EXTS = (".bat", ".cmd", ".exe", ".com", ".ps1", ".vbs")
+
+    def _exec_seg_programs(self, seg: str) -> list[tuple[str, str]]:
+        """拆出一段命令里所有「程序位置」的 (原始 token, 归一化名)。
+
+        普通内建/外部程序后面都是参数，只看首位；call / start / cmd /c
+        是转发型前缀，要继续剥到第一个不是前缀的 token 为止。
+        """
+        tokens = self._exec_split_tokens(seg)
+        out: list[tuple[str, str]] = []
+        idx = 0
+        while idx < len(tokens):
+            raw = tokens[idx]
+            prog = self._exec_norm_program(raw)
+            out.append((raw, prog))
+            if prog not in self._CMD_FORWARDERS:
+                break
+            idx += 1
+            # 剥开关：cmd 的 /c /d /s /q、start 的 /MIN /WAIT /D <路径>；
+            # start 还允许一个可省略的窗口标题（常见写法是 "" 占位）。
+            while idx < len(tokens):
+                low = tokens[idx].lower().strip('"')
+                if low.startswith("/"):
+                    idx += 1
+                    if low in self._CMD_START_VALUE_SWITCHES and idx < len(tokens):
+                        idx += 1  # 该开关还吃一个值（如 /D C:\tmp）
+                    continue
+                if not low:
+                    idx += 1  # "" 标题占位
+                    continue
+                break
+            # call :label 是批处理内标签，不是外部程序，别当文件查
+            if prog in ("call", "start") and idx < len(tokens) \
+                    and tokens[idx].startswith(":"):
+                break
+        return out
+
+    def _exec_hijack_probe(self, raw: str, program: str, cwd: str) -> None:
+        """检查一个程序候选是否在 cwd 里被投放，或经 PATH 落进可写目录。"""
+        if not program or program in self._CMD_BUILTINS:
+            return
+        stem = program[:-4] if program.endswith(".exe") else program
+        names = {stem + ext for ext in self._EXEC_SCRIPT_EXTS}
+        if program.endswith(self._EXEC_SCRIPT_EXTS):
+            names.add(program)      # 命令直接引用了 cwd 里的脚本文件
+        planted = next(
+            (n for n in sorted(names) if os.path.isfile(os.path.join(cwd, n))), None)
+        # 带相对路径的引用（call sub\payload.bat）：basename 在子目录里，
+        # 根下找不到，但文件确实落在 cwd 树内，一样要拦。
+        if planted is None and ("\\" in raw or "/" in raw):
+            rel = raw.strip('"').replace("/", "\\")
+            if not os.path.isabs(rel) and os.path.isfile(os.path.join(cwd, rel)):
+                planted = rel
+        if planted:
+            raise PathError(
+                "exec_hijack_suspected",
+                f"命令链中 {program} 对应的工作目录里存在 {planted}，"
+                "拒绝执行——cwd 优先于 PATH 的程序搜索序会被它劫持。"
+                "如确属正常使用，请换一个工作目录，或把该程序装到授权目录之外。",
+            )
+        resolved = shutil.which(program) or shutil.which(stem)
+        if resolved:
+            resolved_dir = os.path.normcase(os.path.dirname(os.path.abspath(resolved)))
+            for root in (self.cfg.roots or []):
+                r = os.path.normcase(os.path.abspath(root))
+                if resolved_dir == r or resolved_dir.startswith(r + os.sep):
+                    raise PathError(
+                        "exec_hijack_suspected",
+                        f"程序 {program} 经 PATH 解析到 {resolved}，落在授权可写目录内，"
+                        "拒绝执行。请从 PATH 移除该目录，或把程序安装到可信位置。",
+                    )
+
     def _exec_guard_hijack(self, command: str, cwd: str) -> None:
-        """围栏⑦（v1.7.11 引入，v1.7.12 扩为全链）：堵 cwd 劫持。
+        """围栏⑦（v1.7.11 引入，v1.7.12 全链，v1.7.22 补转发前缀）：堵 cwd 劫持。
 
         Windows 下 cmd 执行不带路径的程序时搜索序是 **cwd 优先于 PATH**，
         而 roots 恰恰是 AI 可写目录——往里面放一个与白名单程序同名的
         php.bat / php.exe，"php xxx" 实际执行的就是投放文件。
 
-        v1.7.12 两处升级（外部审计实测绕过）：
-        ① **全链检测**：旧版只查整条命令的首程序，`dir && payload.bat`
-           直接绕过（dir 在白名单，链上第二段投放文件照跑）。现在拆链后
-           每一段的首程序都过投放检测——白名单仍是首程序制（复合命令的
-           可用性），但「往可写 cwd 投放可执行文件」这个攻击面对全链封死；
-        ② **内建名单**：cmd 内建（echo/dir/type…）优先于文件搜索，投放
-           同名 .bat 劫持不了它们——对这些名字跳过 cwd 检测，消除误报。
+        ① 全链检测：拆链后每一段都过投放检测（白名单仍是首程序制）；
+        ② 内建名单：真内建优先于文件搜索，投放同名 .bat 劫持不了；
+        ③ v1.7.22 转发前缀：call / start / cmd /c 后面才是真正执行的
+           程序，旧版在这一步整段跳过，`dir && call payload.bat` 直接放行；
+        ④ v1.7.22 段内兜底：任何位置显式引用了 cwd 里存在的脚本文件
+           一律拒绝（覆盖 if / for / 重定向里藏的脚本名）。
         """
         # 拆链（2>&1 的 & 不是分隔符，先打码——v1.7.8 的老坑不能复发）
         masked = re.sub(r"(\d*)&(\d+)",
@@ -3378,35 +3532,17 @@ class Agent:
             if not seg:
                 continue
             try:
-                program = self._exec_head_program(seg)
+                programs = self._exec_seg_programs(seg)
             except PathError:
                 continue
-            if program in self._CMD_BUILTINS:
-                continue
-            stem = program[:-4] if program.endswith(".exe") else program
-            names = {stem + ext for ext in (".bat", ".cmd", ".exe", ".com")}
-            if program.endswith((".bat", ".cmd", ".com")):
-                names.add(program)      # 命令直接引用了 cwd 里的脚本文件
-            planted = next(
-                (n for n in sorted(names) if os.path.isfile(os.path.join(cwd, n))), None)
-            if planted:
-                raise PathError(
-                    "exec_hijack_suspected",
-                    f"命令链中 {program} 对应的工作目录里存在 {planted}，"
-                    "拒绝执行——cwd 优先于 PATH 的程序搜索序会被它劫持。"
-                    "如确属正常使用，请换一个工作目录，或把该程序装到授权目录之外。",
-                )
-            resolved = shutil.which(program) or shutil.which(stem)
-            if resolved:
-                resolved_dir = os.path.normcase(os.path.dirname(os.path.abspath(resolved)))
-                for root in (self.cfg.roots or []):
-                    r = os.path.normcase(os.path.abspath(root))
-                    if resolved_dir == r or resolved_dir.startswith(r + os.sep):
-                        raise PathError(
-                            "exec_hijack_suspected",
-                            f"程序 {program} 经 PATH 解析到 {resolved}，落在授权可写目录内，"
-                            "拒绝执行。请从 PATH 移除该目录，或把程序安装到可信位置。",
-                        )
+            for raw, program in programs:
+                self._exec_hijack_probe(raw, program, cwd)
+            # 段内兜底：程序位置之外的脚本引用（if exist x call p.bat、
+            # type x > p.bat 之类）也逐个查，不再只看「首程序」。
+            for tok in self._exec_split_tokens(seg):
+                low = tok.strip('"').lower()
+                if low.endswith(self._EXEC_SCRIPT_EXTS):
+                    self._exec_hijack_probe(tok, self._exec_norm_program(tok), cwd)
 
     # 热加载只覆盖"参数级"字段；exec_enabled 仍然必须重启 —— 它决定
     # win_exec 是否出现在 tools/list（Agent 构造时的快照），"能力开关必须

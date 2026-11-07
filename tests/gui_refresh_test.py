@@ -168,7 +168,10 @@ def test_health_probe():
         check("首选失败会回退另一协议并命中", ok and detail == "detail-https"
               and [s for _p, s, _t in seen] == ["http", "https"], seen)
         check("timeout 原样透传", all(t == 0.3 for _p, _s, t in seen))
-        check("不依赖任何 Tk 对象（纯参数调用）", True)
+        _names = g.health_probe.__code__.co_names
+        check("不依赖任何 Tk 对象（纯参数调用）",
+              "Tk" not in _names and "after" not in _names and "self" not in _names,
+              str(_names)[:160])
     finally:
         g.http_health = orig
 

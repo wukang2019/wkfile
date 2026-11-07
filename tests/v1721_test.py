@@ -26,6 +26,15 @@ def check(name, cond, detail=""):
                          "  :: %s" % detail if detail and not cond else ""))
 
 
+def serializable(obj):
+    """模拟 HTTP / MCP 出站。只查 isError 拦不住响应里混进 bytes。"""
+    try:
+        json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def skip(name, why):
     SKIP.append(name)
     print("  [SKIP] %s :: %s" % (name, why))
@@ -187,7 +196,8 @@ def test_audit_degrade():
         check("缓冲受 audit_buffer_max 限制", h["buffered"] == 3, str(h))
         check("溢出计数正确", h["dropped"] == 2, str(h))
         check("失败次数被记录", h["failures"] >= 5, str(h))
-        check("主操作不受影响（write 不抛异常）", True)
+        _code, _msg = err_of(lambda: audit.write({"op": "still-running"}))
+        check("主操作不受影响（审计降级时 write 仍不抛异常）", _code is None, _msg[:120])
 
         audit.path = os.path.join(base, "logs", "audit.jsonl")
         audit.write({"op": "recovered"})
@@ -387,6 +397,7 @@ def test_new_tools():
         res = m.call_tool(a.dispatch, {"name": "win_probe", "arguments": {}})
         check("call_tool(win_probe) 成功", res["isError"] is False
               and "自检" in res["content"][0]["text"])
+        check("win_probe 响应真的能发出去（json.dumps）", serializable(res))
         check("probe 结构化字段完整",
               res["structuredContent"]["config"]["layers"]["order"]
               == ["default", "file", "env"])
@@ -395,10 +406,18 @@ def test_new_tools():
                                                       "content": '{"v": 3}\n'}})
         check("call_tool(win_validate) 成功", res2["isError"] is False
               and "写前校验" in res2["content"][0]["text"])
+        check("win_validate 响应真的能发出去（json.dumps）", serializable(res2))
         res3 = m.call_tool(a.dispatch, {"name": "win_patch", "arguments": {
             "changes": [{"path": p2, "content": "final\n"}]}})
         check("call_tool(win_patch) 成功", res3["isError"] is False
               and read(p2) == "final\n")
+        # v1.7.22：这条就是拦 P0 的。旧版只查 isError，bytes 进了
+        # structuredContent 也照样全绿，服务端却已经 500 / 断连。
+        check("win_patch 响应真的能发出去（json.dumps）", serializable(res3))
+        check("win_patch 响应里没有原文字节",
+              all("original" not in it
+                  for it in (res3.get("structuredContent") or {}).get("changes", [])),
+              str(res3.get("structuredContent"))[:160])
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

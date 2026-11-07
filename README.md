@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.21\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.22\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.21.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.22.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.21\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.22\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.21\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.22\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -362,10 +362,14 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > ④ 超时硬顶（默认 60s，上限 300s），超时连子进程树一起杀；
 > ⑤ 只读 Token / 只读模式拒绝；
 > ⑥ 审计日志记录完整命令，输出截 64KB；
-> ⑦ **cwd 劫持防护（v1.7.11）**——Windows 下 cmd 执行不带路径的程序时搜索序
-> 是 **cwd 优先于 PATH**，而 roots 恰恰是 AI 可写目录：往里面放一个与白名单
-> 程序同名的 `php.bat`，`php xxx` 实际执行的就是投放文件，白名单形同虚设。
-> 现在两道检查：cwd 里存在首程序的同名可执行变体（.bat/.cmd/.exe/.com）→ 拒绝；
+> ⑦ **cwd 劫持防护（v1.7.11 引入 / v1.7.12 全链 / v1.7.22 补转发前缀）**——
+> Windows 下 cmd 执行不带路径的程序时搜索序是 **cwd 优先于 PATH**，而 roots
+> 恰恰是 AI 可写目录：往里面放一个与白名单程序同名的 `php.bat`，`php xxx`
+> 实际执行的就是投放文件，白名单形同虚设。现在拆链后**每段**都查；
+> `call` / `start` / `cmd /c` 这类转发前缀会继续剥到真正执行的程序
+> （`dir && call payload.bat` 也在拦截之列）；段内任意位置引用了 cwd 里
+> 已存在的脚本文件（`%cd%\x.bat`、`.\x.bat`、`sub\x.bat`）同样拒绝；
+> cwd 里存在同名可执行变体（.bat/.cmd/.exe/.com/.ps1/.vbs）→ 拒绝；
 > `shutil.which` 按 PATH 解析到的真实路径落在 roots 内 → 拒绝。
 >
 > v1.7.9 补强：
@@ -734,6 +738,28 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
        文件 / 合计 8 MB；审计缓冲 200 条；环境变量只认已有键。
        **仍明确不做**：异步 `win_exec`、`win_db_query offset`、开放给 AI
        删除备份（让 AI 删掉回滚兜底比写错文件更危险）。
+   - **响应契约与两处安全补漏**（v1.7.22，外部体检发现）：
+     - **P0：`win_patch` 写成功却回不了响应**。旧版把原文件的**完整字节**
+       塞进 `changes[*].original`，HTTP 侧 `json.dumps` 直接 500、MCP 侧
+       连接断；可文件已经落盘、审计也已经记了成功 —— 客户端看到失败就
+       重试，同一处补丁被重复应用到已改过的文件上。现在只回
+       `original_sha256` + `original_bytes`，回滚用的原字节改成内部字段
+       （下划线开头，构造响应时剔除）；`win_patch` 描述、`rollback_hint`
+       与文本渲染都明确要求：重试前先用 `win_read(hash=true)` 核对，或
+       下一次调用带 `expected_sha256` 让服务端拦下重复应用。
+     - **围栏⑦补漏**：旧版每段只查首程序，`call` / `start` 被当内建整段
+       跳过，`dir && call payload.bat` 仍能执行 cwd 里的投放脚本。现在会
+       剥离 `call` / `start` / `cmd /c` 转发前缀继续查真实程序，并对段内
+       **任意位置**引用了 cwd 已存在脚本的写法一律拒绝（覆盖
+       `%cd%\x.bat`、`.\x.bat`、`sub\x.bat`、`cmd /c "x.bat"` 等变体）。
+     - **回滚体积闸**：原子补丁原先无上限地整份读入原文件，>4 MB 的目标
+       就能让请求线程同时扛原文 + 新内容 + 响应。新增
+       `patch_max_rollback_bytes`（默认 8 MB，同时管单文件与单次总量），
+       在动第一个文件**之前**结清预算，超限明确拒绝、磁盘一字不动。
+     - **契约护栏**：新增 `tests/v1722_test.py`（105 项），把「响应必须能
+       `json.dumps`」覆盖到全部 37 个 MCP 工具与全部 HTTP action；同时清掉
+       旧测试里的 `check(..., True)` 恒真断言、「分页没发生却记 PASS」的
+       假绿，并在 MCP 结果上补序列化断言。**「断言绿但契约错」不再有第三次**。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -816,14 +842,16 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.21 实测，源码级）：**selftest 53/53、features 208/208（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 44 项、`tests/v1721_test.py` 84 项；`py_compile` 与模块导入自检通过。本轮把工具数量的硬编码断言改成按 `TOOLS` 动态校验，以后加工具不会再让回归假红。
+当前状态（v1.7.22 实测，源码级）：**selftest 53/53、features 211/211（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、**`tests/v1722_test.py` 105 项（本轮新增的 JSON 契约护栏）**；`py_compile` 与模块导入自检通过。
+
+真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**。本轮还把旧测试里的恒真断言改成真实条件，并给 MCP 结果补上 `json.dumps` 断言 —— 只查 `isError` 已经放过三次契约错了。
 
 > ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
 > `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
-> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.21 均未改动 GUI 代码。上述源码级
-> 回归已覆盖本轮全部改动（真实配置分层/热加载、审计写盘失败与恢复补写、
-> 硬链接去重的实体与回滚、多文件补丁成功与中途失败回滚、MCP 双通道调用）。
+> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.22 均未改动 GUI 代码。上述源码级
+> 回归已覆盖本轮全部改动（响应序列化契约、重试语义、围栏⑦转发前缀与变体、
+> 回滚体积闸的写前拒绝）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：

@@ -11,6 +11,7 @@
 全部用真实 Agent 调用 + MCP call_tool/render 文本断言（纯文本客户端也要能用）。
 """
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -28,6 +29,15 @@ def check(name, cond, detail=""):
     (PASS if cond else FAIL).append(name)
     print("  %s %s%s" % ("[OK]  " if cond else "[FAIL]", name,
                          "  :: %s" % detail if detail and not cond else ""))
+
+
+def _dumps_ok(obj):
+    """模拟 HTTP / MCP 出站序列化，别让不可序列化的返回值全绿过关。"""
+    try:
+        json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def make_agent(base, share, **over):
@@ -75,15 +85,18 @@ def test_read_hash():
         # 分页时每一页给的都是全文件 hash，不是本页 hash
         small = a.op_read({"path": p, "hash": True, "max_bytes": 8})
         check("分页首篇也带全文件 sha256", small.get("sha256") == want)
+        # 分页游标必须真的存在：以前这里的 else 分支直接 check(..., True)，
+        # 样本一旦不再分页，「续读页 hash 正确」这条断言根本没跑却记了 PASS。
+        check("max_bytes=8 确实产生分页游标", bool(small.get("next_offset")),
+              str(small)[:160])
         if small.get("next_offset"):
             nxt = a.op_read({"path": p, "hash": True, "max_bytes": 8,
                              "offset": small["next_offset"]})
             check("续读页的 sha256 仍是全文件值", nxt.get("sha256") == want)
-        else:
-            check("续读页的 sha256 仍是全文件值", True)
 
         # 纯文本客户端：MCP content[0].text 里必须看得见
         out = mcp_call(a, "win_read", path=p, hash=True, line_numbers=False)
+        check("MCP win_read 响应真的能发出去（json.dumps）", _dumps_ok(out))
         text = out["content"][0]["text"]
         check("纯文本渲染里含全文件 sha256", want in text)
         check("纯文本渲染里明确标「全文件」", "全文件 sha256=" in text)

@@ -51,6 +51,26 @@ def check(name, cond, extra=""):
     print("  [%s] %s%s" % ("OK" if cond else "XX", name, ("  <- " + extra) if extra and not cond else ""))
 
 
+def raises(fn, exc_type=ValueError):
+    """真断言：抛了**指定类型**才算过，别的异常/没抛都记 FAIL 并给原因。"""
+    try:
+        fn()
+    except exc_type as exc:
+        return True, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        return False, "抛了 %s：%s" % (type(exc).__name__, exc)
+    return False, "没有抛异常"
+
+
+def _dumps_ok(obj):
+    """模拟 HTTP / MCP 出站序列化：只查 isError 会放过不可序列化的响应。"""
+    try:
+        json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def skip(name, why):
     """环境不具备时跳过（不计入失败）—— 比如本机没装 MySQL。"""
     SKIP.append(name)
@@ -250,6 +270,7 @@ check("未被禁用的工具仍在列表里", "win_read" in names and "win_write
 res = mcp.call_tool(agent_dis.dispatch, {"name": "win_trash", "arguments": {"path": os.path.join(root, "good.py")}},
                     disabled=agent_dis.disabled_tools)
 check("直接调用被禁工具 → isError", res["isError"] is True)
+check("错误响应真的能发出去（json.dumps）", _dumps_ok(res))
 check("错误文案说明是配置禁用", "禁用" in res["content"][0]["text"])
 
 try:
@@ -609,9 +630,9 @@ tk_agent.set_request_mode(False)
 check("普通请求的 effective_readonly 为 False", tk_agent.effective_readonly() is False)
 try:
     tk_agent._require_write()
-    check("完整权限请求允许写入", True)
-except wa.PathError:
-    check("完整权限请求允许写入", False)
+    check("完整权限请求允许写入", tk_agent.effective_readonly() is False)
+except wa.PathError as exc:
+    check("完整权限请求允许写入", False, exc.message)
 
 tk_agent.set_request_mode(True)
 check("只读请求的 effective_readonly 为 True", tk_agent.effective_readonly() is True)
@@ -821,6 +842,7 @@ try:
         r2 = ro_call("win_write", {"path": ro_file, "content": "nope"}, RO_TOKEN)
         check("只读 Token 写被拒", r2.get("isError") and "只读" in r2["content"][0]["text"],
               str(r2)[:160])
+        check("MCP 错误响应真的能发出去（json.dumps）", _dumps_ok(r2))
         check("只读 Token 写失败后文件没被改",
               open(ro_file, encoding="utf-8").read() == "hello\n")
         r3 = ro_call("win_roots", {}, RO_TOKEN)
@@ -829,6 +851,7 @@ try:
         r4 = ro_call("win_write", {"path": ro_file, "content": "hello"},
                      TOKEN)
         check("主 Token 依然可写", not r4.get("isError"), str(r4)[:160])
+        check("MCP 成功响应真的能发出去（json.dumps）", _dumps_ok(r4))
 
     time.sleep(0.4)
     ro_audit = os.path.join(ro_tmp, "logs", "audit.jsonl")
@@ -897,23 +920,14 @@ check("local_ipv4 返回一个合法 IPv4", wa.is_private_ip(_o_lan)
 
 _o_tmp = tempfile.mkdtemp(prefix="wk-selfcert-")
 try:
-    try:
-        sc.generate_pair(cn="x")
-        check("既没 IP 也没域名时拒绝生成", False)
-    except ValueError:
-        check("既没 IP 也没域名时拒绝生成", True)
+    _ok, _why = raises(lambda: sc.generate_pair(cn="x"))
+    check("既没 IP 也没域名时拒绝生成", _ok, _why)
 
-    try:
-        sc.generate_pair(ips=["999.1.1.1"])
-        check("非法 IP 被拒（否则会签出一张永远校验失败的证书）", False)
-    except ValueError:
-        check("非法 IP 被拒（否则会签出一张永远校验失败的证书）", True)
+    _ok, _why = raises(lambda: sc.generate_pair(ips=["999.1.1.1"]))
+    check("非法 IP 被拒（否则会签出一张永远校验失败的证书）", _ok, _why)
 
-    try:
-        sc.generate_rsa_key(1024)
-        check("低于 2048 位的密钥被拒", False)
-    except ValueError:
-        check("低于 2048 位的密钥被拒", True)
+    _ok, _why = raises(lambda: sc.generate_rsa_key(1024))
+    check("低于 2048 位的密钥被拒", _ok, _why)
 
     _o_cert = os.path.join(_o_tmp, "s.crt")
     _o_key = os.path.join(_o_tmp, "s.key")
@@ -928,9 +942,10 @@ try:
     # 1) 能被 ssl 加载 —— 说明 PEM 结构、私钥与证书是配对的
     try:
         _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER).load_cert_chain(_o_cert, _o_key)
-        check("ssl.load_cert_chain 能加载（格式正确、公私钥配对）", True)
+        _loaded, _why = True, ""
     except Exception as _exc:  # noqa: BLE001
-        check("ssl.load_cert_chain 能加载（格式正确、公私钥配对）", False, str(_exc))
+        _loaded, _why = False, str(_exc)
+    check("ssl.load_cert_chain 能加载（格式正确、公私钥配对）", _loaded, _why)
 
     check("describe_cert 能读出 CN", "wkfile-test" in wa.describe_cert(_o_cert),
           wa.describe_cert(_o_cert))
