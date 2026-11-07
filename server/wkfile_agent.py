@@ -103,9 +103,10 @@ from wkfile_core import (  # noqa: E402
     read_text_file, sha256_of, sha256_under_cap, token_strength, token_state,
     cas_object_path, coerce_env_value, dedup_eligible, merge_config_layers,
     patch_plan, strip_json_comments, backup_inode_sizes,
+    validate_config_types,
 )
 
-VERSION = "1.7.24"
+VERSION = "1.7.25"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -977,8 +978,17 @@ class Config:
     def __init__(self, data: dict, path: str, env: dict | None = None):
         merged, report = merge_config_layers(
             DEFAULT_CONFIG, data, os.environ if env is None else env)
+        # v1.7.25：配置文件层此前没有任何类型校验。"backup_max_bytes":
+        # "2GB" 这种很自然的写法会一直活到运行时的 int() 才炸：启动清理被
+        # try/except 吞掉（保留策略静默失效），op_probe / op_patch 直接 500，
+        # 连唯一能自检的工具都哑了。这里在加载阶段一次结清，脏值回退默认
+        # 并留结构化告警（只有键名与类型名，不含任何配置值）。
+        merged, type_warnings = validate_config_types(
+            DEFAULT_CONFIG, merged, report["sources"])
+        report["config_warnings"] = type_warnings
         self.__dict__.update(merged)
         self._layers = report
+        self.config_warnings = type_warnings
         # 环境变量覆盖的键：save() 跳过、热加载跳过，保持「环境说了算」
         self._env_overridden = frozenset(report["env_applied"])
         self.config_path = os.path.abspath(path)
@@ -998,6 +1008,7 @@ class Config:
             "order": list(self._layers["order"]),
             "env_applied": list(self._layers["env_applied"]),
             "env_warnings": list(self._layers["env_warnings"]),
+            "config_warnings": list(self._layers.get("config_warnings") or []),
             "by_layer": {
                 name: sum(1 for src in self._layers["sources"].values() if src == name)
                 for name in ("default", "file", "env")
@@ -1083,6 +1094,11 @@ _CONFIG_NOTES = {
         "// 不能超过它；改这个键保存后下次调用即生效，不用重启服务。",
         "// 上限自身会被夹到 1~3600 秒，防止误填超大值把请求线程挂死。",
         "// 长任务请拆成多次短命令，别靠拉长超时硬扛。",
+    ],
+    '"backup_max_bytes"': [
+        "// ★ 所有数值型配置一律填【纯整数字节数】，不要写 \"2GB\" / \"8MB\"",
+        "// 这类带单位的字符串：类型不对会在启动时回退到内置默认值，并在",
+        "// /api/health 与 win_probe 里报出来（v1.7.25）。0 表示不按体积清理。",
     ],
     '"backup_dedup"': [
         "// 增量备份：内容完全相同的历史版本共用一份磁盘实体（NTFS 硬链接）。",
@@ -2221,6 +2237,13 @@ class Agent:
         if layers["env_warnings"]:
             issues.append(f"有 {len(layers['env_warnings'])} 个环境变量未生效，"
                           "详见 config.layers.env_warnings")
+        config_warnings = layers.get("config_warnings") or []
+        if config_warnings:
+            issues.append(
+                f"有 {len(config_warnings)} 个配置项类型不对，已回退到内置默认值："
+                + "、".join(str(w.get("key", "?")) for w in config_warnings)
+                + "；数值键请填纯整数、不要带单位，"
+                  "详见 config.layers.config_warnings")
         if int(getattr(cfg, "patch_max_rollback_bytes", 0) or 0) <= 0:
             issues.append("patch_max_rollback_bytes 配成了 0 或负数，已回退到内置 "
                           "8MB 安全上限；该配置不支持「0=不限」，请改成正数")
@@ -4789,8 +4812,21 @@ class Handler(BaseHTTPRequestHandler):
     PUBLIC_GET_PATHS = frozenset({"/health", "/api/health"})
 
     def _health_minimal(self) -> dict:
-        """给负载均衡 / 自检脚本看的最小信息：不含主机名、Python 版本、目录数。"""
-        return {"service": SERVICE, "version": VERSION}
+        """给负载均衡 / 自检脚本看的最小信息：不含主机名、Python 版本、目录数。
+
+        v1.7.25：配置类型错误不能只躺在日志里 —— 换版重启时，这是唯一
+        不用鉴权就能看到的地方。只报数量与键名，绝不带配置值/路径/Token；
+        详情走需要鉴权的 win_probe。
+        """
+        out = {"service": SERVICE, "version": VERSION}
+        cw = getattr(self.agent.cfg, "config_warnings", None) or []
+        if cw:
+            out["config_warnings"] = {
+                "count": len(cw),
+                "keys": [w["key"] for w in cw],
+                "hint": "类型不对已回退内置默认值，详见 win_probe（需鉴权）",
+            }
+        return out
 
     def _info_detail(self) -> dict:
         return {

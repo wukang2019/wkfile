@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.24\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.25\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.24.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.25.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -112,7 +112,7 @@ trae-winfile\
 │   ├─ mcp-public-test.py          #   验 MCP 端点（initialize + tools/list）
 │   └─ mcp-call-test.py            #   真调一个工具（如 win_roots / win_list）
 ├─ tests\                          # 端到端测试套件（本地开发用）
-│   ├─ features_e2e.py             #   新增能力自测（自签证书、公网 IP、证书链、数据库、超时边界，211 用例）
+│   ├─ features_e2e.py             #   新增能力自测（…）：195 或 211 用例，随有无 openssl 浮动
 │   ├─ mcp_e2e.py                  #   MCP 端点（Streamable HTTP + SSE + 鉴权 + 越权拦截）
 │   ├─ local_e2e.py                #   本机端到端（源码路线）
 │   ├─ tls_e2e.py                  #   真 HTTPS 链路（需本机有 openssl，无则跳过）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.24\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.25\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.24\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.25\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -822,6 +822,26 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
        `tests/v1724_test.py` 里作为已知限制登记，不再当作待修漏洞。
      - 新增 `tests/v1724_test.py`（47 项），同样先写「修复前应该红」的
        断言：修复前 21 项红，逐条对应本轮问题。
+   - **脏数值配置不再把服务/自检弄死**（v1.7.25，第四轮外部体检）：
+     - 配置文件层此前**完全没有类型校验**（只有环境变量层有）。写成
+       `"backup_max_bytes": "2GB"` 或 `"patch_max_rollback_bytes": "8MB"`
+       这种很自然的带单位写法，会一直活到运行时的 `int()` 才炸：启动清理
+       被 `try/except` 静默吞掉（保留策略整个失效、没人知道），`op_probe`
+       与 `op_patch` 直接回 500 —— 连唯一能自检的工具都哑了。而手改 JSON
+       的恰恰是运维本人，一次手滑就中，且在换版重启那一刻才暴露。
+     - 现在加载时按 `DEFAULT_CONFIG` 的类型做一次**配置类型校验**：脏值
+       回退内置默认值并记结构化告警（只有键名与类型名，不含任何配置值），
+       `/api/health` 免鉴权报出数量与键名，`win_probe` 的 `issues` 与
+       `config.layers.config_warnings` 给详情；自动生成的配置模板也补了
+       「数值键填纯整数、不支持 2GB / 8MB」的注释。只校验类型，不改语义：
+       0 / 负数 / 空串 / 空容器都照旧合法。
+     - **文档两处纠错**：`features_e2e.py` 的用例数随本机有无 `openssl`
+       浮动（195 或 211），旧版写死 211 还盖「实测」章，现按两种环境如实
+       说明；《使用说明.txt》里「说明书里把已知不拦的写法逐条列了出来」
+       是自指错误 —— 那份清单只在随包的 `README.md` 里，现明确指向。
+     - 新增 `tests/v1725_test.py`，同样先写「修复前应该红」的断言，并真起
+       一个带脏配置的临时服务复现换版重启场景（`/api/health` 200 含告警、
+       `/api/probe` 仍 200）。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -885,7 +905,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 ```powershell
 cd trae-winfile
 python selftest.py                      # 老接口 + 安全机制 + MCP 协议回归：53 用例
-python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：211 用例
+python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：195~211 用例（无 openssl 时 195）
 python tests\mcp_e2e.py                 # MCP 端点（源码）：59 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
@@ -908,14 +928,14 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.24 实测，源码级）：**selftest 53/53、features 211/211（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、`tests/v1723_test.py` 59 项、**`tests/v1724_test.py` 47 项（本轮新增，修复前 21 项红）**；`py_compile` 与模块导入自检通过。全部 18 套回归 exit=0。
+当前状态（v1.7.25 源码级回归）：**selftest 53/53、features 211/211（本机有 openssl）或 195/195（无 openssl，两次都另 2 项真库链路自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；`features_e2e.py` 的用例数随本机是否有 `openssl` 浮动（证书链实测段会整段跳过），不是一个固定值，别拿某个环境跑出的数字当唯一口径。另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、`tests/v1723_test.py` 59 项、`tests/v1724_test.py` 47 项、**`tests/v1725_test.py`（本轮新增）**；`py_compile` 与模块导入自检通过。全部 19 套回归 exit=0。
 
-真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**；v1.7.24 复跑两项仍全绿。只查 `isError` 已经放过三次契约错了 —— 现在每个新增字段都要过 `json.dumps` 断言。
+真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**；v1.7.25 复跑两项仍全绿。只查 `isError` 已经放过三次契约错了 —— 现在每个新增字段都要过 `json.dumps` 断言。
 
 > ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
 > `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
-> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.24 均未改动 GUI 代码。上述源码级
+> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.25 均未改动 GUI 代码。上述源码级
 > 回归已覆盖本轮全部改动（备份孤儿超删与不可回收体积护栏、`would_remove`
 > 口径一致、exec 已知限制文案与运行时契约体积护栏）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。

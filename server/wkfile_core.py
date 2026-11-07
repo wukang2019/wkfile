@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 from datetime import datetime, timedelta
 
@@ -356,6 +357,70 @@ def merge_config_layers(defaults: dict, file_data: dict | None,
         "env_warnings": warnings,
     }
     return merged, report
+
+
+def _config_type_ok(val, sample) -> tuple[bool, str]:
+    """单个配置值的类型是否可接受。返回 (是否通过, 期望类型的人类说法)。
+
+    bool 必须先于 int 判断（Python 里 bool 是 int 的子类），否则
+    auto_backup=1 会被当成合法布尔值一路带到写操作里。
+    """
+    if isinstance(sample, bool):
+        return isinstance(val, bool), "true/false"
+    if isinstance(sample, int):
+        return isinstance(val, int) and not isinstance(val, bool), "整数"
+    if isinstance(sample, float):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return False, "数字"
+        return math.isfinite(val), "有限数字"
+    if isinstance(sample, str):
+        return isinstance(val, str), "字符串"
+    if isinstance(sample, list):
+        return isinstance(val, list), "数组"
+    if isinstance(sample, dict):
+        return isinstance(val, dict), "对象"
+    return True, "任意"          # 默认值为 None 的键不设类型限制
+
+
+def validate_config_types(defaults: dict, merged: dict,
+                          sources: dict) -> tuple[dict, list[dict]]:
+    """按内置默认值的类型校验合并后的配置：脏值回退默认 + 结构化告警。
+
+    v1.7.25：**配置文件层此前完全没有类型校验**（只有环境变量层有
+    coerce_env_value）。于是 `"backup_max_bytes": "2GB"` 这种很自然的
+    写法会一直活到运行时的 int() 才炸 —— 启动清理被 Agent.__init__ 的
+    try/except 静默吞掉（保留策略整个失效、没人知道），op_probe /
+    op_patch 直接回 500，连唯一能自检的工具都哑了。而手改 JSON 的
+    恰恰是运维本人，这不是理论风险。
+
+    这里在加载阶段一次结清。只校验类型与非有限数字，不改语义：
+    0 / 负数 / 空串 / 空容器都合法，范围与枚举仍由各自使用点决定
+    （例如回滚闸的 0 值脚枪由 op_probe 单独提示）。
+
+    **告警只带键名与类型名，绝不带配置值**：这份告警会进免鉴权的
+    /api/health，而同一个配置文件里还有 Token 之类的敏感键。
+    未知键原样保留，不静默抹掉用户手写的自定义键。
+    """
+    cleaned = dict(merged)
+    warnings = []
+    for key, sample in defaults.items():
+        if key not in cleaned:
+            continue
+        val = cleaned[key]
+        ok, expected = _config_type_ok(val, sample)
+        if ok:
+            continue
+        cleaned[key] = sample
+        warnings.append({
+            "key": key,
+            "layer": sources.get(key, "default"),
+            "expected": expected,
+            "got": type(val).__name__,
+            "message": (f"配置项 {key} 类型不对（期望 {expected}，"
+                        f"实际 {type(val).__name__}），已回退到内置默认值；"
+                        "数值请填纯整数，不要带单位"),
+        })
+    return cleaned, warnings
 
 
 # ---------------------------------------------------------------------------
