@@ -690,7 +690,9 @@ def backup_inode_sizes(groups: dict) -> tuple:
     * ``physical``：所有唯一 inode 的字节和（真实占用，每个实体只算一次）；
     * ``reclaim``：每组删掉后能释放的字节。一个 inode 只在**引用它的最后
       一个组**里计入，因为按时间从旧往新删时，只有删到最后一处引用，
-      实体才真正少一份目录项（随后由 ``_prune_backup_objects`` 回收）。
+      实体才真正少一份目录项（随后由 ``cleanup_backups`` 内联回收：复用
+      ``_backup_entries`` 已记下的孤儿路径直接 ``os.remove``，不再有独立的
+      ``_prune_backup_objects``）。
 
     ``.objects`` 只是实体自身的存放处，不参与「谁最后引用」的排序，否则
     它永远排在最后，所有时间戳目录都会被算成 0 可释放。
