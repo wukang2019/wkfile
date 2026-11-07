@@ -254,16 +254,33 @@ def group2(base):
           not getattr(cfg, "config_warnings", []),
           str(getattr(cfg, "config_warnings", []))[:160])
 
-    numcfg, _ = make_cfg(base, port="10087", backup_max_bytes="2GB",
+    # port 是连通性关键键：脏值（含 null / 字符串 / 越界）不再静默回退
+    # 默认值，而是直接拒绝启动 —— 否则你会照着配置里写的端口连、连不上还
+    # 以为服务没起（v1.7.27 把 port 从「普通数值回退」重分类为「拒绝启动」）。
+    expect_raise("port 写字符串不再静默回退 8788（拒绝启动）",
+                 lambda: make_cfg(base, port="10087"), wa.ConfigSafetyError,
+                 "port", "拒绝启动")
+    expect_raise("port 写 null 同样拒绝启动",
+                 lambda: make_cfg(base, port=None), wa.ConfigSafetyError,
+                 "port", "拒绝启动")
+    # host 脏值仍属「普通数值」：回退默认 0.0.0.0 + 横幅告警，不拒绝启动
+    hcfg, _ = make_cfg(base, host=None)
+    check("host 写 null 不拒绝启动、回退 0.0.0.0",
+          hcfg.host == "0.0.0.0", str(hcfg.host))
+    cwh = getattr(hcfg, "config_warnings", [])
+    check("host 脏值产生 action=fallback 告警且点名 host",
+          any(w.get("key") == "host" and w.get("action") == "fallback" for w in cwh),
+          str(cwh)[:200])
+    # 其余普通数值（大小 / 天数）保持回退默认 + 告警
+    numcfg, _ = make_cfg(base, backup_max_bytes="2GB",
                          backup_retain_days="30d")
     check("普通数值仍回退默认值（方向不变）",
-          numcfg.port == 8788
-          and numcfg.backup_max_bytes == wa.DEFAULT_CONFIG["backup_max_bytes"]
+          numcfg.backup_max_bytes == wa.DEFAULT_CONFIG["backup_max_bytes"]
           and numcfg.backup_retain_days == wa.DEFAULT_CONFIG["backup_retain_days"],
-          "%r/%r" % (numcfg.port, numcfg.backup_retain_days))
+          "%r/%r" % (numcfg.backup_max_bytes, numcfg.backup_retain_days))
     cw = getattr(numcfg, "config_warnings", [])
     check("普通数值回退仍产生 action=fallback 告警",
-          {w.get("key") for w in cw} == {"port", "backup_max_bytes", "backup_retain_days"}
+          {w.get("key") for w in cw} == {"backup_max_bytes", "backup_retain_days"}
           and all(w.get("action") == "fallback" for w in cw), str(cw)[:200])
     check("告警可 json.dumps 且不回显值",
           json.dumps(cw, ensure_ascii=False) and "10087" not in json.dumps(cw))
@@ -496,7 +513,7 @@ def group5(base):
     finally:
         _stop(p)
 
-    # 5b：脏普通数值 -> 服务照常起，但横幅逐条打印告警（含 port 实际端口）
+    # 5b：脏普通数值（非连通性键）-> 服务照常起，但横幅逐条打印告警
     port_b = 18937
     n = os.path.join(base, "cli-num")
     os.makedirs(n, exist_ok=True)
@@ -504,7 +521,7 @@ def group5(base):
     os.makedirs(share_b, exist_ok=True)
     cfg_b = os.path.join(n, "wkfile.config.json")
     with open(cfg_b, "w", encoding="utf-8") as fh:
-        json.dump({"host": "127.0.0.1", "port": "10087",
+        json.dump({"host": "127.0.0.1", "port": port_b,
                    "token": "0123456789abcdef0123456789abcdef",
                    "roots": [share_b], "public_health": True,
                    "backup_max_bytes": "2GB"}, fh)
@@ -527,20 +544,32 @@ def group5(base):
                     break
         check("脏普通数值下服务仍能起且 /api/health 200", up)
         check("health 仍报 config_warnings 键名",
-              {"port", "backup_max_bytes"}
+              {"backup_max_bytes"}
               <= set(health.get("config_warnings", {}).get("keys") or []),
               str(health)[:220])
     finally:
         out2 = _stop(p2)
-    check("真 CLI：启动横幅打印了配置告警与两个键名",
-          "[!] 配置告警" in out2 and "backup_max_bytes" in out2
-          and "port" in out2, out2[:400])
-    check("真 CLI：port 回退提示给出实际监听端口",
-          any("listening" in l and str(port_b) in l for l in out2.splitlines())
-          and any("当前实际监听端口是 %d" % port_b in l
-                  for l in out2.splitlines()), out2[:400])
-    check("真 CLI：横幅不回显用户填的字符串值",
-          "10087" not in out2 and "2GB" not in out2, out2[:400])
+    check("真 CLI：启动横幅打印了配置告警与键名",
+          "[!] 配置告警" in out2 and "backup_max_bytes" in out2, out2[:400])
+    check("真 CLI：横幅不回显用户填的脏值",
+          "2GB" not in out2, out2[:400])
+
+    # 5c：port 脏值（字符串）直接拒绝启动，不绑定端口、不改写配置
+    n3 = os.path.join(base, "cli-port")
+    os.makedirs(n3, exist_ok=True)
+    share_c = os.path.join(n3, "share")
+    os.makedirs(share_c, exist_ok=True)
+    cfg_c = os.path.join(n3, "wkfile.config.json")
+    with open(cfg_c, "w", encoding="utf-8") as fh:
+        json.dump({"host": "127.0.0.1", "port": "10087",
+                   "token": "0123456789abcdef0123456789abcdef",
+                   "roots": [share_c], "public_health": True}, fh)
+    p3 = _spawn(cfg_c)
+    out3 = _stop(p3, wait_first=6)
+    check("真 CLI：port 写字符串拒绝启动（rc=5，不绑定端口）",
+          p3.returncode == 5, "rc=%s out=%r" % (p3.returncode, out3[:220]))
+    check("真 CLI：拒启信息点名 port 且不含令牌/值",
+          "port" in out3 and "0123456789abcdef" not in out3, out3[:300])
 
 
 # ---------------------------------------------------------------------------

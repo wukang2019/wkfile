@@ -668,7 +668,10 @@ def patch_plan(changes, *, max_files: int = PATCH_MAX_FILES,
             "encoding": item.get("encoding") or "utf-8",
             "count": item.get("count", 0),
         })
-    if total > max_total_bytes:
+    # v1.7.27：max_total_bytes <= 0 视为「不限制」（与 backup_max_bytes=0
+    # 表示不清理同一约定）。旧版把 0 当硬上限，于是 patch_max_total_bytes
+    # 误填 0 会让每一次补丁都被「超过预算 0 字节」静默全拒，且无任何告警。
+    if max_total_bytes > 0 and total > max_total_bytes:
         errors.append(
             f"本次写入合计 {human_size(total)} 超过预算 {human_size(max_total_bytes)}，请拆批")
     return planned, errors
@@ -694,13 +697,15 @@ def backup_inode_sizes(groups: dict) -> tuple:
     """
     all_inodes: dict = {}
     for items in groups.values():
-        for key, size in items:
+        # v1.7.27：每个文件项形如 (inode_key, size) 或 (inode_key, size, path)，
+        # 后者来自 _backup_entries 的孤儿路径记录；末尾用 *_ 吃掉 path 保持兼容。
+        for key, size, *_ in items:
             all_inodes.setdefault(key, int(size))
     physical = sum(all_inodes.values())
     stamps = sorted(k for k in groups if k != ".objects")
     last_owner: dict = {}
     for stamp in stamps:
-        for key, _size in groups[stamp]:
+        for key, _size, *_ in groups[stamp]:
             last_owner[key] = stamp
     reclaim = {stamp: 0 for stamp in stamps}
     for key, stamp in last_owner.items():

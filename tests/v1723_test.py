@@ -343,9 +343,19 @@ def test_docs():
     check("README 里 features 用例数只有一种口径", len(nums) == 1,
           "出现 %s" % sorted(nums))
     check("README 测试命令块含 v1723_test.py", "v1723_test.py" in text)
+    # v1.7.27 起，文档不能只做形状断言 —— 要验真内容，否则会和代码再次脱节
+    check("README 记录 v1.7.27 这轮修复", "v1.7.27" in text)
+    check("README 写明 port 脏值拒绝启动（不再静默回退）",
+          "port" in text and "拒绝启动" in text)
+    check("README 写明 type/copy 需进白名单（不是围栏漏判）",
+          "type" in text and "白名单" in text and "cmd 内建" in text)
     quick = open(os.path.join(ROOT, "README-快速上手.txt"), "r",
                  encoding="utf-8").read()
     check("快速上手不再超卖「再也借不到道」", "再也借不到道" not in quick)
+    check("快速上手补了 backup_required 配置说明",
+          "backup_required" in quick and "强制先备份再写" in quick)
+    check("快速上手仍写明备份只能由运维清、AI 无删备份权限",
+          "备份只能由运维" in quick)
 
     spec = importlib.util.spec_from_file_location(
         "build_release", os.path.join(ROOT, "build-release.py"))

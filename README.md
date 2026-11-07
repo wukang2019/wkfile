@@ -176,7 +176,8 @@ python build-release.py                                     # 再重建 文件�
 
 > 首次双击若提示「未知发布者」（没买代码签名证书，不是病毒），点  
 > 「更多信息」→「仍要运行」。若被**智能应用控制（SAC）**&#x76F4;接拦死且没有「仍要运行」按钮，  
-> 那台机器只能跑源码版（`启动界面.bat` + Python），或用已放行的旧版 exe。
+> 那台机器只能跑源码版（`启动界面.bat` + Python）—— 自编译的 exe 会被 SAC 直接拦下，  
+> 不要指望「用旧版 exe 绕过」，旧版同样可能被拦，而且旧版不含最新的安全修复。
 
 打开界面有两种方式：直接双击 `wkfile.exe`，或双击 **`以管理员身份启动.bat`**（自动提权，
 省得右键选）。装开机自启、放行防火墙需要管理员权限，界面分三页：
@@ -409,6 +410,12 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 >
 > 开启入口：界面②「安全与权限」→「远程命令执行」区，或直接改
 > `wkfile.config.json` 的 `exec_enabled` + `exec_allowed_commands` 后重启。
+>
+> **cmd 内建命令（type / copy / del / move / where / findstr 等）也要写进白名单**
+> 才会被放行：白名单只认「整条命令的首程序」，`type .\deploy.ps1`、`copy a b`
+> 这类命令的首程序是 `type` / `copy`，不在白名单里就会被拦（这不是围栏漏判，
+> 是白名单机制本身 —— 想用就加进去，别指望围栏替你放行）。推荐白名单里已经
+> 列了 `type`、`where`、`findstr`，按需自行补 `copy` / `del` 等。
 
 > **本地 → 远程传大文件：`POST /api/upload`（v1.7.9+）**——几 MB 的文件
 > 不再需要 base64 塞进 JSON（会超限/被截断）。请求体就是文件原始字节，
@@ -873,6 +880,27 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      - 新增 `tests/v1726_test.py`：四个审计用例逐一验（要么按意图生效、
        要么拒启，绝不翻到危险侧），真起进程验证退出码 5 / 不绑端口 /
        不改写文件，以及脏数值配置的横幅告警与 `/api/health`。
+   - **热加载与连通性配置的几处 fail-open / 静默退化（v1.7.27，第六轮外部体检）**：
+     - **exec 热加载不再静默套用非法值**。此前 `_hotload_exec_cfg` 直接把
+       配置文件里的值 `setattr` 上去，于是 `exec_strict_chain: null` 会被
+       `op_exec` 当成 `False` 把严格链**静默关掉**（安全降级），
+       `exec_allowed_commands` 写成数字会让 `for c in ...` 抛 `TypeError`
+       导致 `/api/exec` 直接 500。现在每个热加载键都过类型守门：
+       非法值丢弃并保留上次生效值，同时在运行日志告警。
+     - **`patch_max_total_bytes=0` 不再静默全拒**。旧版把 0 当硬上限，
+       于是「本次写入合计 N 字节超过预算 0 字节」把每一次补丁都拒掉、且无告警。
+       现在 `0 / 负数` 视为「不限制」（与 `backup_max_bytes=0` 同一约定）。
+     - **`port` / `host` 的 null / 类型不对不再静默回退默认值**。`port` 是
+       连通性关键键，脏值（null / 字符串 / 越界）直接**拒绝启动**（拒绝连
+       错端口还以为服务没起）；`host` 脏值回退 `0.0.0.0` 并在启动横幅告警。
+     - **备份清理少走一遍 `.objects` 遍历**。孤儿实体回收直接复用
+       `_backup_entries` 已经枚举出来的路径清单，不再单独再扫一次目录。
+     - **文档与测试**：`type` / `copy` 等 cmd 内建命令需在 `exec_allowed_commands`
+       白名单里才放行，已在 README 写明（这是白名单机制本身，不是围栏漏判）；
+       《使用说明》补上 `backup_required` 等备份相关配置键的说明；
+       `tests/v1723_test.py` 的 `test_docs` 从「形状断言」补成「内容断言」。
+     - 新增 `tests/v1727_test.py`：热加载非法值丢弃不套用、`patch_max_total_bytes=0`
+       视为不限制、port 脏值拒启、备份清理单遍遍历共四类。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关

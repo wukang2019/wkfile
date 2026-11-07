@@ -108,7 +108,7 @@ from wkfile_core import (  # noqa: E402
     SAFETY_BOOL_KEYS, SAFETY_LIST_KEYS,
 )
 
-VERSION = "1.7.26"
+VERSION = "1.7.27"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1014,6 +1014,30 @@ class Config:
             DEFAULT_CONFIG, merged, report["sources"])
         type_warnings = safety_warnings + type_warnings
         report["config_warnings"] = type_warnings
+        # v1.7.27：port / host 静默回退到默认值是危险性最高的一类——
+        # 连错端口你只会以为服务没起来，绑到 0.0.0.0 还以为只监听本机。
+        # null / 类型不对 / 越界必须显式报错，不能猜默认值继续跑。
+        if "port" in raw_data:
+            pv = raw_data["port"]
+            if pv is None or isinstance(pv, bool) or not isinstance(pv, int) \
+                    or not (1 <= pv <= 65535):
+                raise ConfigSafetyError(
+                    "配置 port 无效：必须是 1-65535 的整数（不要加引号、不要写 null），"
+                    "拒绝启动；否则会被当成默认端口 8788 静默绑定，连错端口时你只会"
+                    "以为服务没起来。改对后重新启动。")
+        if "host" in raw_data:
+            hv = raw_data["host"]
+            if hv is None or not isinstance(hv, str) or not hv.strip():
+                type_warnings.append({
+                    "key": "host", "layer": "file", "action": "fallback",
+                    "expected": "非空字符串（IP 或 0.0.0.0）",
+                    "got": "null/空" if hv is None else type(hv).__name__,
+                    "message": ("host 配置为空或类型不对，回退到默认 0.0.0.0"
+                                "（监听所有网卡）；若只想本机访问请显式填 127.0.0.1"),
+                })
+                # v1.7.27：告警里写了「回退到默认 0.0.0.0」，就必须真的回退，
+                # 否则绑定到空串/空白会按监听失败而不是 0.0.0.0，告警沦为谎言。
+                merged["host"] = DEFAULT_CONFIG.get("host", "0.0.0.0")
         self.__dict__.update(merged)
         self._layers = report
         self.config_warnings = type_warnings
@@ -1859,15 +1883,18 @@ class Agent:
                         if key in seen_here:
                             continue
                         seen_here.add(key)
-                        groups[label].append((key, st.st_size))
+                        groups[label].append((key, st.st_size, p))
                     except OSError:
                         continue
-        referenced = {key for st in stamps for key, _size in groups[st]}
+        referenced = {key for st in stamps for key, _size, _path in groups[st]}
         orphans = [it for it in groups[".objects"] if it[0] not in referenced]
         groups[".objects"] = [it for it in groups[".objects"]
                               if it[0] in referenced]
         self._backup_orphan_objects = len(orphans)
-        self._backup_orphan_bytes = sum(int(sz) for _key, sz in orphans)
+        self._backup_orphan_bytes = sum(int(sz) for _key, sz, _p in orphans)
+        # v1.7.27：把孤儿实体路径记下来，cleanup_backups 直接复用，不再单独
+        # 走第二遍 .objects 目录去 prune（旧版每轮清理要枚举 .objects 两次）。
+        self._backup_orphan_paths = [p for _key, _sz, p in orphans]
         physical, reclaim = backup_inode_sizes(groups)
         out = []
         for st in stamps:
@@ -1891,17 +1918,35 @@ class Agent:
         v1.7.24：**先回收孤儿实体，再统计体积、算清理计划**。孤儿是
         os.link 失败后代码明确允许存在的正常状态，它删版本释放不掉，
         旧版却被算进 physical 一路把有效备份删光（且启动清理压根不
-        prune）。即使 prune 因权限/竞态失败，_backup_entries 也会把
-        孤儿从 physical 里剔除，_backup_cleanup_plan 另有一道护栏。
+        prune）。_backup_entries 已经把孤儿从 physical 里剔除，并顺手
+        记下了孤儿路径清单。
+        v1.7.27：清理前回收孤儿直接复用 _backup_entries 记下的路径，
+        不再单独走第二遍 .objects 目录（旧版每轮清理要枚举 .objects 两次）。
         """
-        if bool(getattr(self.cfg, "backup_dedup", True)):
-            self._prune_backup_objects()
         max_bytes = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
         days = max(0, int(getattr(self.cfg, "backup_retain_days", 0) or 0))
         count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
+        dedup = bool(getattr(self.cfg, "backup_dedup", True))
+        base, entries, physical = self._backup_entries()
+        # v1.7.27：先回收孤儿（复用刚枚举出来的路径，省一次 .objects 遍历），
+        # 不论下面有没有保留策略都要做——孤儿是 os.link 失败允许存在的正常状态，
+        # 不回收会一直占着磁盘。旧版在策略判断之前就 prune，这里保持同样语义。
+        if dedup:
+            for p in getattr(self, "_backup_orphan_paths", []) or []:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            obj_base = os.path.join(backup_root(self.cfg.base_dir), ".objects")
+            for bucket in (os.listdir(obj_base) if os.path.isdir(obj_base) else ()):
+                d = os.path.join(obj_base, bucket)
+                if os.path.isdir(d):
+                    try:
+                        os.rmdir(d)          # 空桶才删得掉，非空说明还有引用
+                    except OSError:
+                        pass
         if max_bytes <= 0 and days <= 0 and count <= 0:
             return
-        base, entries, physical = self._backup_entries()
         plan = self._backup_cleanup_plan(
             entries, max_bytes=max_bytes, retain_days=days, retain_count=count,
             total_bytes=physical)
@@ -3866,8 +3911,45 @@ class Agent:
         # v1.7.21：环境变量优先级高于配置文件，热加载不能把覆盖值冲掉
         overridden = getattr(self.cfg, "_env_overridden", ()) or ()
         for key in self._EXEC_HOT_KEYS:
-            if key in data and key not in overridden:
+            if key not in data or key in overridden:
+                continue
+            ok, why = self._validate_hot_key(key, data[key])
+            if ok:
                 setattr(self.cfg, key, data[key])
+            else:
+                # v1.7.27：热加载绝不静默套用非法值。exec_strict_chain 写 null
+                # 会被 op_exec 当成 False 静默关掉严格链（安全降级）；
+                # exec_allowed_commands 写成数字会让 `for c in ...` 抛 TypeError
+                # 导致 /api/exec 直接 500 —— 两类都是「改了配置反而更危险」的
+                # 退化，必须丢弃并保留上次生效值，同时打告警到运行日志。
+                sys.stderr.write(
+                    "[wkfile] 配置热加载跳过非法键 %s：%s，保留上次生效值\n"
+                    % (key, why))
+
+    @staticmethod
+    def _validate_hot_key(key: str, val) -> tuple[bool, str]:
+        """热加载字段的类型守门：非法值返回 (False, 原因)，绝不套用。
+
+        v1.7.27：此前直接 setattr，于是 exec_strict_chain 写 null 会被 op_exec
+        的 `if getattr(..., 'exec_strict_chain', False)` 当成 False，严格链静默
+        关闭；exec_allowed_commands 写成数字会让 `for c in ...` 抛 TypeError 导致
+        /api/exec 500。这些热加载字段都来自运维手改的配置，必须有类型守门，
+        非法就丢弃并保留上次生效值（绝不猜一个默认值继续跑）。
+        """
+        if key == "exec_strict_chain":
+            coerced, _ = coerce_safety_bool(val)
+            if coerced is None:
+                return False, "安全开关必须是 true/false（不能是 null 或字符串）"
+            return True, ""
+        if key == "exec_allowed_commands":
+            if not isinstance(val, list) or \
+                    not all(isinstance(x, str) for x in val):
+                return False, "必须是字符串数组（如 [\"php\", \"composer\"]）"
+            return True, ""
+        # exec_timeout_sec / exec_timeout_max_sec / exec_max_output_bytes：正整数
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            return False, "必须是正整数"
+        return True, ""
 
     @staticmethod
     def _exec_preview(output: str, output_file: str | None, max_out: int,
