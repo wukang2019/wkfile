@@ -20,6 +20,7 @@ import wkfile_agent as wa  # noqa: E402
 HOST = "127.0.0.1"
 PORT = 8815
 TOKEN = "mcp-e2e-token-9f3a"
+RO_TOKEN = "mcp-e2e-ro-7c1d"  # 只读 Token：用于验证握手契约里的 token_scope
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 PASS, FAIL = [], []
@@ -95,6 +96,7 @@ def main():
         "host": HOST,
         "port": PORT,
         "token": TOKEN,
+        "readonly_token": RO_TOKEN,
         "roots": [share],
         "ip_allowlist": ["127.0.0.1"],
         "audit_log": os.path.join(tmp, "audit.jsonl"),
@@ -145,6 +147,21 @@ def main():
     check("serverInfo.name = winfile-mcp", obj.get("result", {}).get("serverInfo", {}).get("name") == "wkfile-mcp")
     check("capabilities.tools 已声明", "tools" in obj.get("result", {}).get("capabilities", {}))
     check("instructions 里带出可操作目录", share in obj.get("result", {}).get("instructions", ""))
+    ins = obj.get("result", {}).get("instructions", "")
+    check("instructions 下发运行时契约", "【运行时契约" in ins)
+    check("运行时契约版本与源码常量一致", wa.VERSION in ins)
+    check("运行时契约带出实际读写上限",
+          "单次读 4 MB" in ins and "单次写与请求体 16 MB" in ins, ins[-400:])
+    check("运行时契约标明 exec 默认关闭", "win_exec 默认关闭" in ins)
+    check("运行时契约不含凭据原文", TOKEN not in ins and RO_TOKEN not in ins)
+    check("完整 Token 握手契约权限为 full", "凭据权限 full" in ins)
+    st_ro, _, body_ro = post("/mcp", jrpc("initialize", {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "e2e-ro", "version": "1"},
+    }), token=RO_TOKEN)
+    ins_ro = (json.loads(body_ro).get("result") or {}).get("instructions", "")
+    check("只读 Token 握手返回 200", st_ro == 200, str(st_ro))
+    check("只读 Token 握手契约权限为 readonly", "凭据权限 readonly" in ins_ro, ins_ro[-300:])
 
     print("\n========== 3. 通知：notifications/initialized ==========")
     st, _, body = post("/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})

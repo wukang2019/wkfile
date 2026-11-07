@@ -184,6 +184,12 @@ def main():
         check("initialize 200", st == 200, f"{st} {body[:200]}")
         check("下发会话 ID", bool(sid))
         check("serverInfo 正常", obj.get("result", {}).get("serverInfo", {}).get("name") == "wkfile-mcp")
+        ver = obj.get("result", {}).get("serverInfo", {}).get("version", "")
+        ins = obj.get("result", {}).get("instructions", "")
+        check("exe 握手下发运行时契约", "【运行时契约" in ins, ins[-200:])
+        check("契约版本与 serverInfo 一致", bool(ver) and ver in ins)
+        check("契约带出实际读写上限与 exec 状态",
+              "单次读" in ins and "win_exec" in ins)
 
         print("\n========== 3. exe 的 tools/list ==========")
         st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},

@@ -30,6 +30,27 @@ MCP_SERVICE = "wkfile-mcp"
 SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"]
 DEFAULT_PROTOCOL = "2025-03-26"
 
+# 响应正文只发一份：structuredContent 省略重复 content 的阈值。
+# initialize 下发的「运行时契约」直接引用这两个常量，避免说明文字与代码各写一份数字。
+STRUCTURED_CONTENT_OMIT_BYTES = 4096
+# win_write_b64 的引导阈值（base64 膨胀约 33%，再大容易被 AI 客户端静默截断）
+BASE64_UPLOAD_HINT_BYTES = 8 * 1024
+
+
+def human_bytes(n) -> str:
+    """把字节数写成人类可读的短标签，专给协议说明用。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n <= 0:
+        return "0 B"
+    if n % (1024 * 1024) == 0:
+        return f"{n // (1024 * 1024)} MB"
+    if n % 1024 == 0:
+        return f"{n // 1024} KB"
+    return f"{n} B"
+
 # ---------------------------------------------------------------------------
 # 工具风险标注
 # ---------------------------------------------------------------------------
@@ -275,7 +296,7 @@ TOOLS = [
     {
         "name": "win_write_b64",
         "description": "用 base64 内容写入二进制文件（自动建父目录，写前备份）。"
-                       "⚠️ 大文件（>8KB）慎用：base64 会让参数膨胀 33%，超长会被 AI 客户端静默截断"
+                       f"⚠️ 大文件（>{BASE64_UPLOAD_HINT_BYTES // 1024}KB）慎用：base64 会让参数膨胀 33%，超长会被 AI 客户端静默截断"
                        "而服务端无法察觉——请务必同时传 expected_sha256（按解码后原始内容计算），"
                        "不匹配会 409 拒写；更大的文件（如整个 PHP 类文件）建议改走 HTTP 直传通道"
                        " POST /api/upload（原始字节，用法见 tools/upload.py 或 README）。",
@@ -962,8 +983,59 @@ def error_response(msg_id, code: int, message: str, data=None) -> dict:
     return {"jsonrpc": "2.0", "id": msg_id, "error": err}
 
 
+def runtime_contract(info: dict) -> str:
+    """按「当前这次握手的实际配置」生成给智能体的运行时契约。
+
+    只写会随配置变、且 tools/list 的 schema 里查不到的约定；工具级细节仍以
+    schema 为准。纯函数：不读文件、不联网、不持有服务端对象，单测可直接调。
+    所有数字都从 info / 模块常量取，避免说明文字与实现各写一份而漂移。
+    """
+    info = info or {}
+    limits = info.get("limits") or {}
+    flags = info.get("flags") or {}
+    read_max = human_bytes(limits.get("max_read_bytes"))
+    write_max = human_bytes(limits.get("max_write_bytes"))
+    omit = human_bytes(limits.get("structured_omit_bytes",
+                                 STRUCTURED_CONTENT_OMIT_BYTES))
+    upload = human_bytes(limits.get("upload_hint_bytes",
+                                   BASE64_UPLOAD_HINT_BYTES))
+    scope = info.get("token_scope") or "full"
+
+    lines = [
+        "【运行时契约·随本次连接的实际配置生成，以此为准】",
+        f"版本 {info.get('version') or '?'} / 凭据权限 {scope}"
+        "（readonly=只读 Token，写、删、执行会被拒绝）。",
+        f"上限：单次读 {read_max}、单次写与请求体 {write_max}；"
+        f"win_write_b64 超过 {upload} 请改用 POST /api/upload（原始字节 + sha256 校验）；"
+        f"响应正文超过 {omit} 时 structuredContent 省略重复 content"
+        "（标记 content_omitted），全文取 content[0].text。",
+        "win_read 读完只看 eof=true，用 next_offset / next_start_line 续读；"
+        "line_fragment=true 的页尾不补换行，其余页补一个。",
+        "自动备份" + ("开" if flags.get("auto_backup", True) else "关")
+        + "：备份失败时覆盖/替换/移动/回滚整体中止且原文件不动；"
+          "win_write / win_write_b64 可传 backup=false 跳过。",
+        ("删除走 win_trash（可恢复）；" if flags.get("allow_delete", True)
+         else "当前禁止删除；")
+        + "encoding 不接受 utf-8-sig（不静默写 BOM），请用 utf-8。",
+    ]
+    allowed = [str(x) for x in (flags.get("exec_allowed_commands") or [])]
+    if flags.get("exec_enabled"):
+        shown = "、".join(allowed[:6]) or "（空）"
+        if len(allowed) > 6:
+            shown += f" 等 {len(allowed)} 项"
+        lines.append(
+            f"win_exec 已开启：白名单 {shown}；只校验整条命令的首个程序；"
+            f"超时 {flags.get('exec_timeout_sec', 60)} 秒"
+            + ("；严格链式校验开" if flags.get("exec_strict_chain") else "") + "。"
+        )
+    else:
+        lines.append("win_exec 默认关闭且当前未开启（tools/list 也不会列出该工具）。")
+    return "\n".join(lines)
+
+
 def build_initialize(params: dict, *, info: dict) -> dict:
-    """info 由服务端提供：server_name / version / roots / read_only / allow_delete / auto_backup"""
+    """info 由服务端提供：server_name / version / roots / read_only /
+    allow_delete / auto_backup / tools_disabled / token_scope / limits / flags"""
     want = (params or {}).get("protocolVersion")
     proto = want if want in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
     host = info.get("server_name") or "windows-server"
@@ -976,7 +1048,8 @@ def build_initialize(params: dict, *, info: dict) -> dict:
         "2) 用 win_list / win_search / win_grep 定位文件，不要凭猜测直接写；",
         "3) 改文件前先 win_read 看清当前内容，能用 win_replace 做精确替换就别整文件覆盖；",
         "4) 需要删除时用 win_trash（进服务器回收站，可恢复），它会返回 trash_id；",
-        "5) 写入成功后服务端会自动备份原文件，返回里的 backup 字段就是备份路径；",
+        "5) 写入时服务端默认会先备份原文件（是否开启、能否跳过见下方运行时契约），"
+        "返回里的 backup 字段就是备份路径；",
         "   改坏了可以用 win_backup_list 找到旧版本、win_backup_restore 回滚；",
         "6) 拿不准改动结果时，先用 win_replace 的 dry_run=true 看一眼 unified diff 预览再动手。",
         "路径一律使用服务器上的绝对路径，例如 D:\\share\\app\\config.ini。",
@@ -988,6 +1061,9 @@ def build_initialize(params: dict, *, info: dict) -> dict:
     disabled = info.get("tools_disabled") or []
     if disabled:
         lines.append("注意：以下工具已被服务端配置禁用，不要调用：" + "、".join(str(x) for x in disabled))
+    # v1.7.16：把「会随配置变的运行时约定」在握手时一次下发。协议必经、
+    # 零额外调用，且不新增工具 / 不新增包内文件（README 是给人看的，也会漂移）。
+    lines.append(runtime_contract(info))
 
     return {
         "protocolVersion": proto,
@@ -1064,7 +1140,7 @@ def call_tool(dispatch, params: dict, *, disabled=()) -> dict:
             body = data.get("content")
             if isinstance(body, str):
                 n = len(body.encode("utf-8", "replace"))
-                if n > 4096:
+                if n > STRUCTURED_CONTENT_OMIT_BYTES:
                     sc = dict(data)
                     sc.pop("content", None)
                     sc["content_omitted"] = True

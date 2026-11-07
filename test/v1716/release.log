@@ -1,0 +1,18 @@
+  + wkfile.exe                         <- dist/wkfile.exe
+  + 使用说明.txt                           <- README-快速上手.txt
+  + README.md                          <- README.md
+  + LICENSE                            <- LICENSE
+  + connect-check.py                   <- server/connect-check.py
+  + 连接自检.bat                           <- server/连接自检.bat
+  + wkfile.config.example.json         <- server/wkfile.config.example.json
+  + tools/probe-public.py              <- tools/probe-public.py
+  + tools/mcp-public-test.py           <- tools/mcp-public-test.py
+  + tools/mcp-call-test.py             <- tools/mcp-call-test.py
+  + tools/upload.py                    <- tools/upload.py
+  + wkfile\数据目录说明.txt                  <- (生成)
+  + 以管理员身份启动.bat                       <- (生成)
+  + 文件夹说明.txt                          <- (生成)
+
+文件夹 : D:\deving\bigmodelstudy\trae-winfile\wkfile-v1.7.16
+压缩包 : D:\deving\bigmodelstudy\trae-winfile\wkfile-v1.7.16.zip  (11.84 MB, 14 个文件)
+敏感文件检查：干净（无真实配置 / mcp.json）

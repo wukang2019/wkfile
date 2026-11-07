@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.15"
+VERSION = "1.7.16"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -3690,6 +3690,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _mcp_info(self) -> dict:
         cfg = self.agent.cfg
+        ep = mcpmod  # 协议层常量是数字的唯一来源，别在这里另写一份
         return {
             "server_name": socket.gethostname(),
             "version": VERSION,
@@ -3698,6 +3699,26 @@ class Handler(BaseHTTPRequestHandler):
             "allow_delete": bool(cfg.allow_delete),
             "auto_backup": bool(cfg.auto_backup),
             "tools_disabled": sorted(self.agent.disabled_tools),
+            # v1.7.16：initialize 的运行时契约全靠这些值，随本次连接的
+            # 配置 / Token 权限实时生成，不会和代码里的常量漂移。
+            "token_scope": "readonly" if self.agent.request_readonly() else "full",
+            "limits": {
+                "max_read_bytes": int(getattr(cfg, "max_read_bytes", 0)),
+                "max_write_bytes": int(getattr(cfg, "max_write_bytes", 0)),
+                "structured_omit_bytes": getattr(
+                    ep, "STRUCTURED_CONTENT_OMIT_BYTES", 4096) if ep else 4096,
+                "upload_hint_bytes": getattr(
+                    ep, "BASE64_UPLOAD_HINT_BYTES", 8192) if ep else 8192,
+            },
+            "flags": {
+                "auto_backup": bool(cfg.auto_backup),
+                "allow_delete": bool(cfg.allow_delete),
+                "exec_enabled": bool(getattr(cfg, "exec_enabled", False)),
+                "exec_allowed_commands": list(
+                    getattr(cfg, "exec_allowed_commands", None) or []),
+                "exec_timeout_sec": int(getattr(cfg, "exec_timeout_sec", 60)),
+                "exec_strict_chain": bool(getattr(cfg, "exec_strict_chain", False)),
+            },
         }
 
     def _mcp_new_session(self) -> str:

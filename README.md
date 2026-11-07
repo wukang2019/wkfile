@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.15\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.16\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.15.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.16.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.15\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.16\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -168,7 +168,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.15\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.16\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -661,6 +661,13 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
    - MCP 响应里的大正文只发一份：`content` 文本块已经是全文，`structuredContent`
      在正文超过 4 KB 时会省略重复的 `content`，改给 `content_omitted` /
      `content_bytes`；小响应原样保留，旧客户端不受影响（v1.7.13）。
+   - **AI 该知道的约定在握手时就下发**（v1.7.16）：`initialize` 的 `instructions`
+     除入门流程外，还带一段按**当前配置实时生成**的「运行时契约」——版本与本次
+     Token 权限、读/写上限、`/api/upload` 引导阈值、`structuredContent` 去重阈值、
+     `win_read` 续读与残页拼接、备份失败整体中止、`utf-8-sig` 禁用、`win_exec`
+     开关与白名单。数字全部取自代码常量，不会随文档漂移；**没有新增工具、
+     没有新增调用、包里也没有多一份机读文档**。改了配置重启后，AI 下次连接
+     看到的就是新值。
    - 改 Token / 白名单 / 端口后**必须重启服务**才生效（暂未做配置热重载）。
    - 不开 HTTPS 的话，Token 仍是明文过公网 —— 这是最大的剩余风险，见第 7 条。
 10. **开数据库之前请先想清楚这三件事**（v1.6.0 新增能力）：
@@ -731,7 +738,7 @@ python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：53 
 
 ````
 
-当前状态（v1.7.15 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、48/48、13/13、11/11、152/152、53/53 全通过**；另跑通 `test/v1712/spotcheck.py` A~E 段、`check.py` 13 项、structuredContent 去重定向断言 3 项、`tests/gui_refresh_test.py` 46 项与打包后 `wkfile.exe --check-gui` 自检。
+当前状态（v1.7.16 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、56/56、13/13、11/11、152/152、56/56 全通过**；另跑通 `test/v1712/spotcheck.py` A~E 段、`check.py` 13 项、`tests/gui_refresh_test.py` 46 项、`tests/mcp_contract_test.py` 43 项、structuredContent 去重定向断言 3 项与打包后 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：
 
