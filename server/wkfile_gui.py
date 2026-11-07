@@ -472,9 +472,29 @@ class Wizard:
 
         现在鼓励用户手改 wkfile.config.json（模板自带注释），手改就可能出现
         语法错误。此时绝不能让窗口整个打不开 —— 那样用户连改回来的机会都没有。
+
+        v1.7.26：安全开关类型不对是另一种情况 —— 服务端会**拒绝启动**，
+        界面也不能用默认值覆盖那个文件（那等于把只读/白名单/删除/备份
+        四道门默默打开）。所以这里弹窗后把「保存/启动」锁住。
         """
+        self._config_blocked = ""
         try:
             return wa.load_config(CONFIG_PATH)
+        except wa.ConfigSafetyError as exc:
+            self._config_blocked = str(exc)
+            try:
+                self.msg.showerror(
+                    "安全开关配置有误（服务已拒绝启动）",
+                    f"{exc}\n\n为避免把安全设置悄悄覆盖成默认值，本窗口的"
+                    "【保存配置】与【启动服务】已锁定。\n"
+                    "请用记事本打开配置文件，把报错的键改成正确类型，"
+                    "然后重新打开本程序。\n"
+                    f"配置文件：{CONFIG_PATH}",
+                    parent=self.root)
+            except Exception:  # noqa: BLE001 —— 无头模式下弹不了窗，不拦流程
+                pass
+            self.log("安全开关配置有误，已锁定保存/启动：" + str(exc), "err")
+            return wa.Config({}, CONFIG_PATH)
         except ValueError as exc:
             try:
                 self.msg.showerror(
@@ -1865,6 +1885,20 @@ class Wizard:
         }
 
     def save_config(self, silent: bool = False) -> bool:
+        # v1.7.26：磁盘上的安全开关类型不对时，界面显示的是内置默认值。
+        # 此时「保存」会把用户原本想收紧的开关整体覆盖成默认值（fail-open），
+        # 所以直接拒绝，要求先手改配置文件。启动服务也走这里，一并拦住。
+        if getattr(self, "_config_blocked", ""):
+            if not silent:
+                try:
+                    self.msg.showerror(
+                        "配置未修复，拒绝保存",
+                        self._config_blocked + "\n\n为避免把安全开关覆盖成默认值，"
+                        "本次保存已取消。请先用记事本修正配置文件再重新打开界面。",
+                        parent=self.root)
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
         try:
             form = self.collect()
         except ValueError as exc:
@@ -1882,6 +1916,14 @@ class Wizard:
 
         try:
             cfg = wa.load_config(CONFIG_PATH)
+        except wa.ConfigSafetyError as exc:
+            # v1.7.26：不能当语法错误处理（那样会用界面默认值整体覆盖，
+            # 把门悄悄打开）。改成中止保存并提示去修文件。
+            self._config_blocked = str(exc)
+            self.log("磁盘配置安全开关有误，拒绝覆盖：" + str(exc), "err")
+            if not silent:
+                self.msg.showerror("安全开关配置有误", str(exc), parent=self.root)
+            return False
         except ValueError as exc:
             # 磁盘上的配置有语法错误（多半是手改坏的）。这里直接放弃合并
             # 旧值：界面里当前显示的就是用户要保存的全部内容，

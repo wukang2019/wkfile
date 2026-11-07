@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.25\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.26\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.25.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.26.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.25\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.26\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.25\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.26\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -842,6 +842,37 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      - 新增 `tests/v1725_test.py`，同样先写「修复前应该红」的断言，并真起
        一个带脏配置的临时服务复现换版重启场景（`/api/health` 200 含告警、
        `/api/probe` 仍 200）。
+   - **手改配置不会再静默打开安全门**（v1.7.26，第五轮外部体检）：
+     - v1.7.25 的「脏值回退默认值」对大小/天数/端口是对的，但**默认值对
+       安全开关来说等于关掉保护**。实测四种手滑：
+       `"read_only": "true"` → `False`（只读被静默关闭）、
+       `"ip_allowlist": "10.0.0.0/8"` → `[]`（放行所有 IP）、
+       `"allow_delete": "false"` → `True`（删除被打开）、
+       `"backup_required": "true"` → `False`（强制备份失效）。
+       一个引号就能把四道门同时翻到危险侧，服务照常启动、横幅一声不吭。
+       比起不来更坏：**起不来能立刻发现，静默放开不会发现**。
+     - 本版把两类值分开：**安全开关**（`read_only` / `allow_delete` /
+       `allow_move` / `auto_backup` / `backup_required` / `exec_enabled` /
+       `exec_strict_chain` / `enable_mcp` / `preflight_check` /
+       `public_health`，以及数组 `ip_allowlist` / `tools_disable`）
+       只严格识别 `true/false`、`1/0` 与对应的字符串写法，认不出来、
+       写成 `null`、或把数组写成单个字符串就**直接拒绝启动**（退出码 5，
+       不监听端口、不改写配置文件），绝不猜默认值；带引号的 `"true"` 会按意图解析成 `true`
+       并留一条规范化提示。**普通数值**（大小 / 天数 / 端口）仍是回退默认
+       值 + 告警，方向不变。环境变量层的安全开关脏值同样拒绝启动，
+       不再只被「忽略并告警」。
+     - **所有 `config_warnings` 打到启动横幅**，不再只躺在 `/api/health`
+       和 `win_probe` 里；`port: "10087"` 回退成 8788 时额外提示
+       「按上面 listening 行的端口连」，别照着配置里写的端口连然后以为
+       服务没起来。告警只带键名与类型名，绝不回显配置值。
+     - 顺带堵上同源脚枪：GUI 保存与 `--token-days` 写出的
+       `token_ttl_days` 是浮点，v1.7.25 按整数校验会把 `30.0` 判脏回退
+       `0`（Token 悄悄变成永久有效）。该键的默认值改为浮点，整数与浮点
+       都收。GUI 遇到脏安全开关时会弹窗并锁住【保存配置】/【启动服务】，
+       避免用默认值把用户原本收紧的开关覆盖掉。
+     - 新增 `tests/v1726_test.py`：四个审计用例逐一验（要么按意图生效、
+       要么拒启，绝不翻到危险侧），真起进程验证退出码 5 / 不绑端口 /
+       不改写文件，以及脏数值配置的横幅告警与 `/api/health`。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -928,7 +959,7 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.25 源码级回归）：**selftest 53/53、features 211/211（本机有 openssl）或 195/195（无 openssl，两次都另 2 项真库链路自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；`features_e2e.py` 的用例数随本机是否有 `openssl` 浮动（证书链实测段会整段跳过），不是一个固定值，别拿某个环境跑出的数字当唯一口径。另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、`tests/v1723_test.py` 59 项、`tests/v1724_test.py` 47 项、**`tests/v1725_test.py`（本轮新增）**；`py_compile` 与模块导入自检通过。全部 19 套回归 exit=0。
+当前状态（v1.7.26 源码级回归）：**selftest 53/53、features 211/211（本机有 openssl）或 195/195（无 openssl，两次都另 2 项真库链路自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；`features_e2e.py` 的用例数随本机是否有 `openssl` 浮动（证书链实测段会整段跳过），不是一个固定值，别拿某个环境跑出的数字当唯一口径。另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、`tests/v1723_test.py` 59 项、`tests/v1724_test.py` 47 项、`tests/v1725_test.py` 54 项、**`tests/v1726_test.py`（本轮新增）**；`py_compile` 与模块导入自检通过。全部 20 套回归 exit=0。
 
 真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**；v1.7.25 复跑两项仍全绿。只查 `isError` 已经放过三次契约错了 —— 现在每个新增字段都要过 `json.dumps` 断言。
 

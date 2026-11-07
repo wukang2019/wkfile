@@ -103,10 +103,12 @@ from wkfile_core import (  # noqa: E402
     read_text_file, sha256_of, sha256_under_cap, token_strength, token_state,
     cas_object_path, coerce_env_value, dedup_eligible, merge_config_layers,
     patch_plan, strip_json_comments, backup_inode_sizes,
-    validate_config_types,
+    validate_config_types, validate_safety_config, coerce_safety_bool,
+    format_config_warnings, safety_env_errors, ConfigSafetyError,
+    SAFETY_BOOL_KEYS, SAFETY_LIST_KEYS,
 )
 
-VERSION = "1.7.25"
+VERSION = "1.7.26"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -134,7 +136,10 @@ DEFAULT_CONFIG = {
     "token": "",
     # Token 有效期：0 = 永久有效；>0 = 自签发起 N 天后自动失效。
     # token_expires_at 是据此算出的绝对到期时间（ISO），空字符串表示永久。
-    "token_ttl_days": 0,
+    # v1.7.26：这里必须是浮点类型 —— GUI 的 collect() 和 CLI 的
+    # --token-days 都写 float(30.0)，v1.7.25 按 int 校验会把它判成脏值
+    # 回退 0（Token 悄悄变成永久有效）。浮点默认值同时接纳 int 与 float。
+    "token_ttl_days": 0.0,
     "token_expires_at": "",
     # 只读专用 Token：用这个 Token 认证的请求一律被当成只读
     # （写/删/移/还原全部拒绝），适合「只让 AI 看看」的场景。留空表示不启用。
@@ -978,13 +983,36 @@ class Config:
     def __init__(self, data: dict, path: str, env: dict | None = None):
         merged, report = merge_config_layers(
             DEFAULT_CONFIG, data, os.environ if env is None else env)
-        # v1.7.25：配置文件层此前没有任何类型校验。"backup_max_bytes":
-        # "2GB" 这种很自然的写法会一直活到运行时的 int() 才炸：启动清理被
-        # try/except 吞掉（保留策略静默失效），op_probe / op_patch 直接 500，
-        # 连唯一能自检的工具都哑了。这里在加载阶段一次结清，脏值回退默认
-        # 并留结构化告警（只有键名与类型名，不含任何配置值）。
+        # v1.7.26：两类配置值分开对待。安全开关先判：**类型不对 / 认不出来
+        # 就拒绝启动**，绝不回退内置默认值（read_only 默认 false、
+        # ip_allowlist 默认 [] = 放行所有 IP、allow_delete 默认 true、
+        # backup_required 默认 false —— 回退就是把门打开）。v1.7.25 那套
+        # 一刀切回退对大小/天数/端口是对的，用在这里是 fail-open。
+        # merge_config_layers 把 null 当「没填」丢掉：普通键这样无害，但
+        # 安全开关写 null 会静默落到默认值（allow_delete 默认 true）。把这类
+        # 键按原值补回去交给严格校验判成致命错误。env 已覆盖的不算。
+        raw_data = data or {}
+        for key in (SAFETY_BOOL_KEYS | SAFETY_LIST_KEYS):
+            if (key in raw_data and raw_data[key] is None
+                    and report["sources"].get(key) != "env"):
+                merged[key] = None
+                report["sources"][key] = "file"
+        merged, safety_warnings, safety_errors = validate_safety_config(
+            DEFAULT_CONFIG, merged, report["sources"])
+        # 环境变量层同一口径：安全开关的脏值不能只被「忽略并告警」
+        safety_errors = safety_errors + safety_env_errors(report["env_warnings"])
+        if safety_errors:
+            keys = "、".join(e["key"] for e in safety_errors)
+            raise ConfigSafetyError(
+                "安全开关配置类型不对，拒绝启动：" + keys + "。"
+                "布尔开关请写 true/false（不带引号，也别写 1/0 之外的数字），"
+                "白名单请写成 [\"...\"] 这样的 JSON 数组；"
+                "这类键绝不猜默认值继续跑，因为默认值往往是「关掉保护」。"
+                "改好后重新启动（报错只列键名，不回显你填的值）")
+        # 普通配置键：v1.7.25 的回退默认 + 结构化告警，方向不变。
         merged, type_warnings = validate_config_types(
             DEFAULT_CONFIG, merged, report["sources"])
+        type_warnings = safety_warnings + type_warnings
         report["config_warnings"] = type_warnings
         self.__dict__.update(merged)
         self._layers = report
@@ -1069,6 +1097,22 @@ _CONFIG_NOTES = {
     '"roots"': [
         "// ★ 允许 AI 操作的目录白名单，越窄越安全。例： \"roots\": [\"D:\\\\share\"]",
     ],
+    '"read_only"': [
+        "// ★ 安全开关（read_only / allow_delete / allow_move / auto_backup /",
+        "//   backup_required / exec_enabled / exec_strict_chain / enable_mcp /",
+        "//   preflight_check / public_health）必须写成不带引号的 true/false。",
+        "// 写成 \"true\"（多了引号）会按 true 严格解析，并提示改回标准写法；",
+        "// 写成 \"yes\" / null / 2 这类认不出来的值，服务会直接拒绝启动。",
+        "// 不能猜默认值：read_only 的默认 false 就是「只读被关掉」。",
+        "// 严格起见也接受 \"true\"/\"false\"/\"1\"/\"0\" 字符串和整数 1/0，",
+        "// 但会在启动横幅 / /api/health / win_probe 里提示改成标准写法。",
+    ],
+    '"ip_allowlist"': [
+        "// ★ IP 白名单必须是 JSON 数组，例： [\"10.0.0.0/8\", \"127.0.0.1\"]。",
+        "// 留空数组 = 不限制来源。写成 \"10.0.0.0/8\"（少了方括号）会拒绝启动：",
+        "// 回退成空数组等于放行所有 IP，这个错不能悄悄吞掉。",
+        "// tools_disable 同理必须是数组。",
+    ],
     '"exec_allowed_commands"': [
         "// 远程命令执行（win_exec）的程序白名单：只查整条命令的首程序",
         "//（去掉 cmd /c 前缀后第一个程序），&&、|、2>&1 都交给 cmd 处理。",
@@ -1097,8 +1141,10 @@ _CONFIG_NOTES = {
     ],
     '"backup_max_bytes"': [
         "// ★ 所有数值型配置一律填【纯整数字节数】，不要写 \"2GB\" / \"8MB\"",
-        "// 这类带单位的字符串：类型不对会在启动时回退到内置默认值，并在",
-        "// /api/health 与 win_probe 里报出来（v1.7.25）。0 表示不按体积清理。",
+        "// 这类带单位的字符串：类型不对会回退到内置默认值，并在【启动横幅】、",
+        "// /api/health 与 win_probe 里报出来（v1.7.25 起）。0 表示不按体积清理。",
+        "// 注意：只有普通数值（大小 / 天数 / 端口）才回退默认值 + 告警；",
+        "// 上面那些安全开关类型不对是直接拒绝启动（v1.7.26）。",
     ],
     '"backup_dedup"': [
         "// 增量备份：内容完全相同的历史版本共用一份磁盘实体（NTFS 硬链接）。",
@@ -1126,6 +1172,8 @@ _CONFIG_NOTES = {
         "// 例：WKFILE_PORT=9000 / WKFILE_EXEC_ENABLED=true 可临时覆盖，",
         "// 只允许覆盖本文件里已有的键；拼错的键忽略并在 win_probe 里报告。",
         "// 环境变量不会被界面保存写回本文件，撤掉即恢复本文件里的值。",
+        "// port 必须填纯整数：写成 \"10087\" 会回退到内置 8788，并在启动",
+        "// 横幅明确提示「按 listening 行的端口连」，别照着这里写的端口连。",
     ],
     '"token"': [
         "// ★ 访问 Token。留空时程序会自动生成一个；也可以自己填任意长随机串。",
@@ -1167,6 +1215,12 @@ def load_config(path: str, env: dict | None = None) -> Config:
 
     但**真正的语法错误照样报错**（与旧行为一致）：手改坏了配置必须当场知道，
     静默退化成默认值等于把 roots/token 全部清空，那比崩一次危险得多。
+
+    v1.7.26：安全开关（read_only / ip_allowlist / allow_delete /
+    backup_required 等）类型不对会抛 ConfigSafetyError，由 main() 转成
+    「拒绝启动」。这一条同样不能退化成默认值 —— 默认值在那里意味着
+    「关掉保护」。GUI 也单独兜住它并锁住保存/启动，避免把脏配置
+    悄悄覆盖成默认值。
     """
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8-sig") as fh:
@@ -2240,10 +2294,11 @@ class Agent:
         config_warnings = layers.get("config_warnings") or []
         if config_warnings:
             issues.append(
-                f"有 {len(config_warnings)} 个配置项类型不对，已回退到内置默认值："
+                f"有 {len(config_warnings)} 个配置项类型不对或写法不规范，"
+                "已按规则处理（普通数值回退内置默认值 / 安全开关严格解析）："
                 + "、".join(str(w.get("key", "?")) for w in config_warnings)
-                + "；数值键请填纯整数、不要带单位，"
-                  "详见 config.layers.config_warnings")
+                + "；数值键请填纯整数、不要带单位，布尔开关请写 true/false，"
+                  "详见 config.layers.config_warnings（启动横幅也会打印）")
         if int(getattr(cfg, "patch_max_rollback_bytes", 0) or 0) <= 0:
             issues.append("patch_max_rollback_bytes 配成了 0 或负数，已回退到内置 "
                           "8MB 安全上限；该配置不支持「0=不限」，请改成正数")
@@ -4817,6 +4872,9 @@ class Handler(BaseHTTPRequestHandler):
         v1.7.25：配置类型错误不能只躺在日志里 —— 换版重启时，这是唯一
         不用鉴权就能看到的地方。只报数量与键名，绝不带配置值/路径/Token；
         详情走需要鉴权的 win_probe。
+        v1.7.26：安全开关类型不对已改成**直接拒绝启动**（不会走到这里），
+        这里剩下的都是普通数值回退 / 安全开关写法规范化，所以 hint 不再
+        笼统写「已回退内置默认值」。启动横幅同步打印同一份告警。
         """
         out = {"service": SERVICE, "version": VERSION}
         cw = getattr(self.agent.cfg, "config_warnings", None) or []
@@ -4824,7 +4882,7 @@ class Handler(BaseHTTPRequestHandler):
             out["config_warnings"] = {
                 "count": len(cw),
                 "keys": [w["key"] for w in cw],
-                "hint": "类型不对已回退内置默认值，详见 win_probe（需鉴权）",
+                "hint": "普通数值已回退默认值 / 安全开关已严格解析，详见 win_probe（需鉴权）",
             }
         return out
 
@@ -5043,7 +5101,17 @@ def main(argv=None):
                   f"（写到配置里请用 --renew-token --token-days {args.token_days:g}）")
         return 0
 
-    cfg = load_config(cfg_path)
+    # v1.7.26：安全开关类型不对 = fail-open，绝不猜默认值继续跑。
+    # 这里必须在绑端口、生成 Token、写回配置之前就拦下来。
+    try:
+        cfg = load_config(cfg_path)
+    except ConfigSafetyError as exc:
+        print("[X] 拒绝启动：安全开关配置有歧义，服务不会带着被打开的安全门运行")
+        print("    " + str(exc))
+        print("    常见手滑：\"read_only\": \"yes\"（认不出来）、"
+              "\"ip_allowlist\": \"10.0.0.0/8\"（少了数组括号）")
+        print("    修复后重新启动；这次没有监听任何端口，也没有改写配置文件。")
+        return 5
 
     if args.renew_token:
         cfg.token = secrets.token_urlsafe(36)
@@ -5184,6 +5252,13 @@ def main(argv=None):
         "[preflight %s]" % ("ON" if getattr(cfg, "preflight_check", True) else "OFF"),
     ]
     print(f"[{SERVICE} {VERSION}]  listening {scheme}://{cfg.host}:{cfg.port}  " + "  ".join(flags))
+    # v1.7.26：配置告警必须出现在启动横幅。此前只躺在 /api/health 和
+    # win_probe 里，运维不主动查就永远不知道 port 悄悄回退成了 8788、
+    # 或者哪个数值被改回了默认值。安全开关的脏值已在 load_config 阶段
+    # 拒绝启动，走不到这里（见 ConfigSafetyError）。
+    for _line in format_config_warnings(
+            getattr(cfg, "config_warnings", None), port=cfg.port):
+        print(_line)
     if tls_on:
         _desc = describe_cert(cfg.tls_cert)
         _n, _incomplete = chain_health(cfg.tls_cert, tls_chain)

@@ -386,6 +386,12 @@ def validate_config_types(defaults: dict, merged: dict,
                           sources: dict) -> tuple[dict, list[dict]]:
     """按内置默认值的类型校验合并后的配置：脏值回退默认 + 结构化告警。
 
+    v1.7.26：**只负责普通配置键**。安全开关（read_only / ip_allowlist /
+    allow_delete / backup_required …）由 validate_safety_config 先行处理，
+    类型不对直接拒绝启动 —— 默认值在那里等于「关掉保护」，不能回退。
+    两类值分开之后，本函数继续对大小、天数、端口、路径等键保持
+    「回退默认 + 告警」，并把每条告警标成 action=fallback。
+
     v1.7.25：**配置文件层此前完全没有类型校验**（只有环境变量层有
     coerce_env_value）。于是 `"backup_max_bytes": "2GB"` 这种很自然的
     写法会一直活到运行时的 int() 才炸 —— 启动清理被 Agent.__init__ 的
@@ -414,6 +420,7 @@ def validate_config_types(defaults: dict, merged: dict,
         warnings.append({
             "key": key,
             "layer": sources.get(key, "default"),
+            "action": "fallback",
             "expected": expected,
             "got": type(val).__name__,
             "message": (f"配置项 {key} 类型不对（期望 {expected}，"
@@ -421,6 +428,166 @@ def validate_config_types(defaults: dict, merged: dict,
                         "数值请填纯整数，不要带单位"),
         })
     return cleaned, warnings
+
+
+# ---------------------------------------------------------------------------
+# 安全开关：类型不对就拒绝启动（v1.7.26）
+# ---------------------------------------------------------------------------
+
+class ConfigSafetyError(ValueError):
+    """安全开关的类型不可识别 —— 拒绝启动，绝不猜一个默认值继续跑。
+
+    v1.7.25 把「脏值回退默认值」一刀切用到所有配置键上，但默认值对安全
+    开关来说往往等于「关掉保护」：read_only 的默认是 false、ip_allowlist
+    的默认是空数组（等于放行所有 IP）、allow_delete 的默认是 true、
+    backup_required 的默认是 false。一个手滑的引号就能把四道门同时打开，
+    服务还照常启动、横幅一声不吭 —— 比起不来危险得多。
+
+    继承 ValueError 只是为了让既有「配置读取失败」的调用点都能兜住；
+    文案必须与 JSON 语法错误区分清楚，见 Config.__init__ 的抛出点。
+    """
+
+
+# 这些键的内置默认值处在「更宽松」的一侧，回退 == fail-open，必须严判。
+# 其余键（大小 / 天数 / 端口 / 路径 / 普通数组）继续走回退默认值 + 告警。
+SAFETY_BOOL_KEYS = frozenset({
+    "read_only", "allow_delete", "allow_move", "auto_backup",
+    "backup_required", "exec_enabled", "exec_strict_chain",
+    "enable_mcp", "preflight_check", "public_health",
+})
+SAFETY_LIST_KEYS = frozenset({
+    # 空数组 = 放行所有 IP / 一个工具都不禁用，字符串脏值回退就是全开
+    "ip_allowlist", "tools_disable",
+})
+
+_SAFETY_TRUE_WORDS = frozenset({"true", "1"})
+_SAFETY_FALSE_WORDS = frozenset({"false", "0"})
+
+
+def coerce_safety_bool(val):
+    """严格解析安全开关：只认真布尔、整数 0/1、字符串 true/false/1/0。
+
+    返回 (值, 是否做了规范化)；识别不了返回 (None, False)，由调用方拒启。
+    - 不认 "yes"/"on"/"2GB"/None/2/1.0：猜错方向就是静默开门。
+    - 字符串大小写与首尾空白容忍（手改 JSON 最常见），但绝不接受
+      任何没在白名单里的词。
+    """
+    if isinstance(val, bool):
+        return val, False
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val), True
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in _SAFETY_TRUE_WORDS:
+            return True, True
+        if s in _SAFETY_FALSE_WORDS:
+            return False, True
+    return None, False
+
+
+def validate_safety_config(defaults: dict, merged: dict,
+                           sources: dict) -> tuple[dict, list[dict], list[dict]]:
+    """安全开关专用校验，返回 (规范化后的配置, 提示, 致命错误)。
+
+    与 validate_config_types 的分工（v1.7.26 两类值分开对待）：
+      - 安全开关：能严格识别就规范化（并留一条 action=coerced 提示），
+        识别不了就记一条 action=fatal 错误，由 Config 直接拒绝启动；
+        **绝不回退内置默认值**。
+      - 普通数值：仍由 validate_config_types 回退默认值 + 告警。
+      - 安全数组：只接受「元素全是字符串」的 JSON 数组；单个字符串
+        （例如 "10.0.0.0/8"）不是数组，不能猜成单元素数组，直接拒启。
+
+    错误/提示都只带键名与类型名，不带任何配置值 —— 它们会出现在
+    启动横幅、免鉴权 /api/health 和日志里，同一份配置里还有 Token。
+    """
+    cleaned = dict(merged)
+    warnings, errors = [], []
+    for key in sorted(SAFETY_BOOL_KEYS | SAFETY_LIST_KEYS):
+        if key not in defaults or key not in cleaned:
+            continue
+        val = cleaned[key]
+        layer = sources.get(key, "default")
+        if key in SAFETY_BOOL_KEYS:
+            coerced, normalized = coerce_safety_bool(val)
+            if coerced is None:
+                errors.append({
+                    "key": key, "layer": layer, "action": "fatal",
+                    "expected": "true/false（布尔值，不加引号）",
+                    "got": type(val).__name__,
+                    "message": (f"安全开关 {key} 的值无法识别（期望 true/false，"
+                                f"实际 {type(val).__name__}），拒绝启动；"
+                                "布尔开关必须写 true/false，不能写带引号的字符串"),
+                })
+                continue
+            cleaned[key] = coerced
+            if normalized:
+                warnings.append({
+                    "key": key, "layer": layer, "action": "coerced",
+                    "expected": "true/false（布尔值，不加引号）",
+                    "got": type(val).__name__,
+                    "message": (f"安全开关 {key} 用的是非标准写法（{type(val).__name__}），"
+                                "已按 true/false 严格解析；建议改成不带引号的布尔值"),
+                })
+        else:
+            ok = isinstance(val, list) and all(isinstance(x, str) for x in val)
+            if not ok:
+                errors.append({
+                    "key": key, "layer": layer, "action": "fatal",
+                    "expected": "元素全是字符串的 JSON 数组",
+                    "got": type(val).__name__,
+                    "message": (f"安全白名单 {key} 类型不对（期望 JSON 数组，"
+                                f"实际 {type(val).__name__}），拒绝启动；"
+                                "请写成 [\"...\"] 这样的数组，不能写单个字符串"),
+                })
+    return cleaned, warnings, errors
+
+
+def safety_env_errors(env_warnings, *, prefix=ENV_PREFIX) -> list[dict]:
+    """环境变量层里，安全开关的脏值也必须拒绝启动。
+
+    coerce_env_value 对拼错的值只「忽略并告警」，普通键这样没问题，但
+    安全开关忽略 == 落到默认值 == fail-open：WKFILE_READ_ONLY=maybe
+    会让只读静默关闭，而且 env_warnings 只在 win_probe 里、启动横幅看不到。
+    这里把这类告警升级成致命错误，与配置文件层同一口径。
+    """
+    errors = []
+    for warn in env_warnings or []:
+        name = str(warn).split(":", 1)[0].strip()
+        if not name.startswith(prefix):
+            continue
+        key = name[len(prefix):].lower()
+        if key not in SAFETY_BOOL_KEYS and key not in SAFETY_LIST_KEYS:
+            continue
+        errors.append({
+            "key": key, "layer": "env", "action": "fatal",
+            "expected": ("true/false" if key in SAFETY_BOOL_KEYS
+                         else "JSON 数组"),
+            "got": "环境变量字符串",
+            "message": (f"环境变量 {name} 的值无法识别，安全开关不能忽略后"
+                        "回退默认值；拒绝启动，请改成 true/false 或 JSON 数组"),
+        })
+    return errors
+
+
+def format_config_warnings(warnings, *, port=None) -> list[str]:
+    """把 config_warnings 渲染成启动横幅行（纯函数，便于测试）。
+
+    v1.7.26：告警此前只躺在 /api/health 和 win_probe 里，运维不去查就
+    永远看不见。所有告警必须打到启动横幅；port 回退尤其要提示「按
+    listening 行的端口连」，否则会照着配置里写的端口连然后以为服务没起来。
+    """
+    items = [w for w in (warnings or []) if isinstance(w, dict)]
+    if not items:
+        return []
+    lines = ["[!] 配置告警：%d 项（启动横幅 / /api/health / win_probe 三处同时可见）"
+             % len(items)]
+    for w in items:
+        lines.append("[!]   %s [%s] %s" % (
+            w.get("key", "?"), w.get("layer", "?"), w.get("message", "")))
+    if port is not None and any(w.get("key") == "port" for w in items):
+        lines.append("[!]   port 已回退到内置默认值，当前实际监听端口是 %s —— "
+                     "请按上面 listening 行的端口连接，别按配置文件里写的端口连" % port)
+    return lines
 
 
 # ---------------------------------------------------------------------------
