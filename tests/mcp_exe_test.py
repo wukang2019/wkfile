@@ -298,7 +298,8 @@ def main():
               body[:200])
 
         # v1.7.9：超限输出落盘 output_file + win_read 可直读全量
-        big_content = ("BIGLINE-" + "x" * 99 + "\n") * 2200          # ~ 230KB > 64KB
+        big_content = (("BIGLINE-" + "x" * 99 + "\n") * 2200
+                       + "FATAL_AT_END_AT_TAIL\n")       # ~230KB > 64KB，尾部带报错行
         st, _, body = post("/api/write", {"path": os.path.join(share, "big.txt"),
                                           "content": big_content})
         check("准备大文件用于输出截断测试", st == 200, body[:120])
@@ -312,6 +313,24 @@ def main():
         check("超限输出已落盘（output_truncated + output_file）",
               r["isError"] is False and sc.get("output_truncated") is True
               and out_file and out_file.endswith(".txt"), body[:200])
+        # v1.7.18：预览必须头尾双端保留，且 win_tail 能直读 exec 落盘输出
+        exec_text = " ".join(i.get("text", "") for i in r.get("content", []))
+        check("预览保留头部与尾部报错（不再只留头）",
+              "BIGLINE-" in exec_text and "FATAL_AT_END_AT_TAIL" in exec_text,
+              exec_text[:200])
+        check("返回省略行数与预览字节数",
+              sc.get("output_omitted_lines", 0) > 0
+              and sc.get("output_preview_bytes", 0) > 0,
+              str({k: sc.get(k) for k in ("output_omitted_lines", "output_preview_bytes")}))
+        st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 161, "method": "tools/call",
+                                    "params": {"name": "win_tail",
+                                               "arguments": {"path": out_file, "lines": 3}}},
+                           headers={"Mcp-Session-Id": sid})
+        t_res = json.loads(body)["result"]
+        t_txt = " ".join(i.get("text", "") for i in t_res.get("content", []))
+        check("win_tail 能读 exec 落盘输出（旧版被数据目录禁访拦截）",
+              t_res.get("isError") is False and "FATAL_AT_END_AT_TAIL" in t_txt,
+              t_txt[:200])
         st, _, body = post("/mcp", {"jsonrpc": "2.0", "id": 15, "method": "tools/call",
                                     "params": {"name": "win_read",
                                                "arguments": {"path": out_file,

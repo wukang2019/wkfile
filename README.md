@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.17\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.18\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.17.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.18.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.17\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.18\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -140,7 +140,8 @@ wkfile\                          ← 程序启动时唯一会创建的地方（�
 ├─ logs\audit.jsonl              审计日志（超 5 MB 轮转，留 3 份；文件操作记
 │                                  path，数据库操作记 source/sql/database/table）
 ├─ backups\<时间戳-毫秒>\<根目录>\…  改写/覆盖文件前的自动备份
-│                                  （总量超 backup_max_bytes 从最旧开始清，默认 2 GB）
+│                                  （按总量 backup_max_bytes / 份数 backup_retain_count /
+│                                   天龄 backup_retain_days 三维度从最旧开始清，后两项默认 0）
 └─ trash\<trash_id>\…            删除的东西（可用 trash_id 恢复，不是真删；
                                    超过 trash_retain_days 天自动清，默认 30 天）
 ```
@@ -168,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.17\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.18\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -673,6 +674,21 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
      `true` 时页尾补一个 `\n`，否则直接接下一页。**不要按 `line_fragment` / `eof`
      猜**——末尾有无换行的文件会各错一半。同时修好「末行无换行且跨页」时 EOF 页
      少算一行的问题，各页 `returned_lines` 之和恒等于逻辑行数。
+   - **命令输出不再丢尾部报错、数据库翻页不用猜、备份清得掉**（v1.7.18）：
+     `win_exec` 超限时只回「头 20 行 + 尾 40 行」压缩预览（`head_lines` /
+     `tail_lines` / `max_output_bytes` 可调小省 token，后者**不能超过**服务端上限），
+     全文落在 `output_file`，`win_tail` 现在能直接读它看尾部报错（旧版被
+     「数据目录禁访」拒绝，只能拿 `win_read` 逐页翻）。
+     `win_db_query` 截断时返回 `page_hint`：该数据源方言的分页 SQL 模板、下一页
+     `OFFSET` 和稳定 `ORDER BY` 提醒。**没有加 `offset` 参数** —— MySQL / SQL Server
+     都是读完整结果流再丢弃超出行，API 层 offset 只改丢弃区间，数据库一点没省，
+     还会因两次查询间数据变动重复/漏行；按模板改写 SQL 才是真分页。
+     备份保留新增 `backup_retain_days` / `backup_retain_count` 两个服务端配置，
+     与原有 `backup_max_bytes` 三者任一超限就从最旧的时间戳目录清。**默认都是 0**
+     （升级后不擅自删已有备份，需显式启用）：攒了几百份小文件就填
+     `backup_retain_days=30`、`backup_retain_count=200`。`win_backup_list` 返回只读
+     `policy` 快照（总份数 / 总体积 / 按策略会清几份），**不提供删除备份的工具**
+     —— 让 AI 能删掉回滚兜底比写错文件更危险，手动清理请由运维在服务器上做。
    - 改 Token / 白名单 / 端口后**必须重启服务**才生效（暂未做配置热重载）。
    - 不开 HTTPS 的话，Token 仍是明文过公网 —— 这是最大的剩余风险，见第 7 条。
 10. **开数据库之前请先想清楚这三件事**（v1.6.0 新增能力）：
@@ -743,7 +759,14 @@ python tests\mcp_exe_test.py            # MCP 端点（打包后的 exe）：53 
 
 ````
 
-当前状态（v1.7.17 实测）：**53/53、207/207（另 2 项环境不具备自动跳过）、59/59、13/13、11/11、152/152、56/56 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 54 项与打包后 `wkfile.exe --check-gui` 自检。
+当前状态（v1.7.18 实测，源码级）：**selftest 53/53、features 207/207（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项。
+
+> ⚠️ **本轮 exe 黑盒未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
+> 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
+> `wkfile.exe --check-gui` 跑不起来。上一版 v1.7.17 用同一构建脚本产出的 exe
+> 黑盒 56/56 与真窗口自检均通过，且本轮**未改动 GUI 代码**；上述源码级回归已
+> 覆盖本轮全部改动（含真实 `op_exec` + `win_tail` 闭环、备份目录清理）。
+> 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：
 

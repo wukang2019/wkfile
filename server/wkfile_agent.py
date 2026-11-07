@@ -92,7 +92,7 @@ try:
 except Exception:  # noqa: BLE001
     sqlsrvmod = None
 
-VERSION = "1.7.17"
+VERSION = "1.7.18"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -150,6 +150,12 @@ DEFAULT_CONFIG = {
     # 备份目录总量上限：超过就从最旧的时间戳文件夹开始整目录清掉，
     # 直到低于上限（0 = 不清理，保持旧行为）。防止长期运行吃满磁盘。
     "backup_max_bytes": 2 * 1024 * 1024 * 1024,
+    # v1.7.18：只按体积清，对「攒了几百份小文件」无效（远不到 2GB）。
+    # 再加两个维度，三者任一超限就从最旧的目录开始清，0 = 该维度不启用。
+    # 建议运维填 backup_retain_days=30、backup_retain_count=200；
+    # 默认 0 是为了升级后不擅自删掉任何已有备份，需显式启用。
+    "backup_retain_days": 0,
+    "backup_retain_count": 0,
     # 回收站保留天数：超过天数的条目整个清掉（0 = 永久保留，保持旧行为）。
     "trash_retain_days": 30,
     "tls_cert": "",
@@ -1590,32 +1596,94 @@ class Agent:
             return
         self.cleanup_backups()
 
-    def cleanup_backups(self):
-        """备份总量超 backup_max_bytes → 从最旧的时间戳文件夹整目录清掉。
+    @staticmethod
+    def _backup_cleanup_plan(entries: list[dict], *, max_bytes: int = 0,
+                             retain_days: int = 0, retain_count: int = 0,
+                             now: float | None = None) -> list[str]:
+        """算出该删哪些备份时间戳目录（纯函数，不碰磁盘，测试可直接调）。
 
-        时间戳文件夹之间互相独立（一个文件夹 = 一次改写动作），整目录删除
-        不会破坏其他备份的完整性。0 = 不清理。
+        entries 按时间升序，每项 {"stamp","size","mtime"}。三个维度是 OR：
+        总量超 max_bytes / 份数超 retain_count / 天龄超 retain_days，
+        任一超限就从最旧的开始删，直到全部达标。0 = 该维度不启用。
         """
-        limit = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
-        if limit <= 0:
-            return
+        now = time.time() if now is None else now
+        total = sum(int(e.get("size") or 0) for e in entries)
+        cutoff = now - retain_days * 86400 if retain_days > 0 else 0
+        plan, removed = [], 0
+        for e in entries:
+            over_bytes = max_bytes > 0 and total > max_bytes
+            over_count = retain_count > 0 and (len(entries) - removed) > retain_count
+            over_age = retain_days > 0 and float(e.get("mtime") or 0) < cutoff
+            if not (over_bytes or over_count or over_age):
+                break
+            plan.append(str(e["stamp"]))
+            removed += 1
+            total -= int(e.get("size") or 0)
+        return plan
+
+    def _backup_entries(self) -> tuple[str, list[dict]]:
+        """扫描备份根，返回 (根路径, 按时间升序的条目)。"""
         base = backup_root(self.cfg.base_dir)
         try:
             stamps = sorted(d for d in os.listdir(base)
                             if os.path.isdir(os.path.join(base, d)))
         except OSError:
-            return
-        total = 0
-        sizes = {}
+            return base, []
+        out = []
         for st in stamps:
-            sz = _dir_size(os.path.join(base, st))
-            sizes[st] = sz
-            total += sz
-        for st in stamps:                     # 从最旧开始清，直到达标
-            if total <= limit:
-                break
+            p = os.path.join(base, st)
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                mtime = 0.0
+            out.append({"stamp": st, "size": _dir_size(p), "mtime": mtime})
+        return base, out
+
+    def cleanup_backups(self):
+        """按总量 / 份数 / 天龄三种策略清理备份（从最旧开始整目录删除）。
+
+        v1.7.18：此前只按 backup_max_bytes 体积清，攒了几百份小文件时远
+        不到 2GB，永远不清。三个维度任一为 0 表示该维度不启用。
+        时间戳文件夹之间互相独立（一个文件夹 = 一次改写动作），整目录
+        删除不会破坏其他备份的完整性。
+        """
+        max_bytes = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
+        days = max(0, int(getattr(self.cfg, "backup_retain_days", 0) or 0))
+        count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
+        if max_bytes <= 0 and days <= 0 and count <= 0:
+            return
+        base, entries = self._backup_entries()
+        plan = self._backup_cleanup_plan(
+            entries, max_bytes=max_bytes, retain_days=days, retain_count=count)
+        for st in plan:
             shutil.rmtree(os.path.join(base, st), ignore_errors=True)
-            total -= sizes.get(st, 0)
+
+    def _backup_policy(self) -> dict:
+        """给 win_backup_list 的只读策略快照：让运维看清「积了多少、配了什么」。
+
+        只报数、不删除；策略是服务端配置，不开放给 AI 改。
+        """
+        _base, entries = self._backup_entries()
+        max_bytes = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
+        days = max(0, int(getattr(self.cfg, "backup_retain_days", 0) or 0))
+        count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
+        plan = self._backup_cleanup_plan(
+            entries, max_bytes=max_bytes, retain_days=days, retain_count=count)
+        total = sum(int(e.get("size") or 0) for e in entries)
+        return {
+            "max_bytes": max_bytes,
+            "max_bytes_human": human_size(max_bytes) if max_bytes > 0 else "不限",
+            "retain_days": days,
+            "retain_count": count,
+            "enabled": bool(max_bytes > 0 or days > 0 or count > 0),
+            "total_count": len(entries),
+            "total_bytes": total,
+            "total_bytes_human": human_size(total),
+            "would_remove": len(plan),
+            "note": ("保留策略由服务端配置（backup_max_bytes / backup_retain_days / "
+                     "backup_retain_count）控制，在服务启动与每 32 次备份时执行；"
+                     "不开放给 AI 删除备份，需要手动清理请由运维在服务器上处理。"),
+        }
 
     def cleanup_trash(self):
         """回收站超过 trash_retain_days 的条目整个清掉。0 = 永久保留。"""
@@ -2454,6 +2522,9 @@ class Agent:
             "items": items,
             "truncated": truncated,
             "filter": want,
+            # v1.7.18：只读策略快照（总量/份数/天龄阈值 + 当前积了多少 +
+            # 按当前策略会清掉几份），让运维不用翻配置文件就知道现状。
+            "policy": self._backup_policy(),
         }
 
     def _find_backup_for(self, original: str) -> str:
@@ -2529,7 +2600,12 @@ class Agent:
 
     def op_tail(self, req: dict) -> dict:
         """只看文件末尾若干行 —— 查日志的主力工具，不用先把整个文件读进来。"""
-        full = self.guard.resolve(req.get("path"))
+        # v1.7.18：win_exec 落盘的 logs\exec-*.txt 不在 roots 里，但就是给 AI
+        # 看尾部报错用的。与 op_read 共用同一个精确白名单口（只放行该目录下
+        # 的直接子文件，不开放整个数据目录）。此前漏了这一步，win_tail 读
+        # output_file 会被「数据目录禁访」拒绝，只能拿 win_read 逐页翻。
+        full = (self._resolve_exec_output(req.get("path"))
+                or self.guard.resolve(req.get("path")))
         if not os.path.isfile(full):
             raise PathError("not_found", f"文件不存在：{full}")
         n = max(1, min(int(req.get("lines", 100) or 100), 5000))
@@ -3029,11 +3105,56 @@ class Agent:
             if key in data:
                 setattr(self.cfg, key, data[key])
 
+    @staticmethod
+    def _exec_preview(output: str, output_file: str | None, max_out: int,
+                      head_lines: int, tail_lines: int) -> tuple[str, int]:
+        """把超限命令输出压成「头 N 行 + 尾 M 行」预览。
+
+        纯函数（不碰磁盘、不读配置，测试可直接调）：启动上下文在头部、
+        真正报错在尾部，只留一头必然丢一半信息。返回 (预览文本, 省略行数)。
+        """
+        lines = output.splitlines()
+        h = max(0, min(int(head_lines or 0), 500))
+        t = max(0, min(int(tail_lines or 0), 500))
+        where = f"完整输出已存 {output_file}，" if output_file else ""
+        if not h and not t:
+            # 调用方明确不要按行预览：仍按字节留头 1/3 + 尾 2/3，
+            # 别只回一句「全文在别处」。
+            raw0 = output.encode("utf-8", "ignore")
+            note0 = (f"\n...（输出超限，已按 {max_out} 字节压缩；{where}"
+                     "可用 win_read / win_tail 读全文）...\n")
+            budget0 = max(1, max_out - len(note0.encode("utf-8")))
+            hb0, tb0 = budget0 // 3, budget0 - budget0 // 3
+            return (raw0[:hb0].decode("utf-8", "ignore") + note0
+                    + raw0[-tb0:].decode("utf-8", "ignore")), 0
+        if h + t >= len(lines):
+            head, tail, omitted = lines, [], 0
+        else:
+            head = lines[:h]
+            tail = lines[len(lines) - t:] if t else []
+            omitted = len(lines) - len(head) - len(tail)
+        mid = (f"\n...（输出超限，预览只留头 {len(head)} 行 + 尾 {len(tail)} 行，"
+               f"中间省略 {omitted} 行；{where}可用 win_read / win_tail 读取）...\n")
+        preview = "\n".join(head)
+        if tail or omitted:
+            preview += mid + "\n".join(tail)
+        raw = preview.encode("utf-8", "ignore")
+        if len(raw) > max_out:
+            # 单行超长 / 行预算给太大时按字节兜底：头 1/3 + 尾 2/3，
+            # 尾部多留一点，因为报错通常在最后。
+            note = (f"\n...（预览按 {max_out} 字节上限再次压缩；{where}"
+                    "可用 win_read / win_tail 读全文）...\n")
+            budget = max(1, max_out - len(note.encode("utf-8")))
+            hb, tb = budget // 3, budget - budget // 3
+            preview = (raw[:hb].decode("utf-8", "ignore") + note
+                       + (raw[-tb:].decode("utf-8", "ignore") if tb else ""))
+        return preview, omitted
+
     def _persist_exec_output(self, text: str) -> str | None:
         """超限输出落盘：数据目录 logs\\exec-<时间戳>.txt，只保留最近 30 份。
 
-        返回文件路径（win_read 可直接读，见 _resolve_exec_output 的白名单口），
-        落盘失败返回 None —— 输出通道绝不能因为落盘失败而整体失败。
+        返回文件路径（win_read / win_tail 可直接读，见 _resolve_exec_output
+        的白名单口），落盘失败返回 None —— 输出通道绝不能因为落盘失败而整体失败。
         """
         try:
             out_dir = os.path.join(self.cfg.base_dir, "logs")
@@ -3118,7 +3239,13 @@ class Agent:
 
         timeout = min(max(self._int_arg(req, "timeout",
                                         int(self.cfg.exec_timeout_sec or 60)) or 60, 1), 300)
-        max_out = int(self.cfg.exec_max_output_bytes or 65536)
+        # 服务端上限是天花板；按调用只能调小（省响应体积 / token），不能放大。
+        cfg_max_out = int(self.cfg.exec_max_output_bytes or 65536)
+        max_out = max(1, min(self._int_arg(req, "max_output_bytes", cfg_max_out)
+                             or cfg_max_out, cfg_max_out))
+        # v1.7.18：默认头 20 行 + 尾 40 行（此前只留头部，报错常在尾部被丢）。
+        head_lines = max(0, min(self._int_arg(req, "head_lines", 20) or 0, 500))
+        tail_lines = max(0, min(self._int_arg(req, "tail_lines", 40) or 0, 500))
         # 围栏⑦（v1.7.11 引入，v1.7.12 全链）：cwd 劫持防护——cwd 默认就是
         # roots[0]（AI 可写），Windows 程序搜索序 cwd 优先于 PATH；链上每一段
         # 的首程序都要过投放检测（`dir && payload.bat` 这种借道也被拒）
@@ -3169,16 +3296,14 @@ class Agent:
         output, out_enc = decode_text(raw or b"")
         truncated = len(output.encode("utf-8", "ignore")) > max_out
         output_file = None
+        omitted_lines = 0
+        preview = output
         if truncated:
-            # 完整输出落盘（v1.7.9）：预览留在响应里，全量存 logs\exec-*.txt，
-            # AI 拿 output_file 路径用 win_read 分段读 —— 不用再靠对话窗口猜
+            # 完整输出落盘（v1.7.9）：全量存 logs\exec-*.txt，响应里只留压缩预览，
+            # AI 拿 output_file 用 win_read / win_tail 按需读全文（v1.7.18）。
             output_file = self._persist_exec_output(output)
-            cut = output.encode("utf-8", "ignore")[:max_out].decode("utf-8", "ignore")
-            note = (f"\n...（输出超过 {max_out} 字节，已截断；"
-                    f"完整输出已存 {output_file}，可用 win_read 读取）"
-                    if output_file else
-                    f"\n...（输出超过 {max_out} 字节，已截断）")
-            output = cut + note
+            preview, omitted_lines = self._exec_preview(
+                output, output_file, max_out, head_lines, tail_lines)
         return {
             "command": command,
             "cwd": cwd,
@@ -3188,7 +3313,9 @@ class Agent:
             "output_encoding": out_enc,
             "output_truncated": truncated,
             "output_file": output_file,
-            "output": output,
+            "output_omitted_lines": omitted_lines,
+            "output_preview_bytes": len(preview.encode("utf-8", "ignore")),
+            "output": preview,
         }
 
     # ---- 分发 ----
@@ -3353,8 +3480,17 @@ class Agent:
                 f"写语句请改用 win_db_exec（需要数据源已开启允许写入）。",
             )
         # 只读查询：即使用完整 Token，也照样开会话只读
-        return self._db_call(src.run, sql, max_rows=self._int_arg(req, "max_rows"),
-                             force_readonly=True)
+        rows_cap = (self._int_arg(req, "max_rows")
+                    or int(getattr(src, "max_rows", 200) or 200))
+        result = self._db_call(src.run, sql, max_rows=self._int_arg(req, "max_rows"),
+                               force_readonly=True)
+        # v1.7.18：截断不是「让 AI 猜下一页」，而是直接给出该方言的真分页 SQL。
+        # 不加 offset 参数 —— MySQL / SQL Server 都是读完整结果流再丢弃超出行，
+        # API 层 offset 只是改丢弃区间，DB 侧一点没省，还会因数据变动漏行/重复。
+        if isinstance(result, dict) and result.get("truncated") and mcpmod is not None:
+            dialect = "tsql" if cls_mod is sqlsrvmod and sqlsrvmod is not None else "mysql"
+            result["page_hint"] = mcpmod.db_page_hint(dialect, rows_cap)
+        return result
 
     def op_db_exec(self, req: dict) -> dict:
         self._require_write()

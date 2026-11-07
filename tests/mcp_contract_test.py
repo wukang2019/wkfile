@@ -253,11 +253,67 @@ def test_contract_matches_real_behavior():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def test_db_page_hint_behavior():
+    """v1.7.18：分页提示不能只是文案，要验它真的随截断结果下发。"""
+    print("\n========== 6. 数据库分页提示与 exec 输出契约（行为断言） ==========")
+    my = m.db_page_hint("mysql", 200)
+    ts = m.db_page_hint("sqlserver", 200)
+    check("MySQL 模板含 LIMIT/OFFSET",
+          my["dialect"] == "mysql" and "LIMIT 200 OFFSET 0" in my["template"])
+    check("T-SQL 模板含 OFFSET/FETCH",
+          ts["dialect"] == "tsql" and "OFFSET 0 ROWS FETCH NEXT 200 ROWS ONLY" in ts["template"])
+    check("下一页游标 = 本页行数", my["next_offset"] == 200 and ts["next_offset"] == 200)
+    check("模板强调稳定 ORDER BY", "ORDER BY" in my["template"] and "ORDER BY" in ts["template"])
+    check("提示说明 max_rows 不是 SQL LIMIT", "不是 SQL LIMIT" in my["note"])
+    r = m.render("win_db_query", {"source": "prod", "columns": ["id"], "rows": [[1]],
+                                  "row_count": 1, "truncated": True, "page_hint": my})
+    check("render 文本带模板与下一页 OFFSET",
+          "LIMIT 200 OFFSET 0" in r and "下一页 OFFSET = 200" in r)
+    txt = m.runtime_contract({"version": "1.7.18"})
+    check("契约写明分页规则", "page_hint" in txt and "ORDER BY" in txt)
+    check("契约写明 exec 尾部输出通道", "output_file" in txt and "win_tail" in txt)
+
+    # 真行为：走 op_db_query 完整路径，截断结果必须挂上 page_hint
+    base = tempfile.mkdtemp(prefix="wk-pagehint-")
+    try:
+        share = os.path.join(base, "share")
+        os.makedirs(share)
+        cfg = wa.Config({"roots": [share], "max_read_bytes": 1 << 20,
+                         "max_write_bytes": 1 << 20}, os.path.join(base, "c.json"))
+        a = wa.Agent(cfg)
+
+        class FakeSrc:
+            max_rows = 200
+
+            def run(self, sql, max_rows=None, force_readonly=False):
+                return {"source": "fake", "columns": ["id"], "rows": [[1]],
+                        "row_count": 1, "truncated": True}
+
+        a.db_source = lambda req, kind=None: FakeSrc()
+        out = a.op_db_query({"sql": "SELECT id FROM t"})
+        check("op_db_query 截断时真的挂 page_hint",
+              out.get("page_hint", {}).get("dialect") == "mysql", str(out)[:200])
+        check("page_hint 的 rows 取数据源 max_rows",
+              out.get("page_hint", {}).get("rows") == 200)
+
+        class SmallSrc(FakeSrc):
+            def run(self, sql, max_rows=None, force_readonly=False):
+                return {"source": "fake", "columns": ["id"], "rows": [[1]],
+                        "row_count": 1, "truncated": False}
+
+        a.db_source = lambda req, kind=None: SmallSrc()
+        check("未截断时不挂 page_hint",
+              "page_hint" not in a.op_db_query({"sql": "SELECT id FROM t"}))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_default_contract()
     test_follows_config()
     test_legacy_and_initialize()
     test_threshold_is_shared()
     test_contract_matches_real_behavior()
+    test_db_page_hint_behavior()
     print("\nMCP_CONTRACT_TEST: %d PASS / %d FAIL" % (len(PASS), len(FAIL)))
     raise SystemExit(1 if FAIL else 0)

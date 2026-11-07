@@ -31,6 +31,22 @@ def check(name, cond, detail=""):
     print(f"  {'[OK]  ' if cond else '[FAIL]'} {name}" + (f"  :: {detail}" if detail and not cond else ""))
 
 
+# 本机回环在连续请求后偶发 WinError 10053（服务端主动关连接时客户端拿到
+# 已关闭的 socket）。只在 TCP 层瞬时异常上重试一次，不吞 HTTP 状态、
+# 不掩盖断言失败 —— 否则发布版回归会随机在第 7 段崩掉而不是报失败项。
+_TRANSIENT = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
+def _open(req):
+    for attempt in range(2):
+        try:
+            return OPENER.open(req, timeout=20)
+        except _TRANSIENT:
+            if attempt:
+                raise
+            time.sleep(0.05)
+
+
 def post(path, body, token=TOKEN, headers=None, raw_body=None):
     url = f"http://{HOST}:{PORT}{path}"
     data = raw_body if raw_body is not None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -40,7 +56,7 @@ def post(path, body, token=TOKEN, headers=None, raw_body=None):
     hdrs.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     try:
-        with OPENER.open(req, timeout=20) as r:
+        with _open(req) as r:
             return r.status, dict(r.headers), r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read().decode("utf-8", "replace")
@@ -54,7 +70,7 @@ def get(path, token=TOKEN, headers=None):
     hdrs.update(headers or {})
     req = urllib.request.Request(url, headers=hdrs, method="GET")
     try:
-        with OPENER.open(req, timeout=20) as r:
+        with _open(req) as r:
             return r.status, dict(r.headers), r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read().decode("utf-8", "replace")

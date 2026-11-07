@@ -15,6 +15,8 @@
   "allow_move": true,
   "auto_backup": true,
   "backup_max_bytes": 2147483648,
+  "backup_retain_days": 0,
+  "backup_retain_count": 0,
   "trash_retain_days": 30,
   "preflight_check": true,
   "enable_mcp": true,

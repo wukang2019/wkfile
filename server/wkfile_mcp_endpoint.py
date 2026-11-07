@@ -36,6 +36,30 @@ STRUCTURED_CONTENT_OMIT_BYTES = 4096
 # win_write_b64 的引导阈值（base64 膨胀约 33%，再大容易被 AI 客户端静默截断）
 BASE64_UPLOAD_HINT_BYTES = 8 * 1024
 
+# 数据库结果被行数上限截断时，给 AI 的「真分页」SQL 模板。
+# max_rows 只是响应里最多带几行，数据库仍然算完整结果集；要省 DB 资源、
+# 要翻页，必须把分页写进 SQL。模板只有这一份：契约、schema、page_hint 共用。
+DB_PAGE_TEMPLATES = {
+    "mysql": "SELECT ... FROM ... ORDER BY <稳定且唯一的列> LIMIT {rows} OFFSET {offset}",
+    "tsql": ("SELECT ... FROM ... ORDER BY <稳定且唯一的列> "
+             "OFFSET {offset} ROWS FETCH NEXT {rows} ROWS ONLY"),
+}
+
+
+def db_page_hint(dialect: str, rows: int) -> dict:
+    """结果被截断时返回该数据源方言的分页模板（纯函数，便于测试与契约复用）。"""
+    d = "tsql" if str(dialect).lower() in ("tsql", "sqlserver", "mssql") else "mysql"
+    n = max(1, min(int(rows or 200), 5000))
+    return {
+        "dialect": d,
+        "rows": n,
+        "template": DB_PAGE_TEMPLATES[d].format(rows=n, offset=0),
+        "next_offset": n,
+        "note": ("max_rows 只限制响应行数，不是 SQL LIMIT，数据库仍会算出完整结果集；"
+                 "翻页请按模板改写 SQL 并递增 OFFSET。必须有稳定唯一的 ORDER BY，"
+                 "否则两次查询之间数据变动会重复或漏行。"),
+    }
+
 
 def human_bytes(n) -> str:
     """把字节数写成人类可读的短标签，专给协议说明用。"""
@@ -313,7 +337,8 @@ TOOLS = [
     },
     {
         "name": "win_tail",
-        "description": "只看文件末尾若干行（默认 100 行）—— 查日志、看最新报错就用它，不用把整个文件读进来。",
+        "description": "只看文件末尾若干行（默认 100 行）—— 查日志、看最新报错就用它，不用把整个文件读进来。"
+                       "win_exec 返回的 output_file（logs\\exec-*.txt）也能直接传进来读尾部报错，无需先逐页 win_read。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -359,7 +384,10 @@ TOOLS = [
     {
         "name": "win_backup_list",
         "description": "列出服务器上的文件备份（每次 win_write / win_replace 覆盖前都会自动存一份）。\n"
-                       "用来查「这个文件以前长什么样」，也用来挑要回滚到哪一版。",
+                       "用来查「这个文件以前长什么样」，也用来挑要回滚到哪一版。\n"
+                       "返回的 policy 是只读的保留策略快照（总量/份数/天龄阈值、当前备份总数与总体积、"
+                       "按策略会清掉几份）。备份清理由服务端配置自动执行，不提供删除工具 —— "
+                       "需要手动清理请让运维改配置或直接在服务器上处理。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -393,7 +421,7 @@ TOOLS = [
     },
     {
         "name": "win_db_query",
-        "description": "在 MySQL/MariaDB/SQL Server 上执行一条**只读** SQL 查询（SELECT / SHOW / DESC / EXPLAIN / WITH...SELECT），返回表格数据。写语句（INSERT/UPDATE/DELETE/DDL/EXEC）会被拒绝，请改用 win_db_exec。结果有行数上限，被截断时返回 truncated=true。",
+        "description": "在 MySQL/MariaDB/SQL Server 上执行一条**只读** SQL 查询（SELECT / SHOW / DESC / EXPLAIN / WITH...SELECT），返回表格数据。写语句（INSERT/UPDATE/DELETE/DDL/EXEC）会被拒绝，请改用 win_db_exec。max_rows 只限制响应行数（数据库仍算完整结果集）；被截断时返回 truncated=true 与 page_hint（含该数据源方言的分页 SQL 模板、下一页 OFFSET 和稳定 ORDER BY 提醒），按它改写 SQL 才能真分页，不要靠反复调大 max_rows。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -516,7 +544,10 @@ TOOLS = [
                        "后面的参数、&&、||、| 管道、2>&1 重定向、带引号的字符串都原样交给 cmd 处理。"
                        "要跑一段脚本（引号嵌套难写）优先用 stdin 参数直喂，别硬拼 php -r \"...\"。"
                        "安全围栏：首程序必须在白名单 exec_allowed_commands 里（改白名单不用重启，"
-                       "保存配置文件后下次调用即生效）；工作目录必须在授权根目录内；超时默认 60 秒。",
+                       "保存配置文件后下次调用即生效）；工作目录必须在授权根目录内；超时默认 60 秒。"
+                       "输出超限时只回传「头 20 行 + 尾 40 行」压缩预览（output_truncated=true），"
+                       "全文落盘到 output_file，用 win_tail 直接看尾部报错、win_read 看全文；"
+                       "要更省 token 就传小一点的 max_output_bytes / head_lines / tail_lines。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -524,6 +555,9 @@ TOOLS = [
                 "cwd": {"type": "string", "description": "工作目录（必须在授权根目录内），默认第一个根目录"},
                 "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 300"},
                 "stdin": {"type": "string", "description": "喂给命令标准输入的文本（如整段 PHP/Python 脚本），免引号转义地狱"},
+                "max_output_bytes": {"type": "integer", "description": "本次响应里最多带多少字节输出，默认取服务端 exec_max_output_bytes（通常 65536）；只能调小不能调大，用来省 token"},
+                "head_lines": {"type": "integer", "description": "输出超限时预览保留开头多少行，默认 20，上限 500；启动上下文和早期报错在这里"},
+                "tail_lines": {"type": "integer", "description": "输出超限时预览保留结尾多少行，默认 40，上限 500；命令真正的失败原因通常在最后几行"},
             },
             "required": ["command"],
         },
@@ -828,16 +862,31 @@ def render(tool_name: str, data: dict) -> str:
             f"目录：{data.get('cwd')}   {state}   耗时 {data.get('duration_ms')}ms"
         )
         if data.get("output_file"):
-            head += f"\n完整输出：{data.get('output_file')}（超限已落盘，可用 win_read 读取）"
+            head += (f"\n完整输出：{data.get('output_file')}（超限已落盘，"
+                     "可用 win_read 读全文、win_tail 直接看尾部报错）")
         flag = "（输出已截断）" if data.get("output_truncated") else ""
         return head + "\n" + ("-" * 60) + flag + "\n" + str(data.get("output") or "（无输出）")
 
     if tool_name == "win_backup_list":
+        # v1.7.18：策略快照也写进文本块 —— 只看 content[0].text 的客户端
+        # 同样能看到「积了多少、配了什么」，不必去翻 structuredContent。
+        pol = data.get("policy") or {}
+        scope = f"（筛选：{data.get('filter')}）" if data.get("filter") else ""
+        policy_line = ""
+        if pol:
+            policy_line = (
+                f"\n保留策略：总量上限 {pol.get('max_bytes_human')} / 天龄 "
+                f"{pol.get('retain_days')} 天 / 份数上限 {pol.get('retain_count')} 份"
+                f"（{'已启用' if pol.get('enabled') else '全为 0，未启用'}）；"
+                f"当前共 {pol.get('total_count')} 份、{pol.get('total_bytes_human')}，"
+                f"按策略会清掉 {pol.get('would_remove')} 份。清理由服务端配置执行，"
+                "本工具不提供删除。"
+            )
         if not data.get("items"):
-            scope = f"（筛选：{data.get('filter')}）" if data.get("filter") else ""
-            return f"没有找到任何备份{scope}。备份目录：{data.get('backup_root')}"
+            return (f"没有找到任何备份{scope}。备份目录：{data.get('backup_root')}"
+                    + policy_line)
         lines = [
-            f"共 {data.get('count')} 份备份，目录：{data.get('backup_root')}"
+            f"共 {data.get('count')} 份备份，目录：{data.get('backup_root')}" + policy_line
         ]
         for it in data.get("items", []):
             lines.append(
@@ -896,8 +945,13 @@ def render(tool_name: str, data: dict) -> str:
         if data.get("affected_rows") is not None:
             head += f"  影响 {data.get('affected_rows')} 行"
         if data.get("truncated"):
-            head += "（已达行数上限，结果被截断，可用 WHERE / LIMIT 缩小范围）"
+            head += "（已达行数上限，结果被截断，翻页请按下方模板改写 SQL）"
         body = _table_text(data.get("columns"), data.get("rows") or [])
+        hint = data.get("page_hint")
+        if hint:
+            body += (f"\n\n翻页模板（{hint.get('dialect')}）：{hint.get('template', '')}"
+                     f"\n下一页 OFFSET = {hint.get('next_offset')}"
+                     f"\n{hint.get('note', '')}")
         return head + ("\n" + body if body else "")
 
     if tool_name == "win_db_schema":
@@ -1019,6 +1073,11 @@ def runtime_contract(info: dict) -> str:
         ("删除走 win_trash（可恢复）；" if flags.get("allow_delete", True)
          else "当前禁止删除；")
         + "encoding 不接受 utf-8-sig（不静默写 BOM），请用 utf-8。",
+        "win_db_query 的 max_rows 只限制响应行数（DB 仍算完整结果集）；"
+        "truncated=true 时看 page_hint，按里面的方言模板改写 SQL 真分页，"
+        "必须带稳定唯一 ORDER BY，否则翻页会重复或漏行。",
+        "win_exec 输出超限时只回头尾压缩预览（output_truncated），全文在 output_file；"
+        "用 win_tail 看尾部报错，max_output_bytes 只能调小以省 token。",
     ]
     allowed = [str(x) for x in (flags.get("exec_allowed_commands") or [])]
     if flags.get("exec_enabled"):
