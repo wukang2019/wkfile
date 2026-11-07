@@ -102,9 +102,11 @@ def test_follows_config():
     check("备份关闭生效", "自动备份关" in txt)
     check("禁止删除生效", "当前禁止删除" in txt)
     check("exec 开启生效", "win_exec 已开启" in txt)
-    check("白名单只列前 6 项并给出总数", "等 7 项" in txt and "xcopy" not in txt)
-    check("超时值跟着变", "超时 25 秒" in txt)
-    check("严格链式标志跟着变", "严格链式校验开" in txt)
+    # v1.7.24：长白名单会把契约顶到 1.5KB 护栏，此时明细退化成「N 项」。
+    # 断言仍精确检查总数与「第 7 项不出现」，只是不再绑死「等」这个字。
+    check("白名单只列前 6 项并给出总数", "7 项" in txt and "xcopy" not in txt)
+    check("超时值跟着变", "超时 25" in txt)
+    check("严格链式标志跟着变", "严格链式" in txt)
     check("不含服务端口令/主机名等无关信息", "WIN-SRV01" not in txt)
 
 

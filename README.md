@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.23\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.24\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.23.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.24.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.23\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.24\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.23\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.24\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -350,7 +350,10 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > 目的是避免"只想改一处 `localhost`，结果文件里 4 处全被改掉"这类不可逆误伤。
 > 未命中时返回里带 `file_head`（文件开头 200 字符），省得再 read 一趟排查。
 
-> **`win_exec`（远程命令执行）七重围栏**——它是全服务权限最高的能力，默认整体关闭：
+> **`win_exec`（远程命令执行）七重围栏**——它是全服务权限最高的能力，默认整体关闭。
+> **先说结论：这七重是给可信运维操作者减误伤的静态检查，不是安全边界。**
+> 一旦开启 `win_exec`，拿到它的操作者就应当被视为能在这台机器上执行任意
+> 命令；不要拿它当沙箱去隔离不可信的 AI 或不可信用户。
 > ① `exec_enabled` 总开关（不开 = tools/list 里根本没有这个工具）；
 > ② 程序白名单 `exec_allowed_commands`：v1.7.8 起**只查整条命令的首程序**
 > （剥掉 `cmd /c` 前缀后第一个 token，`php` 等价 `php.exe`、全路径调用也认），
@@ -362,20 +365,30 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > ④ 超时硬顶（默认 60s，上限 300s），超时连子进程树一起杀；
 > ⑤ 只读 Token / 只读模式拒绝；
 > ⑥ 审计日志记录完整命令，输出截 64KB；
-> ⑦ **cwd 劫持防护（v1.7.11 引入 / v1.7.12 全链 / v1.7.22 转发前缀 /
-> v1.7.23 动态程序名）**——Windows 下 cmd 执行不带路径的程序时搜索序是
-> **cwd 优先于 PATH**，而 roots 恰恰是 AI 可写目录：往里面放一个与白名单
-> 程序同名的 `php.bat`，`php xxx` 实际执行的就是投放文件。现在拆链后
-> **每段**都查（换行也参与拆链）；`call` / `start` / `cmd /c` 会继续剥到
-> 真正执行的程序；程序名里含变量/转义（`call %X%`、`for %i in (...) do
-> call %i`）无法静态判定，一律拒绝；cwd 里存在同名可执行变体
-> （.bat/.cmd/.exe/.com/.ps1/.vbs）→ 拒绝；`shutil.which` 按 PATH 解析到
-> 的真实路径落在 roots 内 → 拒绝。
+> ⑦ **cwd 劫持防护（尽力而为的静态检查）**——Windows 下 cmd 执行不带路径
+> 的程序时搜索序是 **cwd 优先于 PATH**，而 roots 恰恰是 AI 可写目录：往里
+> 面放一个与白名单程序同名的 `php.bat`，`php xxx` 实际执行的就是投放文件。
+> 目前会查：拆链后能静态定位的程序位（含 `call` / `start` / `cmd /c` 转发
+> 前缀、换行也参与拆链）、含变量或转义的程序名一律拒绝、带路径的脚本引用
+> （`%cd%\x.bat`、`.\x.bat`、`sub\x.bat`）、cwd 里的同名可执行变体
+> （.bat/.cmd/.exe/.com/.ps1/.vbs），以及 `shutil.which` 按 PATH 解析到
+> roots 内的程序。`type deploy.ps1`、`copy payload.bat x` 这类只是读/复制
+> 文件的**参数**不查，避免误伤。
 >
-> 段内兜底**只查程序位置和带路径的脚本引用**（`%cd%\x.bat`、
-> `.\x.bat`、`sub\x.bat`）：`type deploy.ps1`、`copy payload.bat x`
-> 这类只是读/复制文件的**参数**不会被误拦。这是「只放行能静态判定
-> 程序的命令」，不是万能沙箱；想更严可以把 `exec_strict_chain` 打开。
+> **已知限制（v1.7.24 起不再继续加固围栏）**——下面这些写法当前**不会被
+> 拦截**，围栏不承诺覆盖它们：
+> - `dir && if exist payload.bat payload.bat`
+> - `dir && (payload.bat)`
+> - `dir && >nul payload.bat`
+>
+> 前提都是 `exec_enabled=true`（默认关闭）。根因不是某一处漏写判断，而是
+> 方法本身有天花板：cmd 的 `if` / `for` / 括号 / 重定向 / 变量展开可以自由
+> 组合，用正则或词法去判定一段自由文本「会不会执行某个文件」永远堵不完。
+> 这条线上已经往返四次（堵死 → 误伤 → 收窄 → 又漏），继续打补丁只会让
+> 误伤和漏拦来回摆动。要真正的安全边界得换设计：**typed 命令 + 参数
+> schema + 服务端用绝对路径直接调用解释器**（不再接受自由命令行）——本版
+> 不做这个改造。在那之前：默认保持 `exec_enabled=false`；确需开启时只给
+> 可信操作者，白名单只放必要程序，别放 `powershell`。
 >
 > v1.7.9 补强：
 > * **stdin 参数**——要跑一段 PHP/Python 脚本，把整段脚本放 `stdin` 直喂，
@@ -391,7 +404,8 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > `cmd`、`dir`、`type`、`where`、`findstr`、`tasklist`、`netstat`、`curl`）。
 > 谨慎追加：`del`/`rd`（不可逆删除）、`move`/`copy`（搬运覆盖）、`net`/`sc`/`wmic`
 > （服务管理）、`certutil`（常被滥用为下载器）；**`powershell` 几乎等于全开**
-> （`-Command` 能绕过一切白名单），非加不可时务必同时开 `exec_strict_chain`。
+> （`-Command` 能绕过一切白名单），`exec_strict_chain` 也挡不住它——加进去
+> 就等于把任意命令执行能力完整交出去，别指望围栏兜底。
 >
 > 开启入口：界面②「安全与权限」→「远程命令执行」区，或直接改
 > `wkfile.config.json` 的 `exec_enabled` + `exec_allowed_commands` 后重启。
@@ -788,6 +802,26 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
        双重转换 —— 发布包 .txt / .bat 里 509 处 `\r\r\n` 消失。
      - 新增 `tests/v1723_test.py`（59 项），同样先写「修复前应该红」的
        断言：修复前 33 项红，逐条对应本轮问题。
+   - **备份超删与围栏口径**（v1.7.24，第三轮外部体检）：
+     - **备份清理超删（必修）**：开了硬链接去重后，`.objects` 会留下孤儿
+       （`os.link` 失败是代码自己承认的正常状态）。旧版启动清理不 prune
+       孤儿，却把它的字节算进 `physical`；删版本永远减不掉这部分，于是
+       `backup_max_bytes` 会一路删到把有效备份全部清空、孤儿还在 —— 安全网
+       静默消失，直到真要回滚才发现。现在清理前先 prune；即使 prune 因权限
+       或竞态失败，统计也会把孤儿从 `physical` 剔除，清理计划另加一道
+       「不可回收体积」护栏，且体积维度永不删掉最后一份备份。
+     - **`win_backup_list` 不再虚报**：`would_remove` 旧版漏传 `physical`，
+       孤儿场景下报 0、实际删 2 份。现在与 `cleanup_backups` 同一个口径；
+       `orphan_objects` / `orphan_bytes` / `unreclaimable_bytes` 如实报出，
+       文本渲染也会提示有孤儿待回收。
+     - **围栏停止加固，改写口径**：`if exist payload.bat payload.bat`、
+       `(payload.bat)`、`>nul payload.bat` 这些写法把当时「拆链后逐段拦截」
+       的口径重新打穿了。cmd 语法无法静态穷举，本版**不改围栏逻辑**，改为在 README、
+       工具说明、运行时契约与源码注释里统一写明「静态检查，不是安全边界」，
+       并逐条列出已知限制与 typed 命令的改造方向。三条绕过在
+       `tests/v1724_test.py` 里作为已知限制登记，不再当作待修漏洞。
+     - 新增 `tests/v1724_test.py`（47 项），同样先写「修复前应该红」的
+       断言：修复前 21 项红，逐条对应本轮问题。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -811,8 +845,9 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
    - 但它是"上了膛的枪"：只要服务器上有任何东西会**执行白名单目录里的文件**
      （PHP web 根目录、计划任务的拾取目录、启动文件夹、watcher 服务、有人顺手双击），
      写文件就等于执行代码，权限跟执行者走。`.lnk`、DLL 劫持同类。
-     显式开启 `win_exec` 后风险模型再上一级：它提供了受控执行通道（七重围栏，
-     详见上文），请配套 `exec_strict_chain` 与更窄的白名单。
+     显式开启 `win_exec` 后风险模型再上一级：七重围栏是减误伤的静态检查、
+     **不是安全边界**（已知限制逐条列在上文），别把它当沙箱；开启就只给可信
+     操作者，并配套 `exec_strict_chain` 与更窄的白名单。
    - 真正的边界是**服务账号 + NTFS 权限**，做法：① 永远不要把"会被自动执行"的目录
      加进白名单（web 根目录宁可只给 `uploads/`、`logs/`）；② 服务用低权限专用账号跑
      （装自启/放防火墙那一下需要管理员，跑服务本身不需要）；③ 敏感目录对该账号显式
@@ -864,6 +899,7 @@ python tests\optimistic_lock_test.py       # win_read(hash=true) + conflict 回�
 python tests\v1721_test.py                 # 配置分层 + 纯逻辑外提 + 审计降级 + 增量备份 + validate/patch/probe：88 用例
 python tests\v1722_test.py              # 响应可序列化 + 围栏⑦转发前缀 + 回滚体积闸：105 用例
 python tests\v1723_test.py              # 围栏动态程序名/误伤 + 强制备份 + 硬链接体积 + 只读脱敏 + 文档一致性
+python tests\v1724_test.py              # 备份孤儿超删 + exec 已知限制口径 + 契约体积护栏：47 用例
 python tests\gui_refresh_test.py        # GUI 异步刷新（tkinter 桩）：52 用例
 python test\v1712\spotcheck.py          # win_read 边界 A~F 段：61 用例
 python test\v1712\check.py              # 围栏/原子写定点检查：13 用例
@@ -872,16 +908,16 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.23 实测，源码级）：**selftest 53/53、features 211/211（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、**`tests/v1723_test.py` 59 项（本轮新增，修复前 33 项红）**；`py_compile` 与模块导入自检通过。全部 17 套回归 exit=0。
+当前状态（v1.7.24 实测，源码级）：**selftest 53/53、features 211/211（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、`tests/v1723_test.py` 59 项、**`tests/v1724_test.py` 47 项（本轮新增，修复前 21 项红）**；`py_compile` 与模块导入自检通过。全部 18 套回归 exit=0。
 
-真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**；v1.7.23 复跑两项仍全绿。只查 `isError` 已经放过三次契约错了 —— 现在每个新增字段都要过 `json.dumps` 断言。
+真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**；v1.7.24 复跑两项仍全绿。只查 `isError` 已经放过三次契约错了 —— 现在每个新增字段都要过 `json.dumps` 断言。
 
 > ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
 > `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
-> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.23 均未改动 GUI 代码。上述源码级
-> 回归已覆盖本轮全部改动（围栏动态程序名与参数误伤、体积闸非正数回退、
-> 强制备份、硬链接体积去重、审计丢账告警、只读 Token 脱敏、文档护栏）。
+> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.24 均未改动 GUI 代码。上述源码级
+> 回归已覆盖本轮全部改动（备份孤儿超删与不可回收体积护栏、`would_remove`
+> 口径一致、exec 已知限制文案与运行时契约体积护栏）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：

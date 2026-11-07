@@ -550,6 +550,8 @@ TOOLS = [
                        "安全围栏：首程序必须在白名单 exec_allowed_commands 里（改白名单不用重启，"
                        "保存配置文件后下次调用即生效）；工作目录必须在授权根目录内；"
                        "超时默认 60 秒，服务端可配上限 exec_timeout_max_sec（默认 300），长任务请拆成小批。"
+                       "围栏是尽力而为的静态检查，不是安全边界：cmd 的 if / for / 括号 / 重定向 / "
+                       "变量展开无法穷举，已知不拦的写法见 README「已知限制」；仅给可信操作者使用。"
                        "输出超限时只回传「头 20 行 + 尾 40 行」压缩预览（output_truncated=true），"
                        "全文落盘到 output_file，用 win_tail 直接看尾部报错、win_read 看全文；"
                        "要更省 token 就传小一点的 max_output_bytes / head_lines / tail_lines。",
@@ -1015,6 +1017,11 @@ def render(tool_name: str, data: dict) -> str:
                 f"按策略会清掉 {pol.get('would_remove')} 份。清理由服务端配置执行，"
                 "本工具不提供删除。"
             )
+            if int(pol.get("orphan_objects", 0) or 0) > 0:
+                policy_line += (
+                    f"\n另有 {pol.get('orphan_objects')} 个无版本引用的内容实体"
+                    f"（{pol.get('orphan_bytes_human', '?')}）：清理时先回收，"
+                    "不计入体积上限，也不会因此删掉有效备份。")
         if not data.get("items"):
             return (f"没有找到任何备份{scope}。备份目录：{data.get('backup_root')}"
                     + policy_line)
@@ -1199,7 +1206,7 @@ def runtime_contract(info: dict) -> str:
         "win_read 读完只看 eof=true，用 next_offset / next_start_line 续读；"
         "拼接多页正文时，仅当该页 content_ends_with_newline=true 才在页尾补一个 \\n"
         "（该字段说明本页末行在原文里是否由换行终止），否则直接接下一页；"
-        "不要按 line_fragment / eof 猜，末尾有无换行的文件会各错一半。",
+        "不要按 line_fragment / eof 猜。",
         "自动备份" + ("开" if flags.get("auto_backup", True) else "关")
         + "：备份失败时覆盖/替换/移动/回滚整体中止且原文件不动；"
           "写类工具均可传 backup=false 跳过。",
@@ -1209,8 +1216,8 @@ def runtime_contract(info: dict) -> str:
         "win_db_query 的 max_rows 只限制响应行数（DB 仍算完整结果集）；"
         "truncated=true 时看 page_hint，按里面的方言模板改写 SQL 真分页，"
         "必须带稳定唯一 ORDER BY，否则翻页会重复或漏行。",
-        "win_exec 输出超限时只回头尾压缩预览（output_truncated），全文在 output_file；"
-        "用 win_tail 看尾部报错，max_output_bytes 只能调小以省 token。",
+        "win_exec 输出超限只回头尾预览（output_truncated），全文在 output_file；"
+        "win_tail 看尾报错，max_output_bytes 只能调小。",
     ]
     allowed = [str(x) for x in (flags.get("exec_allowed_commands") or [])]
     if flags.get("exec_enabled"):
@@ -1218,14 +1225,32 @@ def runtime_contract(info: dict) -> str:
         if len(allowed) > 6:
             shown += f" 等 {len(allowed)} 项"
         cap = flags.get("exec_timeout_max_sec", 300)
-        lines.append(
+        sec = flags.get("exec_timeout_sec", 60)
+        exec_line = (
             f"win_exec 已开启：白名单 {shown}；只查首程序；"
-            f"超时 {flags.get('exec_timeout_sec', 60)} 秒、上限 {cap} 秒"
-            + ("；严格链式校验开" if flags.get("exec_strict_chain") else "") + "。"
+            f"超时 {sec} 秒、上限 {cap} 秒"
+            + ("；严格链式校验开" if flags.get("exec_strict_chain") else "")
+            + "。围栏不是安全边界，仅可信者用。"
         )
+        lines.append(exec_line)
     else:
         lines.append("win_exec 默认关闭且当前未开启（tools/list 也不会列出该工具）。")
-    return "\n".join(lines)
+        exec_line = ""
+    text = "\n".join(lines)
+    # 契约有 1.5KB 护栏：长白名单 + 严格链式时明细会把整体撑爆。
+    # 退化成「N 项」只丢白名单明细，其余契约（含限制提示）一字不动。
+    if exec_line and len(text.encode("utf-8")) >= 1536:
+        fallback = (
+            f"win_exec 已开启：白名单 {len(allowed)} 项（明细略）；只查首程序；"
+            f"超时 {sec} 秒、上限 {cap} 秒"
+            + ("；严格链式校验开" if flags.get("exec_strict_chain") else "")
+            + "。围栏不是安全边界，仅可信者用。"
+        )
+        text = text.replace(exec_line, fallback)
+        if len(text.encode("utf-8")) >= 1536:
+            text = text.replace(
+                fallback, "win_exec 已开启。围栏不是安全边界，仅可信者用。")
+    return text
 
 
 def build_initialize(params: dict, *, info: dict) -> dict:

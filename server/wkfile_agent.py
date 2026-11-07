@@ -105,7 +105,7 @@ from wkfile_core import (  # noqa: E402
     patch_plan, strip_json_comments, backup_inode_sizes,
 )
 
-VERSION = "1.7.23"
+VERSION = "1.7.24"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -1701,10 +1701,11 @@ class Agent:
         self._backup_cleanup_count = getattr(self, "_backup_cleanup_count", 0) + 1
         if self._backup_cleanup_count % 32 != 1:
             return
+        # v1.7.24：顺序反过来 —— cleanup_backups() 内部「先回收孤儿、再
+        # 统计体积」。旧版事后才 prune，孤儿先被算进额度，有效备份已经
+        # 删光了才轮到回收；时间戳目录清掉后不再被引用的实体也在这里
+        # 一并于统计前清掉。
         self.cleanup_backups()
-        # v1.7.21：时间戳目录被清掉后，回收不再被任何版本引用的内容实体
-        if bool(getattr(self.cfg, "backup_dedup", True)):
-            self._prune_backup_objects()
 
     @staticmethod
     def _backup_cleanup_plan(entries: list[dict], *, max_bytes: int = 0,
@@ -1722,10 +1723,20 @@ class Agent:
         # 缺省时退回旧的逐项累加，方便这个纯函数被单独测试。
         total = (sum(int(e.get("size") or 0) for e in entries)
                  if total_bytes is None else int(total_bytes))
+        # v1.7.24：total 里可能混进「删掉任何历史版本都释放不掉」的字节
+        # （.objects 里 os.link 失败留下的孤儿实体、或统计口径误差）。拿它
+        # 去压 backup_max_bytes，结果就是一直删、删到把所有有效备份清空
+        # 也永远到不了目标 —— 安全网静默消失，直到真要回滚才发现。
+        # 判定：不可回收部分自己就 >= 上限时，体积维度直接放弃（份数/
+        # 天龄维度照常）；另外体积维度永不删掉最后一份备份。
+        reclaimable = sum(int(e.get("size") or 0) for e in entries)
+        fixed = max(0, total - reclaimable)
+        volume_enabled = 0 < max_bytes and fixed < max_bytes
         cutoff = now - retain_days * 86400 if retain_days > 0 else 0
         plan, removed = [], 0
         for e in entries:
-            over_bytes = max_bytes > 0 and total > max_bytes
+            over_bytes = (volume_enabled and total > max_bytes
+                          and (len(entries) - removed) > 1)
             over_count = retain_count > 0 and (len(entries) - removed) > retain_count
             over_age = retain_days > 0 and float(e.get("mtime") or 0) < cutoff
             if not (over_bytes or over_count or over_age):
@@ -1745,6 +1756,11 @@ class Agent:
           size          = 删掉该版本能释放的字节（供清理计划递减）
           logical_size  = 旧口径「看起来多大」，仅供对照展示
           physical      = 全备份根唯一 inode 的字节和，才是真实占用
+
+        v1.7.24：.objects 里「没有任何版本引用」的实体（nlink==1 的孤儿）
+        是 os.link 失败后代码明确允许存在的正常状态。它们删版本释放不掉，
+        却会被算进 physical，逼着体积清理一路删光有效备份。这里先剔除，
+        数量与字节单独记下来给 win_backup_list / win_probe 如实报出。
         """
         base = backup_root(self.cfg.base_dir)
         try:
@@ -1776,6 +1792,12 @@ class Agent:
                         groups[label].append((key, st.st_size))
                     except OSError:
                         continue
+        referenced = {key for st in stamps for key, _size in groups[st]}
+        orphans = [it for it in groups[".objects"] if it[0] not in referenced]
+        groups[".objects"] = [it for it in groups[".objects"]
+                              if it[0] in referenced]
+        self._backup_orphan_objects = len(orphans)
+        self._backup_orphan_bytes = sum(int(sz) for _key, sz in orphans)
         physical, reclaim = backup_inode_sizes(groups)
         out = []
         for st in stamps:
@@ -1795,7 +1817,15 @@ class Agent:
         不到 2GB，永远不清。三个维度任一为 0 表示该维度不启用。
         时间戳文件夹之间互相独立（一个文件夹 = 一次改写动作），整目录
         删除不会破坏其他备份的完整性。
+
+        v1.7.24：**先回收孤儿实体，再统计体积、算清理计划**。孤儿是
+        os.link 失败后代码明确允许存在的正常状态，它删版本释放不掉，
+        旧版却被算进 physical 一路把有效备份删光（且启动清理压根不
+        prune）。即使 prune 因权限/竞态失败，_backup_entries 也会把
+        孤儿从 physical 里剔除，_backup_cleanup_plan 另有一道护栏。
         """
+        if bool(getattr(self.cfg, "backup_dedup", True)):
+            self._prune_backup_objects()
         max_bytes = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
         days = max(0, int(getattr(self.cfg, "backup_retain_days", 0) or 0))
         count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
@@ -1818,9 +1848,13 @@ class Agent:
         days = max(0, int(getattr(self.cfg, "backup_retain_days", 0) or 0))
         count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
         plan = self._backup_cleanup_plan(
-            entries, max_bytes=max_bytes, retain_days=days, retain_count=count)
+            entries, max_bytes=max_bytes, retain_days=days, retain_count=count,
+            total_bytes=physical)
         total = physical
         logical = sum(int(e.get("logical_size") or 0) for e in entries)
+        orphan_objects = int(getattr(self, "_backup_orphan_objects", 0) or 0)
+        orphan_bytes = int(getattr(self, "_backup_orphan_bytes", 0) or 0)
+        reclaimable = sum(int(e.get("size") or 0) for e in entries)
         return {
             "max_bytes": max_bytes,
             "max_bytes_human": human_size(max_bytes) if max_bytes > 0 else "不限",
@@ -1832,11 +1866,19 @@ class Agent:
             "total_bytes_human": human_size(total),
             "logical_bytes": logical,
             "physical_bytes": physical,
+            # v1.7.24：与 cleanup_backups 用同一个 physical 口径，
+            # would_remove 才是「下次清理真正会删几份」而非一个假数字。
             "would_remove": len(plan),
+            "orphan_objects": orphan_objects,
+            "orphan_bytes": orphan_bytes,
+            "orphan_bytes_human": human_size(orphan_bytes),
+            "unreclaimable_bytes": max(0, physical - reclaimable) + orphan_bytes,
             "dedup": self.dedup_stats(),
             "note": ("保留策略由服务端配置（backup_max_bytes / backup_retain_days / "
                      "backup_retain_count）控制，在服务启动与每 32 次备份时执行；"
-                     "不开放给 AI 删除备份，需要手动清理请由运维在服务器上处理。"),
+                     "清理前先回收无版本引用的内容实体（孤儿），它不计入体积上限、"
+                     "也不会触发删有效备份；不开放给 AI 删除备份，需要手动清理"
+                     "请由运维在服务器上处理。"),
         }
 
     def cleanup_trash(self):
@@ -3456,7 +3498,8 @@ class Agent:
     # ------------------------------------------------------------------
     # 远程命令执行（win_exec）
     #
-    # 这是全服务权限最高的操作，围栏也是最多的，一重都不能少：
+    # 这是全服务权限最高的操作。下面七重是减误伤的静态检查，不是安全边界；
+    # 已知限制与「v1.7.24 起不再加固」的原因见 README「已知限制」小节。
     #   ① exec_enabled 总开关（默认 false —— 不显式开启就是没有这个能力）
     #   ② exec_allowed_commands 程序白名单：v1.7.8 起只查**整条命令的首程序**
     #      （剥掉 cmd /c 前缀后的第一个 token，按 basename 比对，php == php.exe）。
@@ -3648,23 +3691,29 @@ class Agent:
                     )
 
     def _exec_guard_hijack(self, command: str, cwd: str) -> None:
-        """围栏⑦（v1.7.11 引入，v1.7.12 全链，v1.7.22 补转发前缀）：堵 cwd 劫持。
+        """围栏⑦：尽力而为的 cwd 劫持静态检查，**不是安全边界**。
 
         Windows 下 cmd 执行不带路径的程序时搜索序是 **cwd 优先于 PATH**，
         而 roots 恰恰是 AI 可写目录——往里面放一个与白名单程序同名的
         php.bat / php.exe，"php xxx" 实际执行的就是投放文件。
 
-        ① 全链检测：拆链后每一段都过投放检测（白名单仍是首程序制）；
-        ② 内建名单：真内建优先于文件搜索，投放同名 .bat 劫持不了；
-        ③ v1.7.22 转发前缀：call / start / cmd /c 后面才是真正执行的
-           程序，旧版在这一步整段跳过，`dir && call payload.bat` 直接放行；
-        ④ v1.7.23 动态程序名：把程序名藏进 set 变量或 for 变量
-           （`set X=p.bat` 换行 `call %X%`、`for %i in (...) do call %i`）
-           时字面量检测必然看不到，程序位置含 %/!/^ 一律拒绝；
-        ⑤ v1.7.23 收窄兜底：只查「程序位置」和「带路径分隔符的脚本引用」。
-           旧版把段内所有 .bat/.ps1 结尾的 token 都查一遍，于是
-           `type deploy.ps1` / `copy payload.bat x` 这类纯参数被误拦 ——
-           它们是读/复制文件，不是执行文件，cwd 里有没有同名文件无关。
+        v1.7.24 起**不再加固**：cmd 的 if / for / 括号 / 重定向 / 变量展开
+        可以自由组合，用正则或词法判定一段自由文本「会不会执行某个文件」
+        堵不完；这条线上已经往返四次（堵死 → 误伤 → 收窄 → 又漏）。
+        下面这些已知不拦、且刻意不修（README「已知限制」逐条列出）：
+          `dir && if exist payload.bat payload.bat`
+          `dir && (payload.bat)`
+          `dir && >nul payload.bat`
+        要真正的安全边界得换设计：typed 命令 + 参数 schema + 由服务端用
+        绝对路径直接调用解释器，不再接受自由命令行。本版不做这个改造。
+
+        当前能静态判定的检查（保持不变，不再扩张）：
+        ① 拆链后逐段查程序位（换行也参与拆链），白名单仍是首程序制；
+        ② 真内建优先于文件搜索，投放同名 .bat 劫持不了，跳过；
+        ③ call / start / cmd /c 转发前缀继续剥到真正执行的程序；
+        ④ 程序位置含 %/!/^ 等变量或转义，无法静态判定，一律拒绝；
+        ⑤ 段内兜底只查「程序位置」和「带路径分隔符的脚本引用」：
+           `type deploy.ps1` / `copy payload.bat x` 这类纯参数不查，避免误伤。
         """
         # 拆链（2>&1 的 & 不是分隔符，先打码——v1.7.8 的老坑不能复发）。
         # v1.7.23：换行也是 cmd 的命令分隔符，旧版只按 &&/||/&/|/; 拆，
