@@ -184,6 +184,24 @@ def http_health(port: int, host: str = "127.0.0.1", timeout: float = 2.0,
         return False, str(exc)
 
 
+def health_probe(port: int, first: str, timeout: float):
+    """按首选协议探测，失败再试另一种协议（界面勾的 HTTPS 与实际运行可能不同步）。
+
+    刻意做成纯函数：不读任何 Tk 变量。工作线程只能拿到主线程取好的
+    port / first 快照，因为 tkinter 的变量不是线程安全的。
+    """
+    ok, detail = http_health(port, timeout=timeout, scheme=first)
+    if ok:
+        return ok, detail
+    other = "http" if first == "https" else "https"
+    ok2, detail2 = http_health(port, timeout=timeout, scheme=other)
+    return (ok2, detail2) if ok2 else (ok, detail)
+
+
+# 「刷新状态」最小间隔（秒）：连点合并，不排队堆积探测请求。
+STATUS_MIN_INTERVAL = 0.4
+
+
 def enable_dpi_awareness() -> None:
     if sys.platform != "win32":
         return
@@ -234,6 +252,12 @@ class Wizard:
         self.root = root
         self.busy = False
         self._danger_ack = False
+        # v1.7.14：状态刷新 / 端口检查的异步闸门。探测放工作线程，UI 只在
+        # 主线程更新；连点合并成一次，不排队叠加 HTTP / netstat / tasklist。
+        self._status_busy = False
+        self._status_pending = False
+        self._status_last = 0.0
+        self._portcheck_busy = False
         self.cfg = self._load_config_safe()
 
         self.var_host = tk.StringVar()
@@ -1772,16 +1796,41 @@ class Wizard:
             messagebox.showerror("端口无效", msg, parent=self.root)
             return
 
-        # 先把「正在检查」显示出来，避免用户以为没反应
+        if self._portcheck_busy:
+            self.set_hint(f"正在检查端口 {port} …（上一次还没结束）", "info")
+            return
+        # v1.7.14：netstat / tasklist / HTTP 探测原来同步跑在 Tk 主线程，
+        # 连接多的机器上一次就能卡住界面好几秒。挪到工作线程，结果回主线程弹。
         self.set_hint(f"正在检查端口 {port} …", "info")
-        self.root.update()
+        self._portcheck_busy = True
 
-        owners = port_owner(port)
-        reachable, _ = http_health(port, timeout=2.5)
+        def worker() -> None:
+            try:
+                owners = port_owner(port)
+                reachable, _ = http_health(port, timeout=2.5)
+                err = ""
+            except Exception as exc:  # noqa: BLE001
+                owners, reachable, err = [], False, str(exc)
+            try:
+                self.root.after(0, lambda: self._apply_port_check(
+                    port, owners, reachable, err))
+            except (tk.TclError, RuntimeError):
+                self._portcheck_busy = False
 
+        threading.Thread(target=worker, daemon=True, name="wk-portcheck").start()
+
+    def _apply_port_check(self, port: int, owners: list, reachable: bool,
+                          err: str) -> None:
+        """端口探测结束后回到主线程展示结果 / 弹窗。"""
+        self._portcheck_busy = False
+        if err:
+            self.log(f"端口检查失败：{err}", "err")
+            self.set_hint("端口检查失败，详见日志", "err")
+            return
         if not owners and not reachable:
             msg = f"端口 {port} 空闲可用，直接用它就行。"
             self.log(msg, "ok")
+            self.set_hint(msg, "ok")
             messagebox.showinfo("端口检查", msg, parent=self.root)
             return
 
@@ -1790,15 +1839,15 @@ class Wizard:
             if owners
             else "未能识别（建议以管理员身份重新打开本程序再查一次）"
         )
-        self_ok = reachable
-
-        if self_ok:
+        if reachable:
             msg = f"端口 {port} 正在被本服务使用：{who}。健康检查通过，属于正常情况。"
             self.log(msg, "ok")
+            self.set_hint(msg, "ok")
             messagebox.showinfo("端口检查", msg, parent=self.root)
         else:
             msg = f"端口 {port} 已被占用：{who}。请换一个端口，或先结束该进程。"
             self.log(msg, "err")
+            self.set_hint(msg, "err")
             if owners:
                 pids = "、".join(str(p) for p, _ in owners)
                 self.log(f"   结束办法：任务管理器 → 详细信息 → 按 PID {pids} 找到进程 → 右键结束任务")
@@ -2135,22 +2184,56 @@ class Wizard:
         ]
 
     def health(self, timeout: float = 2.0):
+        """同步探测（只在主线程调用）；异步路径请用 health_probe()。"""
         try:
             port = int(str(self.var_port.get()).strip())
         except ValueError:
             return False, "端口无效"
         first = "https" if self.var_tls_on.get() else "http"
-        ok, detail = http_health(port, timeout=timeout, scheme=first)
-        if ok:
-            return ok, detail
-        # 界面上勾的 HTTPS 开关和「正在跑的那个服务实际用的协议」可能还没同步
-        # （比如刚改完还没重启），所以另一种协议也试一次，别把运行中的服务报成未运行。
-        other = "http" if first == "https" else "https"
-        ok2, detail2 = http_health(port, timeout=timeout, scheme=other)
-        return (ok2, detail2) if ok2 else (ok, detail)
+        return health_probe(port, first, timeout)
 
     def refresh_status(self) -> None:
-        ok, detail = self.health(timeout=1.5)
+        """异步刷新状态：网络探测在工作线程，界面绝不被等待冻住。
+
+        v1.7.14：原先 health()（最坏 1.5s × 2 种协议）同步跑在 Tk 主线程，
+        端口不通时点一下「刷新状态」就白屏 3 秒。现在探测挪走，并加
+        in-flight 去重 + 最小间隔节流，连点不会排队叠加请求。
+        """
+        if self._status_busy:
+            self._status_pending = True
+            return
+        now = time.monotonic()
+        if now - self._status_last < STATUS_MIN_INTERVAL:
+            return
+        self._status_last = now
+        self._status_busy = True
+        # Tk 变量只能在主线程读：先取快照，再把纯值交给工作线程。
+        try:
+            port = int(str(self.var_port.get()).strip())
+        except (ValueError, tk.TclError):
+            port = 0
+        try:
+            first = "https" if self.var_tls_on.get() else "http"
+        except tk.TclError:
+            first = "http"
+
+        def worker() -> None:
+            try:
+                ok, _detail = health_probe(port, first, 1.5) if port else (False, "")
+            except Exception:  # noqa: BLE001 —— 探测异常一律按「未运行」呈现
+                ok = False
+            try:
+                self.root.after(0, lambda: self._apply_status(ok))
+            except (tk.TclError, RuntimeError):
+                # 窗口已经关掉：没有界面可更新，把闸门放开即可。
+                self._status_busy = False
+                self._status_pending = False
+
+        threading.Thread(target=worker, daemon=True, name="wk-status").start()
+
+    def _apply_status(self, ok: bool) -> None:
+        """工作线程探测结束后回到主线程改界面（tkinter 不是线程安全的）。"""
+        self._status_busy = False
         if ok:
             self.var_status.set("● 正在运行")
             self.lbl_status.configure(foreground="#137333")
@@ -2158,7 +2241,11 @@ class Wizard:
             self.var_status.set("● 未运行")
             self.lbl_status.configure(foreground="#b3261e")
         self._refresh_audit_size()
-        return ok, detail
+        # 探测期间又点了刷新：合并成一次补刷，不丢结果也不排队。
+        if self._status_pending:
+            self._status_pending = False
+            self.root.after(int(STATUS_MIN_INTERVAL * 1000) + 20,
+                            self.refresh_status)
 
     def cmd_start(self) -> None:
         if self.busy:
@@ -2245,7 +2332,9 @@ class Wizard:
             for _ in range(24):
                 self.root.update()
                 time.sleep(0.5)
-                if self.health(timeout=1.0)[0]:
+                # v1.7.14：回环探测 1.0s→0.4s（本机连接拒绝只需毫秒级），
+                # 服务僵死时 24 轮的最坏等待从约 60s 降到约 31s。
+                if self.health(timeout=0.4)[0]:
                     ready = True
                     break
             if ready:
@@ -2699,6 +2788,20 @@ def _check_gui() -> int:
             app._refresh_audit_size()
         except Exception as exc:
             problems.append(f"审计体积刷新异常: {exc}")
+        try:
+            # v1.7.14：状态刷新改为异步探测 + 节流，闸门字段必须齐备，
+            # 否则连点会排队叠加请求、把界面重新卡住。
+            for _field in ("_status_busy", "_status_pending", "_status_last",
+                           "_portcheck_busy"):
+                if not hasattr(app, _field):
+                    problems.append(f"异步刷新闸门字段缺失: {_field}")
+            if not callable(getattr(app, "_apply_status", None)):
+                problems.append("状态刷新回主线程回调缺失")
+            if not callable(getattr(app, "_apply_port_check", None)):
+                problems.append("端口检查回主线程回调缺失")
+            note("状态刷新       : 异步探测 + 节流（闸门与回调齐备）")
+        except Exception as exc:
+            problems.append(f"状态刷新闸门检查异常: {exc}")
         try:
             if not app.ent_ro_token.winfo_exists():
                 problems.append("只读 Token 输入框缺失")
