@@ -23,6 +23,7 @@
   "patch_max_files": 20,
   "patch_max_total_bytes": 8388608,
   "patch_max_rollback_bytes": 8388608,
+  "backup_required": false,
   "trash_retain_days": 30,
   "preflight_check": true,
   "enable_mcp": true,

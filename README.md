@@ -81,7 +81,7 @@
 
 ```
 trae-winfile\
-├─ wkfile-v1.7.22\                  # ★★ 部署包：整个文件夹拷到服务器就能用
+├─ wkfile-v1.7.23\                  # ★★ 部署包：整个文件夹拷到服务器就能用
 │   ├─ wkfile.exe                  #   主程序（免装 Python）
 │   ├─ 文件夹说明.txt               #   先看这个：包里每个文件是干什么的
 │   ├─ 使用说明.txt                 #   从零到跑通的全流程（纯文本）
@@ -91,7 +91,7 @@ trae-winfile\
 │   ├─ wkfile.config.example.json  #   配置样例
 │   ├─ wkfile\                     #   ★ 运行时数据目录（配置/日志/备份/回收站）
 │   └─ tools\                      #   连通性诊断脚本
-├─ wkfile-v1.7.22.zip               # 上面那个文件夹的同内容压缩包
+├─ wkfile-v1.7.23.zip               # 上面那个文件夹的同内容压缩包
 │
 ├─ dist\
 │   └─ wkfile.exe                  # 编译产物（部署包从这儿取）
@@ -112,7 +112,7 @@ trae-winfile\
 │   ├─ mcp-public-test.py          #   验 MCP 端点（initialize + tools/list）
 │   └─ mcp-call-test.py            #   真调一个工具（如 win_roots / win_list）
 ├─ tests\                          # 端到端测试套件（本地开发用）
-│   ├─ features_e2e.py             #   新增能力自测（自签证书、公网 IP、证书链、数据库、超时边界，207 用例）
+│   ├─ features_e2e.py             #   新增能力自测（自签证书、公网 IP、证书链、数据库、超时边界，211 用例）
 │   ├─ mcp_e2e.py                  #   MCP 端点（Streamable HTTP + SSE + 鉴权 + 越权拦截）
 │   ├─ local_e2e.py                #   本机端到端（源码路线）
 │   ├─ tls_e2e.py                  #   真 HTTPS 链路（需本机有 openssl，无则跳过）
@@ -127,7 +127,7 @@ trae-winfile\
 └─ README.md
 ```
 
-**部署时只需要 `wkfile-v1.7.22\` 这一个文件夹**（或者解压同名 zip），
+**部署时只需要 `wkfile-v1.7.23\` 这一个文件夹**（或者解压同名 zip），
 其余的 `server\`、`dist\`、`tools\` 等都是开发用的源码与中间产物。
 
 ### 运行时只创建一个文件夹：`wkfile\`
@@ -169,7 +169,7 @@ python build-release.py                                     # 再重建 文件�
 
 | 文件                                  | 放哪              | 干什么                                |
 | ----------------------------------- | --------------- | ---------------------------------- |
-| **`wkfile-v1.7.22\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
+| **`wkfile-v1.7.23\` 整个文件夹** | **Windows 服务器** | 拷过去就行，里面含 exe + 说明书 + 自检脚本 + 工具 |
 
 单文件绿色版：不安装、不写注册表，卸载就是删掉。**建议放 `D:\wkfile\` 这类普通目录**；  
 放 `C:\Program Files\` 的话配置和日志会自动改写到 `C:\ProgramData\wkfile\`。
@@ -362,15 +362,20 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 > ④ 超时硬顶（默认 60s，上限 300s），超时连子进程树一起杀；
 > ⑤ 只读 Token / 只读模式拒绝；
 > ⑥ 审计日志记录完整命令，输出截 64KB；
-> ⑦ **cwd 劫持防护（v1.7.11 引入 / v1.7.12 全链 / v1.7.22 补转发前缀）**——
-> Windows 下 cmd 执行不带路径的程序时搜索序是 **cwd 优先于 PATH**，而 roots
-> 恰恰是 AI 可写目录：往里面放一个与白名单程序同名的 `php.bat`，`php xxx`
-> 实际执行的就是投放文件，白名单形同虚设。现在拆链后**每段**都查；
-> `call` / `start` / `cmd /c` 这类转发前缀会继续剥到真正执行的程序
-> （`dir && call payload.bat` 也在拦截之列）；段内任意位置引用了 cwd 里
-> 已存在的脚本文件（`%cd%\x.bat`、`.\x.bat`、`sub\x.bat`）同样拒绝；
-> cwd 里存在同名可执行变体（.bat/.cmd/.exe/.com/.ps1/.vbs）→ 拒绝；
-> `shutil.which` 按 PATH 解析到的真实路径落在 roots 内 → 拒绝。
+> ⑦ **cwd 劫持防护（v1.7.11 引入 / v1.7.12 全链 / v1.7.22 转发前缀 /
+> v1.7.23 动态程序名）**——Windows 下 cmd 执行不带路径的程序时搜索序是
+> **cwd 优先于 PATH**，而 roots 恰恰是 AI 可写目录：往里面放一个与白名单
+> 程序同名的 `php.bat`，`php xxx` 实际执行的就是投放文件。现在拆链后
+> **每段**都查（换行也参与拆链）；`call` / `start` / `cmd /c` 会继续剥到
+> 真正执行的程序；程序名里含变量/转义（`call %X%`、`for %i in (...) do
+> call %i`）无法静态判定，一律拒绝；cwd 里存在同名可执行变体
+> （.bat/.cmd/.exe/.com/.ps1/.vbs）→ 拒绝；`shutil.which` 按 PATH 解析到
+> 的真实路径落在 roots 内 → 拒绝。
+>
+> 段内兜底**只查程序位置和带路径的脚本引用**（`%cd%\x.bat`、
+> `.\x.bat`、`sub\x.bat`）：`type deploy.ps1`、`copy payload.bat x`
+> 这类只是读/复制文件的**参数**不会被误拦。这是「只放行能静态判定
+> 程序的命令」，不是万能沙箱；想更严可以把 `exec_strict_chain` 打开。
 >
 > v1.7.9 补强：
 > * **stdin 参数**——要跑一段 PHP/Python 脚本，把整段脚本放 `stdin` 直喂，
@@ -760,6 +765,29 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
        `json.dumps`」覆盖到全部 37 个 MCP 工具与全部 HTTP action；同时清掉
        旧测试里的 `check(..., True)` 恒真断言、「分页没发生却记 PASS」的
        假绿，并在 MCP 结果上补序列化断言。**「断言绿但契约错」不再有第三次**。
+   - **围栏 / 备份 / 文档一轮推平**（v1.7.23，第二轮外部体检）：
+     - **围栏⑦再补**：`set X=p.bat` 换行 `call %X%`、`for %i in (...) do
+       call %i` 把程序名藏进变量，字面量检测必然看不到。现在换行也参与
+       拆链，程序位置含 `%` / `!` / `^` 一律拒绝（`exec_dynamic_program`）。
+       反向误伤也修掉：旧版把 `type deploy.ps1`、`copy payload.bat x` 的
+       **参数**当投放脚本拦下，现在段内兜底只查「程序位置」和「带路径
+       的脚本引用」。
+     - **体积闸脚枪**：`patch_max_rollback_bytes=0` 旧版等于关掉上限、
+       退回无边界 `fh.read()`。现在 0 / 负数一律回退内置 8 MB，并在
+       `win_probe` 报配置异常；示例配置注释也不再写「0 = 不限制」。
+     - **四条老账**：① 备份体积按 inode 去重，硬链接不再被算成 N 份而
+       误删最旧版本（`physical` / `logical_bytes` 分开报）；② 新增服务端
+       `backup_required`，开启后 AI 传 `backup=false`、或配置把
+       `auto_backup` 关掉，都直接拒写；③ 审计 `dropped>0` 有独立的
+       `integrity` / `alerts`，`win_probe` 与 MCP 文本明确告警，不再只
+       暴露一个数字；④ 只读 Token 调 `win_probe` 时 roots / 备份绝对路径
+       脱敏（`win_roots` 不受影响，它是 AI 构造路径所必需）。
+     - **文档**：features 用例数 207 / 208 / 211 三处统一为 211，命令块
+       补 `v1722_test.py` / `v1723_test.py`；`使用说明.txt` 删掉「投放脚本
+       再也借不到道」的超卖口径；修掉 `build-release.py` 的 `newline`
+       双重转换 —— 发布包 .txt / .bat 里 509 处 `\r\r\n` 消失。
+     - 新增 `tests/v1723_test.py`（59 项），同样先写「修复前应该红」的
+       断言：修复前 33 项红，逐条对应本轮问题。
    - 改 Token / 端口后**必须重启服务**；`exec_allowed_commands` / `exec_timeout_sec` /
      `exec_timeout_max_sec` / `exec_max_output_bytes` / `exec_strict_chain` 这几个
      exec 参数是热加载的，保存配置文件后下次调用即生效（`exec_enabled` 能力开关
@@ -822,7 +850,7 @@ curl.exe -X POST http://127.0.0.1:10087/mcp `
 ```powershell
 cd trae-winfile
 python selftest.py                      # 老接口 + 安全机制 + MCP 协议回归：53 用例
-python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：208 用例
+python tests\features_e2e.py            # 功能回归（标注/轮转/护栏/预校验/工具禁用/启动防护/目录隔离/Token 有效期/HTTPS/只读 Token/备份回滚/tail/tree/批量读/**自签证书**/**证书链与三件套合并**/**数据库与缓存**/**超时边界**）：211 用例
 python tests\mcp_e2e.py                 # MCP 端点（源码）：59 用例
 python tests\local_e2e.py               # 本机端到端：13 用例
 python tests\sqlsrv_proto_test.py       # SQL Server 驱动协议层（无需真实服务器）：152 用例
@@ -832,8 +860,10 @@ python tests\mcp_contract_test.py       # initialize 运行时契约 + 逐页还
 python tests\exec_output_test.py        # win_exec 双端压缩预览 + win_tail 白名单口：25 用例
 python tests\backup_retention_test.py   # 备份保留策略与配置键集合：26 用例
 python tests\write_backup_timeout_test.py  # backup=false 一致性 + 超时上限可配：51 用例
-python tests\optimistic_lock_test.py       # win_read(hash=true) + conflict 回传 + win_replace 乐观锁：44 用例
-python tests\v1721_test.py                 # 配置分层 + 纯逻辑外提 + 审计降级 + 增量备份 + validate/patch/probe：84 用例
+python tests\optimistic_lock_test.py       # win_read(hash=true) + conflict 回传 + win_replace 乐观锁：46 用例
+python tests\v1721_test.py                 # 配置分层 + 纯逻辑外提 + 审计降级 + 增量备份 + validate/patch/probe：88 用例
+python tests\v1722_test.py              # 响应可序列化 + 围栏⑦转发前缀 + 回滚体积闸：105 用例
+python tests\v1723_test.py              # 围栏动态程序名/误伤 + 强制备份 + 硬链接体积 + 只读脱敏 + 文档一致性
 python tests\gui_refresh_test.py        # GUI 异步刷新（tkinter 桩）：52 用例
 python test\v1712\spotcheck.py          # win_read 边界 A~F 段：61 用例
 python test\v1712\check.py              # 围栏/原子写定点检查：13 用例
@@ -842,16 +872,16 @@ python test\v1712\check.py              # 围栏/原子写定点检查：13 用�
 
 ````
 
-当前状态（v1.7.22 实测，源码级）：**selftest 53/53、features 211/211（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、**`tests/v1722_test.py` 105 项（本轮新增的 JSON 契约护栏）**；`py_compile` 与模块导入自检通过。
+当前状态（v1.7.23 实测，源码级）：**selftest 53/53、features 211/211（另 2 项环境不具备自动跳过）、mcp_e2e 59/59、local 13/13、tls 11/11、sqlsrv_proto 152/152 全通过**；另跑通 `test/v1712/spotcheck.py` A~F 段（61 项）、`check.py` 13 项、`tests/gui_refresh_test.py` 52 项、`tests/mcp_contract_test.py` 65 项、`tests/exec_output_test.py` 25 项、`tests/backup_retention_test.py` 26 项、`tests/write_backup_timeout_test.py` 51 项、`tests/optimistic_lock_test.py` 46 项、`tests/v1721_test.py` 88 项、`tests/v1722_test.py` 105 项、**`tests/v1723_test.py` 59 项（本轮新增，修复前 33 项红）**；`py_compile` 与模块导入自检通过。全部 17 套回归 exit=0。
 
-真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**。本轮还把旧测试里的恒真断言改成真实条件，并给 MCP 结果补上 `json.dumps` 断言 —— 只查 `isError` 已经放过三次契约错了。
+真起临时服务的复核：`test/v1721/patch_wire.py` 实测 `/api/patch` 与 `/mcp` 的 `win_patch` **都返回 200**（修复前是 500 / 连接断），`test/v1721/hijack_variants.py` 的 7 个围栏变体 **7/7 全部拦截**；v1.7.23 复跑两项仍全绿。只查 `isError` 已经放过三次契约错了 —— 现在每个新增字段都要过 `json.dumps` 断言。
 
 > ⚠️ **exe 黑盒仍未在开发机执行**：开发机启用了「智能应用控制」（SAC = On），
 > 新构建的自编译 exe 被策略拦截（WinError 4551），因此 `mcp_exe_test.py` 与
 > `wkfile.exe --check-gui` 跑不起来。v1.7.17 用同一构建脚本产出的 exe 黑盒
-> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.22 均未改动 GUI 代码。上述源码级
-> 回归已覆盖本轮全部改动（响应序列化契约、重试语义、围栏⑦转发前缀与变体、
-> 回滚体积闸的写前拒绝）。
+> 56/56 与真窗口自检均通过；v1.7.18 ~ v1.7.23 均未改动 GUI 代码。上述源码级
+> 回归已覆盖本轮全部改动（围栏动态程序名与参数误伤、体积闸非正数回退、
+> 强制备份、硬链接体积去重、审计丢账告警、只读 Token 脱敏、文档护栏）。
 > 部署到目标机器后请跑一次 `connect-check.py` 与 `wkfile.exe --check-gui` 自检。
 
 重新打包 exe（改完源码后）：

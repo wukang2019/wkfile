@@ -175,7 +175,7 @@ TOOLS = [
                 "encoding": {"type": "string", "description": "编码，默认 utf-8"},
                 "create_dirs": {"type": "boolean", "description": "自动创建父目录，默认 true"},
                 "expected_sha256": {"type": "string", "description": "可选：文件当前 sha256（用 win_read(hash=true) 一次拿到；不是 win_read 默认返回值），不匹配则拒绝写入并在错误里给出当前值"},
-                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true。频繁覆盖同一小文件（如 .env 改一行）时可传 false 少留历史版本"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true（服务端 backup_required=true 时不允许跳过）。频繁覆盖同一小文件（如 .env 改一行）时可传 false 少留历史版本"},
             },
             "required": ["path", "content"],
         },
@@ -196,7 +196,7 @@ TOOLS = [
                 "count": {"type": "integer", "description": "替换几处。不传或 0 表示全部，但仅当匹配唯一时才允许；匹配多处时必须显式指定"},
                 "ignore_case": {"type": "boolean", "description": "正则模式下是否忽略大小写"},
                 "dry_run": {"type": "boolean", "description": "只预览不落盘：返回 unified diff，文件保持不动。默认 false"},
-                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true；传 false 可跳过备份（频繁改动同一文件时少留历史版本）"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true（服务端 backup_required=true 时不允许跳过）；传 false 可跳过备份（频繁改动同一文件时少留历史版本）"},
                 "expected_sha256": {"type": "string", "description": "可选：文件当前 sha256（用 win_read(hash=true) 一次拿到），不匹配则拒绝替换，防止读取与替换之间别人改动被静默覆盖"},
             },
             "required": ["path", "old"],
@@ -211,7 +211,7 @@ TOOLS = [
                 "path": {"type": "string", "description": "文件绝对路径"},
                 "content": {"type": "string", "description": "要追加的内容"},
                 "encoding": {"type": "string", "description": "编码，默认 utf-8"},
-                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true；高频写日志建议传 false，避免每次全量复制原文件"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true（服务端 backup_required=true 时不允许跳过）；高频写日志建议传 false，避免每次全量复制原文件"},
             },
             "required": ["path", "content"],
         },
@@ -334,7 +334,7 @@ TOOLS = [
                 "path": {"type": "string", "description": "文件绝对路径"},
                 "base64": {"type": "string", "description": "base64 编码的内容"},
                 "expected_sha256": {"type": "string", "description": "强烈建议提供：解码后原始内容的 sha256 十六进制值，防客户端截断写坏文件"},
-                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true"},
+                "backup": {"type": "boolean", "description": "写前备份原文件，默认 true（服务端 backup_required=true 时不允许跳过）"},
             },
             "required": ["path", "base64"],
         },
@@ -600,7 +600,7 @@ TOOLS = [
                     "items": {"type": "object"},
                 },
                 "dry_run": {"type": "boolean", "description": "只预览不落盘，返回每项校验结论与写入字节数，默认 false"},
-                "backup": {"type": "boolean", "description": "每个文件写前备份，默认 true；传 false 可跳过"},
+                "backup": {"type": "boolean", "description": "每个文件写前备份，默认 true；传 false 可跳过（服务端 backup_required=true 时会被拒）"},
             },
             "required": ["changes"],
         },
@@ -981,6 +981,10 @@ def render(tool_name: str, data: dict) -> str:
         lines.append(f"审计：{a.get('state')}  缓冲 {a.get('buffered')}/{a.get('buffer_max')} 条  "
                      f"失败 {a.get('failures')} 次  已补写 {a.get('flushed')} 条  "
                      f"丢弃 {a.get('dropped')} 条")
+        # v1.7.23：丢账不能只躺在计数里。alerts 为空时这一行根本不出现，
+        # 不给常态自检增加 token。
+        if a.get("alerts"):
+            lines.append("审计告警：" + "；".join(a["alerts"]))
         b = data.get("backup") or {}
         d = b.get("dedup") or {}
         lines.append(f"备份目录 {'可写' if b.get('writable') else '不可写'}；"

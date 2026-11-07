@@ -222,8 +222,11 @@ def is_crlf_target(name: str) -> bool:
 
 
 def write_text(path: str, text: str) -> None:
+    # v1.7.23：旧版既手动把 \n 换成 \r\n，又给 open() 传 newline="\r\n"，
+    # Python 会再换一次，发布包的 .txt/.bat 全是 \r\r\n（509 处双回车）。
+    # 手动转换时必须让 open() 不插手：newline="" 即「原样写入」。
     newline = "\r\n" if is_crlf_target(path) else "\n"
-    with open(path, "w", encoding="utf-8", newline=newline) as fh:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(text.replace("\r\n", "\n").replace("\n", newline))
 
 

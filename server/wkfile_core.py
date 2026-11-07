@@ -440,3 +440,37 @@ def patch_plan(changes, *, max_files: int = PATCH_MAX_FILES,
         errors.append(
             f"本次写入合计 {human_size(total)} 超过预算 {human_size(max_total_bytes)}，请拆批")
     return planned, errors
+
+
+def backup_inode_sizes(groups: dict) -> tuple:
+    """按 inode 去重算备份的真实磁盘占用，以及删掉每组能释放多少字节。
+
+    v1.7.23：增量备份用硬链接让多个历史版本指向同一份内容实体，可旧的
+    ``_dir_size`` 把每个目录项都按全量计一遍 —— 10 个版本共用 1GB 内容
+    会被算成 10GB，``backup_max_bytes`` 于是提前把最旧的版本删掉。
+
+    ``groups`` 形如 ``{".objects": [(inode_key, size), ...],
+    "20260101-...": [...], ...}``，一个文件一项。返回值：
+
+    * ``physical``：所有唯一 inode 的字节和（真实占用，每个实体只算一次）；
+    * ``reclaim``：每组删掉后能释放的字节。一个 inode 只在**引用它的最后
+      一个组**里计入，因为按时间从旧往新删时，只有删到最后一处引用，
+      实体才真正少一份目录项（随后由 ``_prune_backup_objects`` 回收）。
+
+    ``.objects`` 只是实体自身的存放处，不参与「谁最后引用」的排序，否则
+    它永远排在最后，所有时间戳目录都会被算成 0 可释放。
+    """
+    all_inodes: dict = {}
+    for items in groups.values():
+        for key, size in items:
+            all_inodes.setdefault(key, int(size))
+    physical = sum(all_inodes.values())
+    stamps = sorted(k for k in groups if k != ".objects")
+    last_owner: dict = {}
+    for stamp in stamps:
+        for key, _size in groups[stamp]:
+            last_owner[key] = stamp
+    reclaim = {stamp: 0 for stamp in stamps}
+    for key, stamp in last_owner.items():
+        reclaim[stamp] += all_inodes[key]
+    return physical, reclaim

@@ -102,10 +102,10 @@ from wkfile_core import (  # noqa: E402
     is_private_ip, looks_binary, make_expiry, norm, now_iso, parse_expiry,
     read_text_file, sha256_of, sha256_under_cap, token_strength, token_state,
     cas_object_path, coerce_env_value, dedup_eligible, merge_config_layers,
-    patch_plan, strip_json_comments,
+    patch_plan, strip_json_comments, backup_inode_sizes,
 )
 
-VERSION = "1.7.22"
+VERSION = "1.7.23"
 SERVICE = "wkfile"
 
 # 作者署名。想改成自己的名字/微信号，只改这两行就够了 ——
@@ -122,6 +122,10 @@ LOG_FILENAME = "wkfile.log"
 AUDIT_FILENAME = "audit.jsonl"
 BACKUP_DIRNAME = "backups"
 TRASH_DIRNAME = "trash"
+
+# v1.7.23：原子补丁回滚体积闸的内置安全默认值。配置里填 0 / 负数不是
+# 「不限」，而是把刚加的内存闸整个关掉 —— 统一回退到这个值。
+DEFAULT_ROLLBACK_CAP = 8 * 1024 * 1024
 
 DEFAULT_CONFIG = {
     "host": "0.0.0.0",
@@ -182,8 +186,13 @@ DEFAULT_CONFIG = {
     "patch_max_files": 20,
     "patch_max_total_bytes": 8 * 1024 * 1024,
     # v1.7.22 原子回滚要在内存里留一份原文件字节：这个值同时是单文件与
-    # 单次总量的上限，写前就结清，超限直接拒（0 = 不限制，不推荐）。
-    "patch_max_rollback_bytes": 8 * 1024 * 1024,
+    # 单次总量的上限，写前就结清，超限直接拒。
+    # v1.7.23：0 / 负数不再表示「不限」（那等于把内存闸整个关掉），
+    # 一律回退到 DEFAULT_ROLLBACK_CAP，并在 win_probe 里报配置异常。
+    "patch_max_rollback_bytes": DEFAULT_ROLLBACK_CAP,
+    # v1.7.23 服务端强制写前备份：开启后 AI 传 backup=false 也拆不掉兜底；
+    # auto_backup=false 与它冲突时同样拒绝写入。默认 false 保持旧行为。
+    "backup_required": False,
     # 回收站保留天数：超过天数的条目整个清掉（0 = 永久保留，保持旧行为）。
     "trash_retain_days": 30,
     "tls_cert": "",
@@ -1087,7 +1096,14 @@ _CONFIG_NOTES = {
     '"patch_max_rollback_bytes"': [
         "// win_patch 原子回滚要在内存里留一份写前原文字节：这个值同时是",
         "// 单文件与单次总量的上限，超过就在写前拒绝（不会改一半才失败）。",
-        "// 默认 8MB；调大会等比放大单次请求的内存占用。设 0 = 不限制（不推荐）。",
+        "// 默认 8MB；调大会等比放大单次请求的内存占用。",
+        "// 必须填正数：0 / 负数不再表示「不限」，而是回退到内置 8MB 默认值，",
+        "// 并在 win_probe 里报一条配置异常（v1.7.23 堵掉的脚枪）。",
+    ],
+    '"backup_required"': [
+        "// 服务端强制写前备份：设 true 后，AI 传 backup=false 也拆不掉兜底，",
+        "// 会直接拒绝写入；auto_backup=false 与它冲突时同样拒绝。",
+        "// 默认 false，保持旧行为。用 win_probe 可查看开关状态。",
     ],
     '"port"': [
         "// ★ 配置分三层：内置默认 < 本文件 < 环境变量（WKFILE_ 前缀）。",
@@ -1361,19 +1377,36 @@ class Audit:
                   file=sys.stderr, flush=True)
 
     def health(self) -> dict:
-        """给 win_probe 的审计健康快照（不输出绝对路径与请求内容）。"""
+        """给 win_probe 的审计健康快照（不输出绝对路径与请求内容）。
+
+        v1.7.23：dropped 是**永久丢掉的账**，缓冲清空后旧版 state 就回到
+        ok、也不进 issues —— 只暴露不告警等于没暴露。现在它有自己的状态
+        与 alerts，win_probe 和 MCP 文本都会明确报出来。
+        """
         with self.lock:
             buffered = len(self._pending)
+            dropped = self.dropped
+            alerts = []
+            if dropped:
+                alerts.append(
+                    f"已永久丢弃 {dropped} 条审计记录（缓冲溢出），这些记录无法补写；"
+                    "请检查审计盘空间/权限，并人工核对这段时间的写操作")
+            # state 只描述「此刻写盘是否正常」，保持 v1.7.21 的语义；
+            # 永久丢账另用 integrity / alerts 表达 —— 两者不能互相掩盖，
+            # 否则「盘已修好但丢过 2 条」和「现在正写不进去」会混成一团。
+            state = "degraded" if buffered else "ok"
             return {
                 # 缓冲空了就算恢复；历史失败次数留在 failures 里供追溯，
                 # 不能让一次已经修好的盘满故障永远显示「降级」。
-                "state": "degraded" if buffered else "ok",
+                "state": state,
+                "integrity": "lossy" if dropped else "intact",
+                "alerts": alerts,
                 "recovered": bool(self.failures and not buffered),
                 "enabled": bool(self.path),
                 "buffered": buffered,
                 "buffer_max": self._pending.maxlen,
                 "failures": self.failures,
-                "dropped": self.dropped,
+                "dropped": dropped,
                 "flushed": self.flushed,
                 "last_error": self.last_error,
                 "last_ok_ts": self.last_ok_ts,
@@ -1536,6 +1569,30 @@ class Agent:
                 "如需修改文件，请改用完整权限的 Token（界面②里的主 Token）。",
             )
 
+    def _require_backup(self, req: dict) -> bool:
+        """返回本次调用是否要做写前备份，并守住服务端强制策略。
+
+        v1.7.23：契约里的 backup=false 本意是给运维省一次复制，但它同时也
+        让 AI 能自己拆掉「写坏可回滚」这道兜底。backup_required=true 时
+        任何跳过备份的请求一律拒绝；auto_backup=false 与它冲突也拒绝，
+        避免配置自相矛盾却照常提供写入。
+        """
+        want = bool(req.get("backup", True))
+        if not bool(getattr(self.cfg, "backup_required", False)):
+            return want
+        if not want:
+            raise PathError(
+                "backup_required",
+                "服务端开启了 backup_required，不允许用 backup=false 跳过写前备份。",
+            )
+        if not self.cfg.auto_backup:
+            raise PathError(
+                "backup_required",
+                "backup_required=true 但 auto_backup=false 关闭了写前备份；"
+                "请打开 auto_backup，或关闭 backup_required。",
+            )
+        return True
+
     def _backup(self, full: str) -> str | None:
         if not self.cfg.auto_backup or not os.path.exists(full):
             return None
@@ -1652,7 +1709,8 @@ class Agent:
     @staticmethod
     def _backup_cleanup_plan(entries: list[dict], *, max_bytes: int = 0,
                              retain_days: int = 0, retain_count: int = 0,
-                             now: float | None = None) -> list[str]:
+                             now: float | None = None,
+                             total_bytes: int | None = None) -> list[str]:
         """算出该删哪些备份时间戳目录（纯函数，不碰磁盘，测试可直接调）。
 
         entries 按时间升序，每项 {"stamp","size","mtime"}。三个维度是 OR：
@@ -1660,7 +1718,10 @@ class Agent:
         任一超限就从最旧的开始删，直到全部达标。0 = 该维度不启用。
         """
         now = time.time() if now is None else now
-        total = sum(int(e.get("size") or 0) for e in entries)
+        # total_bytes 由 _backup_entries 按 inode 去重后给出（真实磁盘占用）；
+        # 缺省时退回旧的逐项累加，方便这个纯函数被单独测试。
+        total = (sum(int(e.get("size") or 0) for e in entries)
+                 if total_bytes is None else int(total_bytes))
         cutoff = now - retain_days * 86400 if retain_days > 0 else 0
         plan, removed = [], 0
         for e in entries:
@@ -1674,8 +1735,17 @@ class Agent:
             total -= int(e.get("size") or 0)
         return plan
 
-    def _backup_entries(self) -> tuple[str, list[dict]]:
-        """扫描备份根，返回 (根路径, 按时间升序的条目)。"""
+    def _backup_entries(self) -> tuple[str, list[dict], int]:
+        """扫描备份根，返回 (根路径, 按时间升序的条目, 真实磁盘占用)。
+
+        v1.7.23：增量备份的历史版本是 .objects 里同一实体的硬链接。旧版
+        逐个目录 _dir_size 再累加，N 个版本共用一份内容会被算成 N 份，
+        backup_max_bytes 于是提前把最旧的版本删掉 —— 用户以为还有 2GB
+        余量，实际只用了 200MB。现在按 inode 去重：
+          size          = 删掉该版本能释放的字节（供清理计划递减）
+          logical_size  = 旧口径「看起来多大」，仅供对照展示
+          physical      = 全备份根唯一 inode 的字节和，才是真实占用
+        """
         base = backup_root(self.cfg.base_dir)
         try:
             stamps = sorted(d for d in os.listdir(base)
@@ -1683,7 +1753,30 @@ class Agent:
                             if not d.startswith(".")
                             and os.path.isdir(os.path.join(base, d)))
         except OSError:
-            return base, []
+            return base, [], 0
+        groups = {".objects": []}
+        for st in stamps:
+            groups[st] = []
+        folders = [(".objects", os.path.join(base, ".objects"))]
+        folders += [(st, os.path.join(base, st)) for st in stamps]
+        for label, folder in folders:
+            if not os.path.isdir(folder):
+                continue
+            seen_here = set()
+            for cur, _dirs, files in os.walk(folder):
+                for name in files:
+                    p = os.path.join(cur, name)
+                    try:
+                        st = os.stat(p)
+                        key = ((st.st_dev, st.st_ino) if st.st_ino else
+                               (st.st_dev, os.path.normcase(os.path.abspath(p))))
+                        if key in seen_here:
+                            continue
+                        seen_here.add(key)
+                        groups[label].append((key, st.st_size))
+                    except OSError:
+                        continue
+        physical, reclaim = backup_inode_sizes(groups)
         out = []
         for st in stamps:
             p = os.path.join(base, st)
@@ -1691,8 +1784,9 @@ class Agent:
                 mtime = os.path.getmtime(p)
             except OSError:
                 mtime = 0.0
-            out.append({"stamp": st, "size": _dir_size(p), "mtime": mtime})
-        return base, out
+            out.append({"stamp": st, "size": reclaim.get(st, 0),
+                        "logical_size": _dir_size(p), "mtime": mtime})
+        return base, out, physical
 
     def cleanup_backups(self):
         """按总量 / 份数 / 天龄三种策略清理备份（从最旧开始整目录删除）。
@@ -1707,9 +1801,10 @@ class Agent:
         count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
         if max_bytes <= 0 and days <= 0 and count <= 0:
             return
-        base, entries = self._backup_entries()
+        base, entries, physical = self._backup_entries()
         plan = self._backup_cleanup_plan(
-            entries, max_bytes=max_bytes, retain_days=days, retain_count=count)
+            entries, max_bytes=max_bytes, retain_days=days, retain_count=count,
+            total_bytes=physical)
         for st in plan:
             shutil.rmtree(os.path.join(base, st), ignore_errors=True)
 
@@ -1718,13 +1813,14 @@ class Agent:
 
         只报数、不删除；策略是服务端配置，不开放给 AI 改。
         """
-        _base, entries = self._backup_entries()
+        _base, entries, physical = self._backup_entries()
         max_bytes = int(getattr(self.cfg, "backup_max_bytes", 0) or 0)
         days = max(0, int(getattr(self.cfg, "backup_retain_days", 0) or 0))
         count = max(0, int(getattr(self.cfg, "backup_retain_count", 0) or 0))
         plan = self._backup_cleanup_plan(
             entries, max_bytes=max_bytes, retain_days=days, retain_count=count)
-        total = sum(int(e.get("size") or 0) for e in entries)
+        total = physical
+        logical = sum(int(e.get("logical_size") or 0) for e in entries)
         return {
             "max_bytes": max_bytes,
             "max_bytes_human": human_size(max_bytes) if max_bytes > 0 else "不限",
@@ -1734,6 +1830,8 @@ class Agent:
             "total_count": len(entries),
             "total_bytes": total,
             "total_bytes_human": human_size(total),
+            "logical_bytes": logical,
+            "physical_bytes": physical,
             "would_remove": len(plan),
             "dedup": self.dedup_stats(),
             "note": ("保留策略由服务端配置（backup_max_bytes / backup_retain_days / "
@@ -1926,8 +2024,10 @@ class Agent:
         避免「改了一半才发现装不下」。返回本次允许单文件读入的字节上限。
         """
         cap = int(getattr(self.cfg, "patch_max_rollback_bytes", 0) or 0)
+        # v1.7.23：0 / 负数不是「不限」，而是最危险的脚枪 —— 旧版在这里
+        # 直接 return 0，调用方就退回无边界的 fh.read()。统一回退安全默认。
         if cap <= 0:
-            return 0
+            cap = DEFAULT_ROLLBACK_CAP
         total = 0
         for _ch, full, _data, _info in prepared:
             try:
@@ -1979,7 +2079,7 @@ class Agent:
         done: list[dict] = []
         for ch, full, data, info in prepared:
             try:
-                backup = self._backup(full) if req.get("backup", True) else None
+                backup = self._backup(full) if self._require_backup(req) else None
                 try:
                     with open(full, "rb") as fh:
                         # 上限内读满；多读 1 字节用来抓「预检后被改大」的竞态，
@@ -2037,12 +2137,19 @@ class Agent:
 
         只读、不输出 Token 明文，也不写任何文件。运维/AI 排障不用再
         「curl health + 翻日志 + 看配置文件」跑三趟。
+
+        v1.7.23：只读 Token 是低权限通道，不该顺手拿到服务器上的绝对
+        路径（roots / 备份目录 / 审计错误里的路径）。脱敏只影响展示，
+        状态、计数、可写性照常返回；完整 Token 仍看得到完整信息。
+        注意 win_roots 是 AI 构造路径必需的工具，不在此脱敏范围内。
         """
         cfg = self.cfg
         layers = cfg.layers_report()
+        redacted = self.request_readonly()
         roots = []
-        for r in cfg.roots or []:
-            roots.append({"path": r, "exists": os.path.isdir(r),
+        for i, r in enumerate(cfg.roots or [], 1):
+            roots.append({"path": f"<root#{i}>" if redacted else r,
+                          "exists": os.path.isdir(r),
                           "readable": os.access(r, os.R_OK),
                           "writable": os.access(r, os.W_OK)})
         bdir = backup_root(cfg.base_dir)
@@ -2050,6 +2157,9 @@ class Agent:
         backup_ok = (os.access(bdir, os.W_OK) if os.path.isdir(bdir)
                      else os.access(parent, os.W_OK))
         audit = self.audit.health()
+        if redacted:
+            audit = dict(audit)
+            audit["last_error"] = ""      # 写盘错误里常带绝对路径
         issues = []
         if not roots:
             issues.append("没有配置任何授权根目录（roots 为空），文件类工具全部不可用")
@@ -2059,13 +2169,22 @@ class Agent:
             elif not r["readable"]:
                 issues.append(f"授权根目录不可读：{r['path']}")
         if audit["state"] != "ok":
-            issues.append(f"审计日志处于降级状态（缓冲 {audit['buffered']} 条 / "
-                          f"累计失败 {audit['failures']} 次）：{audit['last_error'][:120]}")
+            issues.append(f"审计日志处于降级状态（{audit['state']}，缓冲 {audit['buffered']} 条 / "
+                          f"累计失败 {audit['failures']} 次）"
+                          + (f"：{audit['last_error'][:120]}" if audit["last_error"] else ""))
+        for alert in audit.get("alerts") or []:
+            issues.append("审计告警：" + alert)
         if not backup_ok:
             issues.append("备份目录不可写，写入类操作会被拒绝（备份是强制兜底）")
         if layers["env_warnings"]:
             issues.append(f"有 {len(layers['env_warnings'])} 个环境变量未生效，"
                           "详见 config.layers.env_warnings")
+        if int(getattr(cfg, "patch_max_rollback_bytes", 0) or 0) <= 0:
+            issues.append("patch_max_rollback_bytes 配成了 0 或负数，已回退到内置 "
+                          "8MB 安全上限；该配置不支持「0=不限」，请改成正数")
+        if bool(getattr(cfg, "backup_required", False)) and not cfg.auto_backup:
+            issues.append("backup_required=true 但 auto_backup=false：写操作会被拒绝，"
+                          "请打开 auto_backup 或关闭 backup_required")
         return {
             "ok": not issues,
             "version": VERSION,
@@ -2073,7 +2192,8 @@ class Agent:
             "config": {"layers": layers, "file_exists": os.path.isfile(cfg.config_path)},
             "roots": roots,
             "audit": audit,
-            "backup": {"path": bdir, "writable": backup_ok,
+            "backup": {"path": "<redacted>" if redacted else bdir,
+                       "writable": backup_ok,
                        "exists": os.path.isdir(bdir), "dedup": self.dedup_stats()},
             "security": {
                 "read_only": bool(self.effective_readonly()),
@@ -2082,10 +2202,13 @@ class Agent:
                 "public_health": bool(getattr(cfg, "public_health", True)),
                 "exec_enabled": bool(getattr(cfg, "exec_enabled", False)),
                 "mcp_enabled": bool(getattr(cfg, "enable_mcp", True)),
+                "probe_redacted": redacted,
+                "backup_required": bool(getattr(cfg, "backup_required", False)),
             },
             "tools": {"disabled": sorted(self.disabled_tools),
                       "count": len(self.ROUTES)},
             "issues": issues,
+            "redacted": redacted,
         }
 
     def op_roots(self, req: dict) -> dict:
@@ -2447,7 +2570,7 @@ class Agent:
         self._preflight(full, data)
         # backup=false（v1.7.9）：频繁覆盖同一小文件（.env 改一行密码这种）
         # 时可以按次关掉备份，不让回收站堆一堆同文件的历史版本
-        backup = self._backup(full) if req.get("backup", True) else None
+        backup = self._backup(full) if self._require_backup(req) else None
         existed = os.path.isfile(full)
         self._atomic_write(full, data)      # v1.7.12：补上原子化（此前仍是固定名 tmp）
         st = os.stat(full)
@@ -2505,7 +2628,7 @@ class Agent:
         if req.get("create_dirs", True):
             os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         self._preflight(full, data)
-        backup = self._backup(full) if req.get("backup", True) else None
+        backup = self._backup(full) if self._require_backup(req) else None
         self._atomic_write(full, data)
         return {"path": full, "bytes": len(data), "backup": backup}
 
@@ -2539,7 +2662,7 @@ class Agent:
                 )
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         self._preflight(full, raw)
-        backup = self._backup(full) if req.get("backup", True) else None
+        backup = self._backup(full) if self._require_backup(req) else None
         existed = os.path.isfile(full)
         self._atomic_write(full, raw)
         st = os.stat(full)
@@ -2569,7 +2692,7 @@ class Agent:
         # v1.7.19：与 op_write 对齐，允许按次跳过备份。append 每次全量复制
         # 原文件（4MB 日志追加一行也要复制 4MB），高频写日志时开销很大；
         # 契约已承诺 backup=false，此处补齐实现，避免「说了能跳过却照样复制」。
-        backup = self._backup(full) if req.get("backup", True) else None
+        backup = self._backup(full) if self._require_backup(req) else None
         with open(full, "ab") as fh:
             fh.write(data)
         return {"path": full, "appended_bytes": len(data), "size": os.path.getsize(full),
@@ -2685,7 +2808,7 @@ class Agent:
         out_bytes = replaced_text.encode(enc if enc != "utf-8-sig" else "utf-8")
         self._preflight(full, out_bytes)
         # v1.7.19：与 op_write 对齐，backup=false 可跳过备份（契约口径统一）。
-        backup = self._backup(full) if req.get("backup", True) else None
+        backup = self._backup(full) if self._require_backup(req) else None
         # v1.7.12（WK-006）：与 op_write 一致走原子写——固定 open("wb") 在
         # 写到一半崩溃时会把原文件截成半截，备份虽有但等于赌运气
         self._atomic_write(full, out_bytes)
@@ -3440,6 +3563,20 @@ class Agent:
     _CMD_START_VALUE_SWITCHES = frozenset({"/d", "/node", "/machine", "/affinity"})
     _EXEC_SCRIPT_EXTS = (".bat", ".cmd", ".exe", ".com", ".ps1", ".vbs")
 
+    @staticmethod
+    def _exec_is_dynamic(token: str) -> bool:
+        """程序名里含 cmd 变量/转义（%X% / !X! / ^），无法静态判定。"""
+        return any(ch in token for ch in "%!^")
+
+    @staticmethod
+    def _exec_dynamic_error(token: str) -> "PathError":
+        return PathError(
+            "exec_dynamic_program",
+            f"命令里的 {token} 含变量或转义，程序名无法静态判定，拒绝执行。"
+            "围栏只放行能一眼看出跑的是哪个程序的命令；"
+            "请改成明确的程序名，或把这类脚本调用拆成白名单里的固定命令。",
+        )
+
     def _exec_seg_programs(self, seg: str) -> list[tuple[str, str]]:
         """拆出一段命令里所有「程序位置」的 (原始 token, 归一化名)。
 
@@ -3521,13 +3658,20 @@ class Agent:
         ② 内建名单：真内建优先于文件搜索，投放同名 .bat 劫持不了；
         ③ v1.7.22 转发前缀：call / start / cmd /c 后面才是真正执行的
            程序，旧版在这一步整段跳过，`dir && call payload.bat` 直接放行；
-        ④ v1.7.22 段内兜底：任何位置显式引用了 cwd 里存在的脚本文件
-           一律拒绝（覆盖 if / for / 重定向里藏的脚本名）。
+        ④ v1.7.23 动态程序名：把程序名藏进 set 变量或 for 变量
+           （`set X=p.bat` 换行 `call %X%`、`for %i in (...) do call %i`）
+           时字面量检测必然看不到，程序位置含 %/!/^ 一律拒绝；
+        ⑤ v1.7.23 收窄兜底：只查「程序位置」和「带路径分隔符的脚本引用」。
+           旧版把段内所有 .bat/.ps1 结尾的 token 都查一遍，于是
+           `type deploy.ps1` / `copy payload.bat x` 这类纯参数被误拦 ——
+           它们是读/复制文件，不是执行文件，cwd 里有没有同名文件无关。
         """
-        # 拆链（2>&1 的 & 不是分隔符，先打码——v1.7.8 的老坑不能复发）
+        # 拆链（2>&1 的 & 不是分隔符，先打码——v1.7.8 的老坑不能复发）。
+        # v1.7.23：换行也是 cmd 的命令分隔符，旧版只按 &&/||/&/|/; 拆，
+        # `set X=p.bat` 换行 `call %X%` 会连成一整段从而躲过检测。
         masked = re.sub(r"(\d*)&(\d+)",
                         lambda m: m.group(1) + "\x01" + m.group(2), command)
-        for seg in re.split(r"\s*(?:&&|\|\||[&|;])\s*", masked):
+        for seg in re.split(r"[ \t]*(?:&&|\|\||[&|;]|\r?\n)[ \t]*", masked):
             seg = seg.replace("\x01", "&").strip()
             if not seg:
                 continue
@@ -3536,13 +3680,29 @@ class Agent:
             except PathError:
                 continue
             for raw, program in programs:
+                # 程序位置一旦含变量/转义，后面究竟跑哪个文件根本无法静态
+                # 确定，白名单与 cwd 投放检测都失去意义 —— 直接拒绝。
+                if self._exec_is_dynamic(raw):
+                    raise self._exec_dynamic_error(raw)
                 self._exec_hijack_probe(raw, program, cwd)
-            # 段内兜底：程序位置之外的脚本引用（if exist x call p.bat、
-            # type x > p.bat 之类）也逐个查，不再只看「首程序」。
-            for tok in self._exec_split_tokens(seg):
-                low = tok.strip('"').lower()
-                if low.endswith(self._EXEC_SCRIPT_EXTS):
-                    self._exec_hijack_probe(tok, self._exec_norm_program(tok), cwd)
+
+            tokens = self._exec_split_tokens(seg)
+            for i, tok in enumerate(tokens):
+                if not self._exec_is_dynamic(tok):
+                    continue
+                prev = self._exec_norm_program(tokens[i - 1]) if i else ""
+                # for 的 do、call/start/cmd 后面那个 token 才是程序位置
+                if i == 0 or prev in self._CMD_FORWARDERS or prev == "do":
+                    raise self._exec_dynamic_error(tok)
+
+            # 收窄后的段内兜底：只查显式带路径的脚本引用（.\p.bat、
+            # sub\p.bat、%cd%\p.bat）。纯文件名参数不查，避免误伤。
+            for tok in tokens:
+                ref = tok.strip('"').strip("()").strip('"')
+                if "\\" not in ref and "/" not in ref:
+                    continue
+                if ref.lower().endswith(self._EXEC_SCRIPT_EXTS):
+                    self._exec_hijack_probe(ref, self._exec_norm_program(ref), cwd)
 
     # 热加载只覆盖"参数级"字段；exec_enabled 仍然必须重启 —— 它决定
     # win_exec 是否出现在 tools/list（Agent 构造时的快照），"能力开关必须
